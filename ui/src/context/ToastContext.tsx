@@ -96,51 +96,10 @@ export function ToastProvider({ children }: { children: ReactNode }) {
     setToasts([]);
   }, []);
 
+  // Toasts are disabled app-wide for now.
   const pushToast = useCallback(
-    (input: ToastInput) => {
-      const now = Date.now();
-      const tone = input.tone ?? "info";
-      const ttlMs = normalizeTtl(input.ttlMs, tone);
-      const dedupeKey =
-        input.dedupeKey ?? input.id ?? `${tone}|${input.title}|${input.body ?? ""}|${input.action?.href ?? ""}`;
-
-      for (const [key, ts] of dedupeRef.current.entries()) {
-        if (now - ts > DEDUPE_MAX_AGE_MS) {
-          dedupeRef.current.delete(key);
-        }
-      }
-
-      const lastSeen = dedupeRef.current.get(dedupeKey);
-      if (lastSeen && now - lastSeen < DEDUPE_WINDOW_MS) {
-        return null;
-      }
-      dedupeRef.current.set(dedupeKey, now);
-
-      const id = input.id ?? generateToastId();
-      clearTimer(id);
-
-      setToasts((prev) => {
-        const nextToast: ToastItem = {
-          id,
-          title: input.title,
-          body: input.body,
-          tone,
-          ttlMs,
-          action: input.action,
-          createdAt: now,
-        };
-
-        const withoutCurrent = prev.filter((toast) => toast.id !== id);
-        return [nextToast, ...withoutCurrent].slice(0, MAX_TOASTS);
-      });
-
-      const timeout = window.setTimeout(() => {
-        dismissToast(id);
-      }, ttlMs);
-      timersRef.current.set(id, timeout);
-      return id;
-    },
-    [clearTimer, dismissToast],
+    (_input: ToastInput): string | null => null,
+    [],
   );
 
   useEffect(() => () => {

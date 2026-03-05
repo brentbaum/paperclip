@@ -42,6 +42,7 @@ import { AgentIcon } from "./AgentIconPicker";
 import { InlineEntitySelector, type InlineEntityOption } from "./InlineEntitySelector";
 
 const DRAFT_KEY = "paperclip:issue-draft";
+const LAST_ASSIGNEE_KEY = "paperclip:last-assignee";
 const DEBOUNCE_MS = 800;
 
 /** Return black or white hex based on background luminance (WCAG perceptual weights). */
@@ -248,6 +249,7 @@ export function NewIssueDialog() {
     onSuccess: (issue) => {
       queryClient.invalidateQueries({ queryKey: queryKeys.issues.list(effectiveCompanyId!) });
       if (draftTimer.current) clearTimeout(draftTimer.current);
+      if (assigneeId) localStorage.setItem(LAST_ASSIGNEE_KEY, assigneeId);
       clearDraft();
       reset();
       closeNewIssue();
@@ -330,7 +332,7 @@ export function NewIssueDialog() {
       setStatus(newIssueDefaults.status ?? "todo");
       setPriority(newIssueDefaults.priority ?? "");
       setProjectId(newIssueDefaults.projectId ?? "");
-      setAssigneeId(newIssueDefaults.assigneeAgentId ?? "");
+      setAssigneeId(newIssueDefaults.assigneeAgentId ?? localStorage.getItem(LAST_ASSIGNEE_KEY) ?? "");
       setAssigneeModelOverride("");
       setAssigneeThinkingEffort("");
       setAssigneeChrome(false);
