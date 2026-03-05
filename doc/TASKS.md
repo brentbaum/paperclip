@@ -159,7 +159,58 @@ multiple teams.
 
 - An issue belongs to at most one project
 - Project status is **manually** updated (not auto-derived from issue states)
-- Projects can contain documents (specs, briefs) as linked entities
+- Projects have one primary document (spec/brief) with revision history
+
+---
+
+## Documents
+
+Paperclip supports a narrow document model for long-form artifacts that sit next to work, not instead of it.
+
+### V1 Document Scopes
+
+- **Project document** -- one primary markdown doc per project
+- **Approval document** -- one markdown doc attached to an approval under review
+- **Agent daily scratchpad** -- one markdown doc per agent per UTC day
+
+### Fields
+
+| Field              | Type      | Notes                                                  |
+| ------------------ | --------- | ------------------------------------------------------ |
+| `id`               | uuid      |                                                        |
+| `scope`            | enum      | `project`, `approval`, `agent_daily`                   |
+| `title`            | string    |                                                        |
+| `format`           | enum      | `markdown` in V1                                       |
+| `projectId`        | uuid FK   | Present for `project` scope                            |
+| `approvalId`       | uuid FK   | Present for `approval` scope                           |
+| `agentId`          | uuid FK   | Present for `agent_daily` scope                        |
+| `day`              | date      | Present for `agent_daily`; UTC date key                |
+| `latestRevisionId` | uuid FK   | Pointer to current head revision                       |
+| `createdAt`        | timestamp |                                                        |
+| `updatedAt`        | timestamp | Mirrors latest revision timestamp for convenience      |
+
+### Document Revision Fields
+
+| Field            | Type      | Notes                                         |
+| ---------------- | --------- | --------------------------------------------- |
+| `id`             | uuid      |                                               |
+| `documentId`     | uuid FK   |                                               |
+| `revisionNumber` | integer   | Monotonic per document                        |
+| `parentId`       | uuid FK   | Previous revision                             |
+| `authorId`       | uuid FK   | Agent or human author                         |
+| `authorType`     | enum      | `agent` or `user`                             |
+| `source`         | string    | e.g. `user_edit`, `agent_edit`, `resubmitted` |
+| `changeSummary`  | string    | Optional short note                           |
+| `body`           | markdown  | Full snapshot                                 |
+| `createdAt`      | timestamp |                                               |
+
+### Rules
+
+- Revisions are append-only
+- Diffing is revision-to-revision, not inline tracked changes
+- Documents are not a separate chat system; work coordination still flows through issues/comments
+- Approval documents are the canonical long-form content under review
+- Agent scratchpads are operational context, not the long-term company knowledge base
 
 ---
 

@@ -33,6 +33,15 @@ export const queryKeys = {
     list: (companyId: string) => ["projects", companyId] as const,
     detail: (id: string) => ["projects", "detail", id] as const,
   },
+  documents: {
+    detail: (documentId: string) => ["documents", "detail", documentId] as const,
+    revisions: (documentId: string) => ["documents", "revisions", documentId] as const,
+    diff: (documentId: string, from?: string | null, to?: string | null) =>
+      ["documents", "diff", documentId, from ?? null, to ?? null] as const,
+    project: (projectId: string) => ["documents", "project", projectId] as const,
+    approval: (approvalId: string) => ["documents", "approval", approvalId] as const,
+    agentDaily: (agentId: string, day?: string) => ["documents", "agent-daily", agentId, day ?? null] as const,
+  },
   goals: {
     list: (companyId: string) => ["goals", companyId] as const,
     detail: (id: string) => ["goals", "detail", id] as const,

@@ -1,5 +1,11 @@
 export type { Company } from "./company.js";
 export type {
+  Document,
+  DocumentRevision,
+  DocumentDiff,
+  DocumentRevisionResult,
+} from "./document.js";
+export type {
   Agent,
   AgentPermissions,
   AgentKeyCreated,

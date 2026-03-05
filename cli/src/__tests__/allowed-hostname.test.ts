@@ -33,6 +33,7 @@ function writeBaseConfig(configPath: string) {
       port: 3100,
       allowedHostnames: [],
       serveUi: true,
+      tailscaleServe: false,
     },
     auth: {
       baseUrlMode: "auto",
@@ -68,4 +69,3 @@ describe("allowed-hostname command", () => {
     expect(raw.server.allowedHostnames).toEqual(["dotta-macbook-pro"]);
   });
 });
-

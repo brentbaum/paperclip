@@ -149,8 +149,15 @@ export async function promptServer(opts?: {
   }
 
   return {
-    server: { deploymentMode, exposure, host: hostStr.trim(), port, allowedHostnames, serveUi: true },
+    server: {
+      deploymentMode,
+      exposure,
+      host: hostStr.trim(),
+      port,
+      allowedHostnames,
+      serveUi: true,
+      tailscaleServe: currentServer?.tailscaleServe ?? false,
+    },
     auth,
   };
 }
-

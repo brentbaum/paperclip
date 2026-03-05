@@ -3,6 +3,7 @@ import { useParams, useNavigate, useLocation, Navigate } from "@/lib/router";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { PROJECT_COLORS, isUuidLike } from "@paperclipai/shared";
 import { projectsApi } from "../api/projects";
+import { documentsApi } from "../api/documents";
 import { issuesApi } from "../api/issues";
 import { agentsApi } from "../api/agents";
 import { heartbeatsApi } from "../api/heartbeats";
@@ -16,11 +17,12 @@ import { InlineEditor } from "../components/InlineEditor";
 import { StatusBadge } from "../components/StatusBadge";
 import { IssuesList } from "../components/IssuesList";
 import { PageSkeleton } from "../components/PageSkeleton";
+import { DocumentWorkspace } from "../components/DocumentWorkspace";
 import { projectRouteRef } from "../lib/utils";
 
 /* ── Top-level tab types ── */
 
-type ProjectTab = "overview" | "list";
+type ProjectTab = "overview" | "document" | "list";
 
 function resolveProjectTab(pathname: string, projectId: string): ProjectTab | null {
   const segments = pathname.split("/").filter(Boolean);
@@ -28,6 +30,7 @@ function resolveProjectTab(pathname: string, projectId: string): ProjectTab | nu
   if (projectsIdx === -1 || segments[projectsIdx + 1] !== projectId) return null;
   const tab = segments[projectsIdx + 2];
   if (tab === "overview") return "overview";
+  if (tab === "document") return "document";
   if (tab === "issues") return "list";
   return null;
 }
@@ -215,6 +218,16 @@ export function ProjectDetail() {
     queryFn: () => projectsApi.get(routeProjectRef, lookupCompanyId),
     enabled: canFetchProject,
   });
+  const { data: document } = useQuery({
+    queryKey: project?.id ? queryKeys.documents.project(project.id) : ["documents", "project", "none"],
+    queryFn: () => documentsApi.getProjectDocument(project!.id),
+    enabled: activeTab === "document" && Boolean(project?.id),
+  });
+  const { data: revisions } = useQuery({
+    queryKey: document?.id ? queryKeys.documents.revisions(document.id) : ["documents", "revisions", "none"],
+    queryFn: () => documentsApi.listRevisions(document!.id),
+    enabled: Boolean(document?.id),
+  });
   const canonicalProjectRef = project ? projectRouteRef(project) : routeProjectRef;
   const projectLookupRef = project?.id ?? routeProjectRef;
   const resolvedCompanyId = project?.companyId ?? selectedCompanyId;
@@ -237,6 +250,18 @@ export function ProjectDetail() {
       projectsApi.update(projectLookupRef, data, resolvedCompanyId ?? lookupCompanyId),
     onSuccess: invalidateProject,
   });
+  const saveDocument = useMutation({
+    mutationFn: (data: { baseRevisionId?: string | null; body: string; changeSummary?: string | null; source?: string }) => {
+      if (!document) throw new Error("Document not found");
+      return documentsApi.createRevision(document.id, data);
+    },
+    onSuccess: () => {
+      if (!project?.id || !document?.id) return;
+      queryClient.invalidateQueries({ queryKey: queryKeys.documents.project(project.id) });
+      queryClient.invalidateQueries({ queryKey: queryKeys.documents.revisions(document.id) });
+      queryClient.invalidateQueries({ queryKey: queryKeys.documents.detail(document.id) });
+    },
+  });
 
   const uploadImage = useMutation({
     mutationFn: async (file: File) => {
@@ -257,6 +282,10 @@ export function ProjectDetail() {
     if (routeProjectRef === canonicalProjectRef) return;
     if (activeTab === "overview") {
       navigate(`/projects/${canonicalProjectRef}/overview`, { replace: true });
+      return;
+    }
+    if (activeTab === "document") {
+      navigate(`/projects/${canonicalProjectRef}/document`, { replace: true });
       return;
     }
     if (activeTab === "list") {
@@ -289,6 +318,8 @@ export function ProjectDetail() {
   const handleTabChange = (tab: ProjectTab) => {
     if (tab === "overview") {
       navigate(`/projects/${canonicalProjectRef}/overview`);
+    } else if (tab === "document") {
+      navigate(`/projects/${canonicalProjectRef}/document`);
     } else {
       navigate(`/projects/${canonicalProjectRef}/issues`);
     }
@@ -325,6 +356,16 @@ export function ProjectDetail() {
         </button>
         <button
           className={`px-3 py-2 text-sm font-medium transition-colors border-b-2 ${
+            activeTab === "document"
+              ? "border-foreground text-foreground"
+              : "border-transparent text-muted-foreground hover:text-foreground"
+          }`}
+          onClick={() => handleTabChange("document")}
+        >
+          Document
+        </button>
+        <button
+          className={`px-3 py-2 text-sm font-medium transition-colors border-b-2 ${
             activeTab === "list"
               ? "border-foreground text-foreground"
               : "border-transparent text-muted-foreground hover:text-foreground"
@@ -349,6 +390,19 @@ export function ProjectDetail() {
 
       {activeTab === "list" && project?.id && resolvedCompanyId && (
         <ProjectIssuesList projectId={project.id} companyId={resolvedCompanyId} />
+      )}
+
+      {activeTab === "document" && (
+        <DocumentWorkspace
+          heading="Project Document"
+          document={document}
+          revisions={revisions ?? []}
+          onSave={async (data) => {
+            await saveDocument.mutateAsync(data);
+          }}
+          isSaving={saveDocument.isPending}
+          emptyLabel="No project document yet."
+        />
       )}
     </div>
   );

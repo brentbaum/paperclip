@@ -51,6 +51,7 @@ function defaultConfig(): PaperclipConfig {
       port: 3100,
       allowedHostnames: [],
       serveUi: true,
+      tailscaleServe: false,
     },
     auth: {
       baseUrlMode: "auto",

@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { Link, useNavigate, useParams, useSearchParams } from "@/lib/router";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { approvalsApi } from "../api/approvals";
+import { documentsApi } from "../api/documents";
 import { agentsApi } from "../api/agents";
 import { useCompany } from "../context/CompanyContext";
 import { useBreadcrumbs } from "../context/BreadcrumbContext";
@@ -15,6 +16,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { CheckCircle2, ChevronRight, Sparkles } from "lucide-react";
 import type { ApprovalComment } from "@paperclipai/shared";
 import { MarkdownBody } from "../components/MarkdownBody";
+import { DocumentWorkspace } from "../components/DocumentWorkspace";
 
 export function ApprovalDetail() {
   const { approvalId } = useParams<{ approvalId: string }>();
@@ -50,6 +52,18 @@ export function ApprovalDetail() {
     queryKey: queryKeys.agents.list(resolvedCompanyId ?? ""),
     queryFn: () => agentsApi.list(resolvedCompanyId ?? ""),
     enabled: !!resolvedCompanyId,
+  });
+
+  const { data: document } = useQuery({
+    queryKey: queryKeys.documents.approval(approvalId!),
+    queryFn: () => documentsApi.getApprovalDocument(approvalId!),
+    enabled: !!approvalId && approval?.type === "approve_ceo_strategy",
+  });
+
+  const { data: revisions } = useQuery({
+    queryKey: queryKeys.documents.revisions(document?.id ?? ""),
+    queryFn: () => documentsApi.listRevisions(document!.id),
+    enabled: Boolean(document?.id),
   });
 
   useEffect(() => {
@@ -129,6 +143,23 @@ export function ApprovalDetail() {
       refresh();
     },
     onError: (err) => setError(err instanceof Error ? err.message : "Comment failed"),
+  });
+
+  const saveDocumentMutation = useMutation({
+    mutationFn: (data: { baseRevisionId?: string | null; body: string; changeSummary?: string | null; source?: string }) => {
+      if (!document) throw new Error("Document not found");
+      return documentsApi.createRevision(document.id, data);
+    },
+    onSuccess: () => {
+      setError(null);
+      refresh();
+      if (document?.id) {
+        queryClient.invalidateQueries({ queryKey: queryKeys.documents.approval(approvalId!) });
+        queryClient.invalidateQueries({ queryKey: queryKeys.documents.revisions(document.id) });
+        queryClient.invalidateQueries({ queryKey: queryKeys.documents.detail(document.id) });
+      }
+    },
+    onError: (err) => setError(err instanceof Error ? err.message : "Document save failed"),
   });
 
   const deleteAgentMutation = useMutation({
@@ -316,6 +347,19 @@ export function ApprovalDetail() {
           )}
         </div>
       </div>
+
+      {approval.type === "approve_ceo_strategy" && (
+        <DocumentWorkspace
+          heading="Strategy Document"
+          document={document}
+          revisions={revisions ?? []}
+          onSave={async (data) => {
+            await saveDocumentMutation.mutateAsync(data);
+          }}
+          isSaving={saveDocumentMutation.isPending}
+          emptyLabel="No strategy document yet."
+        />
+      )}
 
       <div className="border border-border rounded-lg p-4 space-y-3">
         <h3 className="text-sm font-medium">Comments ({comments?.length ?? 0})</h3>

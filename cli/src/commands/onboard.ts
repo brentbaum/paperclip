@@ -47,6 +47,7 @@ function quickstartDefaults(): Pick<PaperclipConfig, "database" | "logging" | "s
       port: 3100,
       allowedHostnames: [],
       serveUi: true,
+      tailscaleServe: false,
     },
     auth: {
       baseUrlMode: "auto",

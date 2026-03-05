@@ -56,6 +56,16 @@ Tasks have parentage. Every task exists in service of a parent task, all the way
 
 More detailed task structure TBD.
 
+### Documents
+
+Paperclip also manages a small set of **governed documents** that are part of the control plane itself:
+
+- **Approval documents** — long-form plans or proposals that the board can edit before approving or requesting revision
+- **Agent daily scratchpads** — a per-agent, per-day markdown document that both the board and the agent can edit
+- **Project documents** — the durable brief/spec for a project
+
+These are not a general-purpose knowledge base or file system. They are lightweight markdown artifacts with revision history, attribution, and diff visibility so the board can see what an agent changed and agents can pick up new notes on heartbeat.
+
 ## Principles
 
 1. **Unopinionated about how you run your agents.** Your agents could be OpenClaw bots, Python scripts, Node scripts, Claude Code sessions, Codex instances — we don't care. Paperclip defines the control plane for communication and provides utility infrastructure for heartbeats. It does not mandate an agent runtime.
@@ -66,7 +76,9 @@ More detailed task structure TBD.
 
 4. **All work traces to the goal.** Hierarchical task management means nothing exists in isolation. If you can't explain why a task matters to the company goal, it shouldn't exist.
 
-5. **Control plane, not execution plane.** Paperclip orchestrates. Agents run wherever they run and phone home.
+5. **Documents are governed artifacts, not a wiki.** Core documents exist only where they support planning, approvals, and ongoing coordination. Broad knowledge-base features remain out of scope.
+
+6. **Control plane, not execution plane.** Paperclip orchestrates. Agents run wherever they run and phone home.
 
 ## User Flow (Dream Scenario)
 

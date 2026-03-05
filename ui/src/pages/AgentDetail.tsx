@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useState, useRef } from "react";
 import { useParams, useNavigate, Link, useBeforeUnload } from "@/lib/router";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { agentsApi, type AgentKey, type ClaudeLoginResult } from "../api/agents";
+import { documentsApi } from "../api/documents";
 import { heartbeatsApi } from "../api/heartbeats";
 import { ChartCard, RunActivityChart, PriorityChart, IssueStatusChart, SuccessRateChart } from "../components/ActivityCharts";
 import { activityApi } from "../api/activity";
@@ -23,6 +24,7 @@ import { CopyText } from "../components/CopyText";
 import { EntityRow } from "../components/EntityRow";
 import { Identity } from "../components/Identity";
 import { PageSkeleton } from "../components/PageSkeleton";
+import { DocumentWorkspace } from "../components/DocumentWorkspace";
 import { formatCents, formatDate, relativeTime, formatTokens } from "../lib/utils";
 import { cn } from "../lib/utils";
 import { Button } from "@/components/ui/button";
@@ -171,12 +173,20 @@ function scrollToContainerBottom(container: ScrollContainer, behavior: ScrollBeh
   container.scrollTo({ top: container.scrollHeight, behavior });
 }
 
-type AgentDetailView = "overview" | "configure" | "runs";
+type AgentDetailView = "overview" | "scratchpad" | "configure" | "runs";
 
 function parseAgentDetailView(value: string | null): AgentDetailView {
   if (value === "configure" || value === "configuration") return "configure";
+  if (value === "scratchpad") return "scratchpad";
   if (value === "runs") return value;
   return "overview";
+}
+
+function localDayString(date: Date): string {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
 }
 
 function usageNumber(usage: Record<string, unknown> | null, ...keys: string[]) {
@@ -264,6 +274,7 @@ export function AgentDetail() {
   const resolvedCompanyId = agent?.companyId ?? selectedCompanyId;
   const canonicalAgentRef = agent ? agentRouteRef(agent) : routeAgentRef;
   const agentLookupRef = agent?.id ?? routeAgentRef;
+  const scratchpadDay = useMemo(() => localDayString(new Date()), []);
 
   const { data: runtimeState } = useQuery({
     queryKey: queryKeys.agents.runtimeState(agentLookupRef),
@@ -287,6 +298,20 @@ export function AgentDetail() {
     queryKey: queryKeys.agents.list(resolvedCompanyId!),
     queryFn: () => agentsApi.list(resolvedCompanyId!),
     enabled: !!resolvedCompanyId,
+  });
+  const { data: scratchpadDocument } = useQuery({
+    queryKey: agent?.id
+      ? queryKeys.documents.agentDaily(agent.id, scratchpadDay)
+      : ["documents", "agent-daily", "none", scratchpadDay],
+    queryFn: () => documentsApi.getAgentDailyDocument(agent!.id, scratchpadDay),
+    enabled: Boolean(agent?.id),
+  });
+  const { data: scratchpadRevisions } = useQuery({
+    queryKey: scratchpadDocument?.id
+      ? queryKeys.documents.revisions(scratchpadDocument.id)
+      : ["documents", "revisions", "none"],
+    queryFn: () => documentsApi.listRevisions(scratchpadDocument!.id),
+    enabled: Boolean(scratchpadDocument?.id),
   });
 
   const assignedIssues = (allIssues ?? [])
@@ -388,6 +413,21 @@ export function AgentDetail() {
       setActionError(err instanceof Error ? err.message : "Failed to update permissions");
     },
   });
+  const saveScratchpad = useMutation({
+    mutationFn: (data: { baseRevisionId?: string | null; body: string; changeSummary?: string | null; source?: string }) => {
+      if (!scratchpadDocument) throw new Error("Scratchpad not found");
+      return documentsApi.createRevision(scratchpadDocument.id, data);
+    },
+    onSuccess: () => {
+      if (!agent?.id || !scratchpadDocument?.id) return;
+      queryClient.invalidateQueries({ queryKey: queryKeys.documents.agentDaily(agent.id, scratchpadDay) });
+      queryClient.invalidateQueries({ queryKey: queryKeys.documents.revisions(scratchpadDocument.id) });
+      queryClient.invalidateQueries({ queryKey: queryKeys.documents.detail(scratchpadDocument.id) });
+    },
+    onError: (err) => {
+      setActionError(err instanceof Error ? err.message : "Failed to save scratchpad");
+    },
+  });
 
   useEffect(() => {
     const crumbs: { label: string; href?: string }[] = [
@@ -401,6 +441,8 @@ export function AgentDetail() {
       if (urlRunId) {
         crumbs.push({ label: "Runs", href: `/agents/${canonicalAgentRef}/runs` });
         crumbs.push({ label: `Run ${urlRunId.slice(0, 8)}` });
+      } else if (activeView === "scratchpad") {
+        crumbs.push({ label: "Scratchpad" });
       } else if (activeView === "configure") {
         crumbs.push({ label: "Configure" });
       } else if (activeView === "runs") {
@@ -563,6 +605,53 @@ export function AgentDetail() {
         </p>
       )}
 
+      <div className="flex items-center gap-1 border-b border-border">
+        <button
+          className={cn(
+            "px-3 py-2 text-sm font-medium transition-colors border-b-2",
+            activeView === "overview"
+              ? "border-foreground text-foreground"
+              : "border-transparent text-muted-foreground hover:text-foreground",
+          )}
+          onClick={() => navigate(`/agents/${canonicalAgentRef}`)}
+        >
+          Overview
+        </button>
+        <button
+          className={cn(
+            "px-3 py-2 text-sm font-medium transition-colors border-b-2",
+            activeView === "scratchpad"
+              ? "border-foreground text-foreground"
+              : "border-transparent text-muted-foreground hover:text-foreground",
+          )}
+          onClick={() => navigate(`/agents/${canonicalAgentRef}/scratchpad`)}
+        >
+          Scratchpad
+        </button>
+        <button
+          className={cn(
+            "px-3 py-2 text-sm font-medium transition-colors border-b-2",
+            activeView === "runs"
+              ? "border-foreground text-foreground"
+              : "border-transparent text-muted-foreground hover:text-foreground",
+          )}
+          onClick={() => navigate(`/agents/${canonicalAgentRef}/runs`)}
+        >
+          Runs
+        </button>
+        <button
+          className={cn(
+            "px-3 py-2 text-sm font-medium transition-colors border-b-2",
+            activeView === "configure"
+              ? "border-foreground text-foreground"
+              : "border-transparent text-muted-foreground hover:text-foreground",
+          )}
+          onClick={() => navigate(`/agents/${canonicalAgentRef}/configure`)}
+        >
+          Configure
+        </button>
+      </div>
+
       {/* Floating Save/Cancel (desktop) */}
       {!isMobile && (
         <div
@@ -630,6 +719,21 @@ export function AgentDetail() {
           directReports={directReports}
           agentId={agent.id}
           agentRouteId={canonicalAgentRef}
+        />
+      )}
+
+      {activeView === "scratchpad" && (
+        <DocumentWorkspace
+          heading={scratchpadDocument?.title ?? `Daily Scratchpad · ${scratchpadDay}`}
+          hideTitleLine
+          document={scratchpadDocument}
+          revisions={scratchpadRevisions ?? []}
+          onSave={async (data) => {
+            await saveScratchpad.mutateAsync(data);
+          }}
+          isSaving={saveScratchpad.isPending}
+          saveSource="board_edit"
+          emptyLabel="No scratchpad document yet."
         />
       )}
 

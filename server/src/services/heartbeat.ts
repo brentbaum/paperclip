@@ -21,6 +21,7 @@ import type { AdapterExecutionResult, AdapterInvocationMeta, AdapterSessionCodec
 import { createLocalAgentJwt } from "../agent-auth-jwt.js";
 import { parseObject, asBoolean, asNumber, appendWithCap, MAX_EXCERPT_BYTES } from "../adapters/utils.js";
 import { secretService } from "./secrets.js";
+import { documentService } from "./documents.js";
 import { resolveDefaultAgentWorkspaceDir } from "../home-paths.js";
 
 const MAX_LIVE_LOG_CHUNK_BYTES = 8 * 1024;
@@ -292,6 +293,7 @@ function resolveNextSessionState(input: {
 export function heartbeatService(db: Db) {
   const runLogStore = getRunLogStore();
   const secretsSvc = secretService(db);
+  const documentsSvc = documentService(db);
 
   async function getAgent(agentId: string) {
     return db
@@ -971,6 +973,22 @@ export function heartbeatService(db: Db) {
       sessionDisplayId: previousSessionDisplayId,
       taskKey,
     };
+    const changedDocuments = await documentsSvc.listChangedRelevantDocumentsForAgent(agent.id);
+    context.paperclipDocuments = {
+      changed: changedDocuments.map((document) => ({
+        id: document.id,
+        scope: document.scope,
+        title: document.title,
+        projectId: document.projectId,
+        approvalId: document.approvalId,
+        agentId: document.agentId,
+        day: document.day,
+        latestRevisionId: document.latestRevisionId,
+        updatedAt: document.updatedAt,
+        body: document.latestRevision?.body ?? "",
+      })),
+      asOf: new Date().toISOString(),
+    };
 
     let seq = 1;
     let handle: RunLogHandle | null = null;
@@ -1107,6 +1125,9 @@ export function heartbeatService(db: Db) {
         onMeta: onAdapterMeta,
         authToken: authToken ?? undefined,
       });
+      if (changedDocuments.length > 0) {
+        await documentsSvc.markDeliveredToAgent(agent.id, changedDocuments);
+      }
       const nextSessionState = resolveNextSessionState({
         codec: sessionCodec,
         adapterResult,

@@ -2,6 +2,7 @@ export { companyService } from "./companies.js";
 export { agentService } from "./agents.js";
 export { assetService } from "./assets.js";
 export { projectService } from "./projects.js";
+export { documentService } from "./documents.js";
 export { issueService, type IssueFilters } from "./issues.js";
 export { issueApprovalService } from "./issue-approvals.js";
 export { goalService } from "./goals.js";

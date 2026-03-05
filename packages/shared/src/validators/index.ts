@@ -56,6 +56,15 @@ export {
 } from "./project.js";
 
 export {
+  createDocumentRevisionSchema,
+  documentDiffQuerySchema,
+  documentDayQuerySchema,
+  type CreateDocumentRevision,
+  type DocumentDiffQuery,
+  type DocumentDayQuery,
+} from "./document.js";
+
+export {
   createIssueSchema,
   createIssueLabelSchema,
   updateIssueSchema,

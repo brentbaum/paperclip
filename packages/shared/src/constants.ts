@@ -113,6 +113,12 @@ export const PROJECT_STATUSES = [
 ] as const;
 export type ProjectStatus = (typeof PROJECT_STATUSES)[number];
 
+export const DOCUMENT_SCOPES = ["project", "approval", "agent_daily"] as const;
+export type DocumentScope = (typeof DOCUMENT_SCOPES)[number];
+
+export const DOCUMENT_FORMATS = ["markdown"] as const;
+export type DocumentFormat = (typeof DOCUMENT_FORMATS)[number];
+
 export const PROJECT_COLORS = [
   "#6366f1", // indigo
   "#8b5cf6", // violet

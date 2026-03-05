@@ -11,6 +11,7 @@ import { validate } from "../middleware/validate.js";
 import { logger } from "../middleware/logger.js";
 import {
   approvalService,
+  documentService,
   heartbeatService,
   issueApprovalService,
   logActivity,
@@ -29,6 +30,7 @@ function redactApprovalPayload<T extends { payload: Record<string, unknown> }>(a
 export function approvalRoutes(db: Db) {
   const router = Router();
   const svc = approvalService(db);
+  const documentsSvc = documentService(db);
   const heartbeat = heartbeatService(db);
   const issueApprovalsSvc = issueApprovalService(db);
   const secretsSvc = secretService(db);
@@ -85,6 +87,15 @@ export function approvalRoutes(db: Db) {
       updatedAt: new Date(),
     });
 
+    let responseApproval = approval;
+    if (approval.type === "approve_ceo_strategy") {
+      await documentsSvc.getOrCreateApprovalDocument(approval.id, {
+        agentId: actor.agentId,
+        userId: actor.actorType === "user" ? actor.actorId : null,
+      });
+      responseApproval = (await svc.getById(approval.id)) ?? approval;
+    }
+
     if (uniqueIssueIds.length > 0) {
       await issueApprovalsSvc.linkManyForApproval(approval.id, uniqueIssueIds, {
         agentId: actor.agentId,
@@ -103,7 +114,7 @@ export function approvalRoutes(db: Db) {
       details: { type: approval.type, issueIds: uniqueIssueIds },
     });
 
-    res.status(201).json(redactApprovalPayload(approval));
+    res.status(201).json(redactApprovalPayload(responseApproval));
   });
 
   router.get("/approvals/:id/issues", async (req, res) => {
@@ -271,10 +282,17 @@ export function approvalRoutes(db: Db) {
             req.body.payload,
             { strictMode: strictSecretsMode },
           )
-        : req.body.payload
+      : req.body.payload
       : undefined;
-    const approval = await svc.resubmit(id, normalizedPayload);
     const actor = getActorInfo(req);
+    const approval = await svc.resubmit(id, normalizedPayload);
+    if (approval.type === "approve_ceo_strategy") {
+      await documentsSvc.getOrCreateApprovalDocument(approval.id, {
+        agentId: actor.agentId,
+        userId: actor.actorType === "user" ? actor.actorId : null,
+      });
+    }
+    const responseApproval = (await svc.getById(approval.id)) ?? approval;
     await logActivity(db, {
       companyId: approval.companyId,
       actorType: actor.actorType,
@@ -285,7 +303,7 @@ export function approvalRoutes(db: Db) {
       entityId: approval.id,
       details: { type: approval.type },
     });
-    res.json(redactApprovalPayload(approval));
+    res.json(redactApprovalPayload(responseApproval));
   });
 
   router.get("/approvals/:id/comments", async (req, res) => {

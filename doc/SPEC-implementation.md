@@ -18,7 +18,7 @@ Paperclip V1 must provide a full control-plane loop for autonomous agents:
 1. A human board creates a company and defines goals.
 2. The board creates and manages agents in an org tree.
 3. Agents receive and execute tasks via heartbeat invocations.
-4. All work is tracked through tasks/comments with audit visibility.
+4. All work is tracked through tasks/comments/documents with audit visibility.
 5. Token/cost usage is reported and budget limits can stop work.
 6. The board can intervene anywhere (pause agents/tasks, override decisions).
 
@@ -35,7 +35,7 @@ These decisions close open questions from `SPEC.md` for V1.
 | Board | Single human board operator per deployment |
 | Org graph | Strict tree (`reports_to` nullable root); no multi-manager reporting |
 | Visibility | Full visibility to board and all agents in same company |
-| Communication | Tasks + comments only (no separate chat system) |
+| Communication | Tasks + comments for operational coordination; governed documents for long-form review/context |
 | Task ownership | Single assignee; atomic checkout required for `in_progress` transition |
 | Recovery | No automatic reassignment; stale work is surfaced, not silently fixed |
 | Agent adapters | Built-in `process` and `http` adapters |
@@ -62,6 +62,7 @@ V1 implementation extends this baseline into a company-centric, governance-aware
 - Goal hierarchy linked to company mission
 - Agent lifecycle with org structure and adapter configuration
 - Task lifecycle with parent/child hierarchy and comments
+- Governed document lifecycle with append-only revisions and diff visibility
 - Atomic task checkout and explicit task status transitions
 - Board approvals for hires and CEO strategy proposal
 - Heartbeat invocation, status tracking, and cancellation
@@ -75,7 +76,7 @@ V1 implementation extends this baseline into a company-centric, governance-aware
 
 - Plugin framework and third-party extension SDK
 - Revenue/expense accounting beyond model/token costs
-- Knowledge base subsystem
+- Broad knowledge base / wiki / search subsystem
 - Public marketplace (ClipHub)
 - Multi-board governance or role-based human permission granularity
 - Automatic self-healing orchestration (auto-reassign/retry planners)
@@ -186,6 +187,75 @@ Invariant: at least one root `company` level goal per company.
 - `lead_agent_id` uuid fk `agents.id` null
 - `target_date` date null
 
+## 7.5a `documents`
+
+- `id` uuid pk
+- `company_id` uuid fk not null
+- `scope` enum: `project | approval | agent_daily`
+- `title` text not null
+- `format` enum: `markdown`
+- `project_id` uuid fk `projects.id` null
+- `approval_id` uuid fk `approvals.id` null
+- `agent_id` uuid fk `agents.id` null
+- `day` date null
+- `latest_revision_id` uuid fk `document_revisions.id` null
+- `created_by_agent_id` uuid fk `agents.id` null
+- `created_by_user_id` uuid fk `users.id` null
+- `archived_at` timestamptz null
+
+Invariants:
+
+- each document belongs to exactly one company
+- exactly one scope owner is populated:
+  - `project` => `project_id`
+  - `approval` => `approval_id`
+  - `agent_daily` => `agent_id` + `day`
+- at most one primary document exists for a given project
+- at most one document exists for a given approval
+- at most one daily document exists per `(agent_id, day)` pair
+
+V1 policy:
+
+- project documents are the primary brief/spec for a project
+- approval documents hold the editable long-form proposal under review
+- agent daily documents are keyed by UTC calendar date (`YYYY-MM-DD`)
+
+## 7.5b `document_revisions`
+
+- `id` uuid pk
+- `company_id` uuid fk not null
+- `document_id` uuid fk `documents.id` not null
+- `revision_number` int not null
+- `parent_revision_id` uuid fk `document_revisions.id` null
+- `author_agent_id` uuid fk `agents.id` null
+- `author_user_id` uuid fk `users.id` null
+- `source` text not null
+- `change_summary` text null
+- `body` text not null
+- `created_at` timestamptz not null default now()
+
+Invariants:
+
+- revisions are append-only; prior revision bodies are never mutated
+- `revision_number` is strictly increasing per document
+- each revision stores a full markdown snapshot, not a patch
+
+## 7.5c `document_agent_states`
+
+- `id` uuid pk
+- `company_id` uuid fk not null
+- `document_id` uuid fk `documents.id` not null
+- `agent_id` uuid fk `agents.id` not null
+- `last_delivered_revision_id` uuid fk `document_revisions.id` null
+- `last_written_revision_id` uuid fk `document_revisions.id` null
+- `updated_at` timestamptz not null default now()
+
+Purpose:
+
+- tracks which revision of a relevant document was last delivered to an agent heartbeat
+- allows the server to include only changed documents in later heartbeats
+- supports simple "new since the agent last saw this" UI badges
+
 ## 7.6 `issues` (core task entity)
 
 - `id` uuid pk
@@ -260,11 +330,27 @@ Invariant: each event must attach to agent and company; rollups are aggregation,
 - `type` enum: `hire_agent | approve_ceo_strategy`
 - `requested_by_agent_id` uuid fk `agents.id` null
 - `requested_by_user_id` uuid fk `users.id` null
-- `status` enum: `pending | approved | rejected | cancelled`
+- `status` enum: `pending | revision_requested | approved | rejected | cancelled`
 - `payload` jsonb not null
 - `decision_note` text null
 - `decided_by_user_id` uuid fk `users.id` null
 - `decided_at` timestamptz null
+
+V1 document rule:
+
+- `approve_ceo_strategy` approvals must have exactly one linked `documents` row scoped to the approval
+- approval payload should store summary metadata and document refs, not the canonical markdown body
+
+## 7.10a `approval_comments`
+
+- `id` uuid pk
+- `company_id` uuid fk not null
+- `approval_id` uuid fk `approvals.id` not null
+- `author_agent_id` uuid fk `agents.id` null
+- `author_user_id` uuid fk `users.id` null
+- `body` text not null
+- `created_at` timestamptz not null default now()
+- `updated_at` timestamptz not null default now()
 
 ## 7.11 `activity_log`
 
@@ -300,6 +386,13 @@ Operational policy:
 - `issues(company_id, assignee_agent_id, status)`
 - `issues(company_id, parent_id)`
 - `issues(company_id, project_id)`
+- `documents(company_id, scope, archived_at)`
+- `documents(company_id, project_id)` unique where `project_id is not null`
+- `documents(company_id, approval_id)` unique where `approval_id is not null`
+- `documents(company_id, agent_id, day)` unique where `scope = 'agent_daily'`
+- `document_revisions(document_id, revision_number desc)`
+- `document_agent_states(agent_id, document_id)`
+- `approval_comments(approval_id, created_at desc)`
 - `cost_events(company_id, occurred_at)`
 - `cost_events(company_id, agent_id, occurred_at)`
 - `heartbeat_runs(company_id, agent_id, started_at desc)`
@@ -365,8 +458,9 @@ Side effects:
 
 ## 8.3 Approval Status
 
-- `pending -> approved | rejected | cancelled`
-- terminal after decision
+- `pending -> revision_requested | approved | rejected | cancelled`
+- `revision_requested -> pending | approved | rejected | cancelled`
+- terminal after `approved | rejected | cancelled`
 
 ## 9. Auth and Permissions
 
@@ -381,7 +475,9 @@ Side effects:
 - Bearer API key mapped to one agent and company
 - Agent key scope:
   - read org/task/company context for own company
+  - read documents in own company
   - read/write own assigned tasks and comments
+  - append revisions to allowed documents in own company
   - create tasks/comments for delegation
   - report heartbeat status
   - report cost events
@@ -398,6 +494,7 @@ Side effects:
 | Hire/create agent | yes (direct) | request via approval |
 | Pause/resume agent | yes | no |
 | Create/update task | yes | yes |
+| Create/update governed document revision | yes | yes |
 | Force reassign task | yes | limited |
 | Approve strategy/hire requests | yes | no |
 | Report cost | yes | yes |
@@ -474,11 +571,33 @@ Server behavior:
 - `POST /companies/:companyId/projects`
 - `GET /projects/:projectId`
 - `PATCH /projects/:projectId`
+- `GET /projects/:projectId/document`
+
+## 10.5a Documents
+
+- `GET /approvals/:approvalId/document`
+- `GET /agents/:agentId/daily-document?day=YYYY-MM-DD`
+- `GET /documents/:documentId`
+- `GET /documents/:documentId/revisions`
+- `GET /documents/:documentId/revisions/:revisionId`
+- `GET /documents/:documentId/diff?from=:revisionId&to=:revisionId`
+- `POST /documents/:documentId/revisions`
+
+Document write semantics:
+
+- writes create a new `document_revisions` row and update `documents.latest_revision_id`
+- writes must fail with `409` if the caller provides an outdated base revision for optimistic concurrency
+- board may edit any company document
+- agents may edit documents in their company, but adapter/tool guidance should restrict them to relevant docs
 
 ## 10.6 Approvals
 
 - `GET /companies/:companyId/approvals?status=pending`
 - `POST /companies/:companyId/approvals`
+- `GET /approvals/:approvalId/comments`
+- `POST /approvals/:approvalId/comments`
+- `POST /approvals/:approvalId/request-revision`
+- `POST /approvals/:approvalId/resubmit`
 - `POST /approvals/:approvalId/approve`
 - `POST /approvals/:approvalId/reject`
 
@@ -572,7 +691,19 @@ Behavior:
 ## 11.4 Context Delivery
 
 - `thin`: send IDs and pointers only; agent fetches context via API
-- `fat`: include current assignments, goal summary, budget snapshot, and recent comments
+- `fat`: include current assignments, goal summary, budget snapshot, recent comments, and relevant changed documents
+
+Relevant documents for V1:
+
+- the agent's daily scratchpad for the current UTC date
+- project documents for projects attached to the agent's assigned issues
+- approval documents for approvals the agent requested or that gate the agent's work
+
+Delivery behavior:
+
+- heartbeat context includes `documentId`, latest revision metadata, and markdown body for changed relevant docs
+- on successful invoke handoff, server updates `document_agent_states.last_delivered_revision_id`
+- later heartbeats include only newer revisions unless a full refresh is requested
 
 ## 11.5 Scheduler Rules
 
@@ -601,9 +732,10 @@ Board can bypass request flow and create agents directly via UI; direct create i
 
 ## 12.2 CEO Strategy Approval
 
-1. CEO posts strategy proposal as `approval(type=approve_ceo_strategy)`.
-2. Board reviews payload (plan text, initial structure, high-level tasks).
-3. Approval unlocks execution state for CEO-created delegated work.
+1. CEO posts strategy proposal as `approval(type=approve_ceo_strategy)` plus an approval-scoped document.
+2. Board reviews and may directly edit the document, add comments, request revision, or approve.
+3. Document revisions remain the audit trail for what changed during review.
+4. Approval unlocks execution state for CEO-created delegated work.
 
 Before first strategy approval, CEO may only draft tasks, not transition them to active execution states.
 
@@ -615,6 +747,21 @@ Board can at any time:
 - reassign or cancel any task
 - edit budgets and limits
 - approve/reject/cancel pending approvals
+- edit any governed document in the company
+
+## 12.4 Governed Document Flows
+
+Project documents:
+
+1. Each project has one primary markdown document.
+2. The board or an agent may update it by appending a revision.
+3. UI shows current body plus revision history and diffs between revisions.
+
+Agent daily scratchpads:
+
+1. Each agent may have one daily document per UTC day.
+2. The board can leave notes there; the next heartbeat should receive any unseen changes.
+3. Agents may edit the same document back, creating attributed revisions.
 
 ## 13. Cost and Budget System
 
@@ -672,14 +819,21 @@ V1 UI routes:
 - `/companies/:id/org` org chart and agent status
 - `/companies/:id/tasks` task list/kanban
 - `/companies/:id/agents/:agentId` agent detail
+- `/companies/:id/agents/:agentId/scratchpad` agent daily scratchpad
+- `/companies/:id/projects/:projectId` project detail with primary document
 - `/companies/:id/costs` cost and budget dashboard
 - `/companies/:id/approvals` pending/history approvals
+- `/approvals/:approvalId` approval detail with editable approval document
 - `/companies/:id/activity` audit/event stream
 
 Required UX behaviors:
 
 - global company selector
 - quick actions: pause/resume agent, create task, approve/reject request
+- editable markdown document surfaces for project docs, approval docs, and agent scratchpads
+- revision history and diff comparison for every document
+- clear attribution for user-edited vs agent-edited revisions
+- visible "updated since last heartbeat/view" indicators on relevant documents
 - conflict toasts on atomic checkout failure
 - clear stale-task indicators
 - no silent background failures; every failed run visible in UI
@@ -709,6 +863,7 @@ Required UX behaviors:
 - API p95 latency under 250 ms for standard CRUD at 1k tasks/company
 - heartbeat invoke acknowledgement under 2 s for process adapter
 - no lost approval decisions (transactional writes)
+- no lost document revisions under concurrent writes (optimistic concurrency + append-only history)
 
 ## 16. Security Requirements
 
@@ -723,6 +878,7 @@ Required UX behaviors:
 ## 17.1 Unit Tests
 
 - state transition guards (agent, issue, approval)
+- document scope uniqueness and revision sequencing
 - budget enforcement rules
 - adapter invocation/cancel semantics
 
@@ -730,12 +886,15 @@ Required UX behaviors:
 
 - atomic checkout conflict behavior
 - approval-to-agent creation flow
+- approval document revision + request-revision + resubmit flow
 - cost ingestion and rollup correctness
 - pause while run is active (graceful cancel then force kill)
+- heartbeat context includes changed documents only
 
 ## 17.3 End-to-End Tests
 
 - board creates company -> hires CEO -> approves strategy -> CEO receives work
+- board edits CEO strategy document -> requests revision -> CEO resubmits -> board approves
 - agent reports cost -> budget threshold reached -> auto-pause occurs
 - task delegation across teams with request depth increment
 
@@ -762,6 +921,7 @@ A release candidate is blocked unless these pass:
 - implement atomic checkout endpoint
 - implement issue comments and lifecycle guards
 - implement approvals table and hire/strategy workflows
+- implement governed documents + revisions for strategy approval
 
 ## Milestone 3: Heartbeat and Adapter Runtime
 
@@ -780,6 +940,7 @@ A release candidate is blocked unless these pass:
 
 - add company selector and org chart view
 - add approvals and cost pages
+- add project doc and agent scratchpad surfaces
 - add operational dashboard and stale-task surfacing
 
 ## Milestone 6: Hardening and Release
@@ -796,7 +957,7 @@ V1 is complete only when all criteria are true:
 2. A company can run at least one active heartbeat-enabled agent.
 3. Task checkout is conflict-safe with `409` on concurrent claims.
 4. Agents can update tasks/comments and report costs with API keys only.
-5. Board can approve/reject hire and CEO strategy requests in UI.
+5. Board can approve/reject hire and CEO strategy requests in UI, with strategy review happening on an editable document.
 6. Budget hard limit auto-pauses an agent and prevents new invocations.
 7. Dashboard shows accurate counts/spend from live DB data.
 8. Every mutation is auditable in activity log.

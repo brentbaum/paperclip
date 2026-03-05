@@ -242,7 +242,7 @@ This is "graceful signal + stop future heartbeats." The current run gets a chanc
 
 ## 5. Inter-Agent Communication [DRAFT]
 
-All agent communication flows through the **task system**.
+Operational coordination flows through the **task system**.
 
 ### Model: Tasks + Comments
 
@@ -250,7 +250,7 @@ All agent communication flows through the **task system**.
 - **Coordination** = commenting on tasks
 - **Status updates** = updating task status and fields
 
-There is no separate messaging or chat system. Tasks are the communication channel. This keeps all context attached to the work it relates to and creates a natural audit trail.
+There is no separate messaging or chat system. Tasks are the communication channel for delegation and discussion. Governed documents may exist alongside that work for longer-form plans, project briefs, and agent scratchpads. This keeps context attached to the work it relates to and creates a natural audit trail.
 
 ### Implications
 
@@ -403,7 +403,15 @@ No separate "agent API" vs. "board API." Same endpoints, different authorization
 
 ### Work Artifacts
 
-Paperclip does **not** manage work artifacts (code repos, file systems, deployments, documents). That's entirely the agent's domain. Paperclip tracks tasks and costs. Where and how work gets done is outside scope.
+Paperclip does **not** manage arbitrary work artifacts such as code repos, file systems, build outputs, or deployments. Those remain entirely in the agent's domain.
+
+Paperclip **does** manage a narrow class of governed markdown documents that are part of the control plane itself:
+
+- approval documents
+- project briefs/specs
+- agent daily scratchpads
+
+These exist so plans can be reviewed and edited in-place, and so agents and the board can maintain shared long-form context with revision visibility. This is intentionally much smaller than a general knowledge base.
 
 ### Open Questions
 
@@ -474,6 +482,7 @@ Each is a distinct page/route:
 - [ ] **Default CEO** — strategic planning, delegation, board communication
 - [ ] **Paperclip skill (SKILL.md)** — teaches agents to interact with the API
 - [ ] **REST API** — full API for agent interaction (Hono)
+- [ ] **Governed documents** — markdown-backed approval docs, project docs, and agent daily scratchpads with revision history
 - [ ] **Web UI** — React/Vite: org chart, task board, dashboard, cost views
 - [ ] **Agent auth** — connection string generation with URL + key + instructions
 - [ ] **One-command dev setup** — embedded PGlite, everything local
@@ -482,7 +491,7 @@ Each is a distinct page/route:
 ### Not V1
 
 - Template export/import
-- Knowledge base - a future plugin
+- Broad knowledge base / wiki / search - a future plugin
 - Advanced governance models (hiring budgets, multi-member boards)
 - Revenue/expense tracking beyond token costs - a future plugin
 - Public job board / open company features
@@ -491,9 +500,9 @@ Each is a distinct page/route:
 
 ## 11. Knowledge Base
 
-**Anti-goal for core.** The knowledge base is not part of the Paperclip core — it will be a plugin. The task system + comments + agent descriptions provide sufficient shared context.
+**Broad knowledge base is an anti-goal for core.** Paperclip core may include a small set of governed documents tied directly to approvals, projects, and agent scratchpads, but it does not include a general wiki, search layer, vector database, or open-ended document workspace.
 
-The architecture must support adding a knowledge base plugin later (clean API boundaries, hookable lifecycle events) but the core system explicitly does not include one.
+The architecture must support adding a richer knowledge base plugin later (clean API boundaries, hookable lifecycle events) without forcing V1 to solve broad knowledge management.
 
 ---
 
@@ -502,11 +511,11 @@ The architecture must support adding a knowledge base plugin later (clean API bo
 Things Paperclip explicitly does **not** do:
 
 - **Not an Agent runtime** — Paperclip orchestrates, Agents run elsewhere
-- **Not a knowledge base** — core has no wiki/docs/vector-DB (plugin territory)
+- **Not a broad knowledge base** — core has no general wiki/docs/search/vector-DB product
 - **Not a SaaS** — single-tenant, self-hosted
 - **Not opinionated about Agent implementation** — any language, any framework, any runtime
 - **Not automatically self-healing** — surfaces problems, doesn't silently fix them
-- **Does not manage work artifacts** — no repo management, no deployment, no file systems
+- **Does not manage arbitrary work artifacts** — no repo management, no deployment, no file systems, no general blob workspace
 - **Does not auto-reassign work** — stale tasks are surfaced, not silently redistributed
 - **Does not track external revenue/expenses** — that's a future plugin. Token/LLM cost budgeting is core.
 
@@ -516,7 +525,7 @@ Things Paperclip explicitly does **not** do:
 
 1. **Unopinionated about how you run your Agents.** Any language, any framework, any runtime. Paperclip is the control plane, not the execution plane.
 2. **Company is the unit of organization.** Everything lives under a Company.
-3. **Tasks are the communication channel.** All Agent communication flows through tasks + comments. No side channels.
+3. **Tasks are the operational communication channel.** Day-to-day coordination flows through tasks + comments. Documents are long-form governed artifacts attached to that work, not a separate chat system.
 4. **All work traces to the goal.** Hierarchical task management — nothing exists in isolation.
 5. **Board governs.** Humans retain control through the Board. Conservative defaults (human approval required).
 6. **Surface problems, don't hide them.** Good auditing and visibility. No silent auto-recovery.
