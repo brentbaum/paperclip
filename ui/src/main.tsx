@@ -15,6 +15,10 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import "@mdxeditor/editor/style.css";
 import "./index.css";
 
+if (import.meta.env.PROD) {
+  import("./register-sw");
+}
+
 const queryClient = new QueryClient({
   defaultOptions: {
     queries: {

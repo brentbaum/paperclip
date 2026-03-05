@@ -168,7 +168,7 @@ export function setupLiveEventsWebSocketServer(
     }
   }, 30000);
 
-  wss.on("connection", (socket, req) => {
+  wss.on("connection", (socket: WebSocket, req: IncomingMessage) => {
     const context = (req as IncomingMessageWithContext).paperclipUpgradeContext;
     if (!context) {
       socket.close(1008, "missing context");
@@ -194,7 +194,7 @@ export function setupLiveEventsWebSocketServer(
       aliveByClient.delete(socket);
     });
 
-    socket.on("error", (err) => {
+    socket.on("error", (err: Error) => {
       logger.warn({ err, companyId: context.companyId }, "live websocket client error");
     });
   });
@@ -229,7 +229,7 @@ export function setupLiveEventsWebSocketServer(
         const reqWithContext = req as IncomingMessageWithContext;
         reqWithContext.paperclipUpgradeContext = context;
 
-        wss.handleUpgrade(req, socket, head, (ws) => {
+        wss.handleUpgrade(req, socket, head, (ws: WebSocket) => {
           wss.emit("connection", ws, reqWithContext);
         });
       })

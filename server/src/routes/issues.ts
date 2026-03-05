@@ -183,6 +183,18 @@ export function issueRoutes(db: Db, storage: StorageService) {
     }
   });
 
+  // Alias: agents often call GET /issues/ without the company prefix.
+  // Redirect to the company-scoped route using the actor's companyId.
+  router.get("/issues", async (req, res) => {
+    const companyId = req.actor?.companyId ?? req.actor?.companyIds?.[0];
+    if (!companyId) {
+      res.status(400).json({ error: "Cannot infer company. Use GET /api/companies/{companyId}/issues instead." });
+      return;
+    }
+    const qs = new URL(req.originalUrl, "http://localhost").search;
+    res.redirect(307, `/api/companies/${companyId}/issues${qs}`);
+  });
+
   router.get("/companies/:companyId/issues", async (req, res) => {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);

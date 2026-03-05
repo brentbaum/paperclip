@@ -739,10 +739,15 @@ export function telegramService(db: Db, deps: TelegramServiceDeps) {
       const activeBot = await ensureBot();
       if (!activeBot) return;
       await registerHandlersIfNeeded();
-      await activeBot.start();
+      // bot.start() blocks forever (long-polling loop) — don't await it.
+      // Use onStart callback to know when polling has begun.
+      void activeBot.start({
+        onStart: () => {
+          started = true;
+          logger.info("telegram bot started");
+        },
+      });
       await subscribeToMappedCompanyEvents();
-      started = true;
-      logger.info("telegram bot started");
     })();
     try {
       await startPromise;

@@ -3,8 +3,22 @@ import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
 
-export default defineConfig({
-  plugins: [react(), tailwindcss()],
+export default defineConfig(async ({ command }) => ({
+  plugins: [
+    react(),
+    tailwindcss(),
+    command === "build" &&
+      (await import("vite-plugin-pwa")).VitePWA({
+        registerType: "autoUpdate",
+        manifest: false,
+        workbox: {
+          globPatterns: ["**/*.{js,css,html,png,svg,ico}"],
+          navigateFallback: "/index.html",
+          navigateFallbackDenylist: [/^\/api\//],
+          maximumFileSizeToCacheInBytes: 5 * 1024 * 1024,
+        },
+      }),
+  ].filter(Boolean),
   resolve: {
     alias: {
       "@": path.resolve(__dirname, "./src"),
@@ -19,4 +33,4 @@ export default defineConfig({
       },
     },
   },
-});
+}));
