@@ -1096,6 +1096,7 @@ export function heartbeatService(db: Db) {
           "local agent jwt secret missing or invalid; running without injected PAPERCLIP_API_KEY",
         );
       }
+      context.paperclipTools = { ...((context.paperclipTools as Record<string, unknown> | undefined) ?? {}), telegram: { sendEndpoint: "/api/agent-tools/telegram/send", defaultAgentId: agent.id, supportsStatusFlags: true } };
       const adapterResult = await adapter.execute({
         runId: run.id,
         agent,

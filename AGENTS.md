@@ -132,7 +132,13 @@ When adding endpoints:
 - Use company selection context for company-scoped pages
 - Surface failures clearly; do not silently ignore API errors
 
-## 10. Definition of Done
+## 10. Living Specs
+
+These docs are kept evergreen. Update them in-place when requirements or functionality change -- no changelog comments, just make the edit.
+
+- `doc/telegram-spec.md` -- Telegram integration: channel structure, commands, message flow, agent tools
+
+## 11. Definition of Done
 
 A change is done when all are true:
 

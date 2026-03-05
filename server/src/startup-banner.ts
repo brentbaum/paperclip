@@ -29,6 +29,7 @@ type StartupBannerOptions = {
   migrationSummary: string;
   heartbeatSchedulerEnabled: boolean;
   heartbeatSchedulerIntervalMs: number;
+  tailscaleServe?: boolean;
 };
 
 const ansi = {
@@ -153,6 +154,9 @@ export function printStartupBanner(opts: StartupBannerOptions): void {
         ? color(agentJwtSecret.message, "green")
         : color(agentJwtSecret.message, "yellow"),
     ),
+    opts.tailscaleServe
+      ? row("Tailscale", color("enabled", "green"))
+      : null,
     row("Heartbeat", heartbeat),
     row("Config", configPath),
     agentJwtSecret.status === "warn"

@@ -252,6 +252,7 @@ export {
   storageLocalDiskConfigSchema,
   storageS3ConfigSchema,
   secretsLocalEncryptedConfigSchema,
+  telegramConfigSchema,
   type PaperclipConfig,
   type LlmConfig,
   type DatabaseConfig,
@@ -264,4 +265,5 @@ export {
   type SecretsConfig,
   type SecretsLocalEncryptedConfig,
   type ConfigMeta,
+  type TelegramConfig,
 } from "./config-schema.js";

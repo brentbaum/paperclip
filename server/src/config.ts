@@ -52,6 +52,12 @@ export interface Config {
   storageS3Endpoint: string | undefined;
   storageS3Prefix: string;
   storageS3ForcePathStyle: boolean;
+  telegramBotToken: string | undefined;
+  telegramChatId: string | undefined;
+  telegramTopicMapping: Record<string, number>;
+  telegramStatusTopicId: number | undefined;
+  telegramApprovalsTopicId: number | undefined;
+  tailscaleServe: boolean;
   heartbeatSchedulerEnabled: boolean;
   heartbeatSchedulerIntervalMs: number;
   companyDeletionEnabled: boolean;
@@ -68,6 +74,7 @@ export function loadConfig(): Config {
       : undefined;
   const fileSecrets = fileConfig?.secrets;
   const fileStorage = fileConfig?.storage;
+  const fileTelegram = fileConfig?.telegram;
   const strictModeFromEnv = process.env.PAPERCLIP_SECRETS_STRICT_MODE;
   const secretsStrictMode =
     strictModeFromEnv !== undefined
@@ -149,6 +156,23 @@ export function loadConfig(): Config {
       ? companyDeletionEnvRaw === "true"
       : deploymentMode === "local_trusted";
 
+  const tailscaleServeFromEnv = process.env.PAPERCLIP_TAILSCALE_SERVE;
+  const tailscaleServe =
+    tailscaleServeFromEnv !== undefined
+      ? tailscaleServeFromEnv === "true"
+      : (fileConfig?.server.tailscaleServe ?? false);
+
+  const telegramStatusTopicIdFromEnvRaw = process.env.PAPERCLIP_TELEGRAM_STATUS_TOPIC_ID?.trim();
+  const telegramApprovalsTopicIdFromEnvRaw = process.env.PAPERCLIP_TELEGRAM_APPROVALS_TOPIC_ID?.trim();
+  const telegramStatusTopicIdFromEnv =
+    telegramStatusTopicIdFromEnvRaw && Number.isInteger(Number(telegramStatusTopicIdFromEnvRaw))
+      ? Number(telegramStatusTopicIdFromEnvRaw)
+      : undefined;
+  const telegramApprovalsTopicIdFromEnv =
+    telegramApprovalsTopicIdFromEnvRaw && Number.isInteger(Number(telegramApprovalsTopicIdFromEnvRaw))
+      ? Number(telegramApprovalsTopicIdFromEnvRaw)
+      : undefined;
+
   return {
     deploymentMode,
     deploymentExposure,
@@ -183,6 +207,12 @@ export function loadConfig(): Config {
     storageS3Endpoint,
     storageS3Prefix,
     storageS3ForcePathStyle,
+    telegramBotToken: process.env.PAPERCLIP_TELEGRAM_BOT_TOKEN ?? fileTelegram?.botToken ?? undefined,
+    telegramChatId: process.env.PAPERCLIP_TELEGRAM_CHAT_ID ?? fileTelegram?.chatId ?? undefined,
+    telegramTopicMapping: fileTelegram?.topicMapping ?? {},
+    telegramStatusTopicId: telegramStatusTopicIdFromEnv ?? fileTelegram?.statusTopicId ?? undefined,
+    telegramApprovalsTopicId: telegramApprovalsTopicIdFromEnv ?? fileTelegram?.approvalsTopicId ?? undefined,
+    tailscaleServe,
     heartbeatSchedulerEnabled: process.env.HEARTBEAT_SCHEDULER_ENABLED !== "false",
     heartbeatSchedulerIntervalMs: Math.max(10000, Number(process.env.HEARTBEAT_SCHEDULER_INTERVAL_MS) || 30000),
     companyDeletionEnabled,

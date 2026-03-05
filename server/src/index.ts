@@ -1,4 +1,5 @@
 /// <reference path="./types/express.d.ts" />
+import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync, rmSync } from "node:fs";
 import { createServer } from "node:http";
 import { resolve } from "node:path";
@@ -22,7 +23,7 @@ import { createApp } from "./app.js";
 import { loadConfig } from "./config.js";
 import { logger } from "./middleware/logger.js";
 import { setupLiveEventsWebSocketServer } from "./realtime/live-events-ws.js";
-import { heartbeatService } from "./services/index.js";
+import { agentService, approvalService, heartbeatService, issueService, telegramService } from "./services/index.js";
 import { createStorageServiceFromConfig } from "./storage/index.js";
 import { printStartupBanner } from "./startup-banner.js";
 import { getBoardClaimWarningUrl, initializeBoardClaimChallenge } from "./board-claim.js";
@@ -416,6 +417,14 @@ if (config.deploymentMode === "authenticated") {
 
 const uiMode = config.uiDevMiddleware ? "vite-dev" : config.serveUi ? "static" : "none";
 const storageService = createStorageServiceFromConfig(config);
+const heartbeat = heartbeatService(db as any);
+const telegram = telegramService(db as any, {
+  config,
+  heartbeat,
+  approvals: approvalService(db as any),
+  issues: issueService(db as any),
+  agents: agentService(db as any),
+});
 const app = await createApp(db as any, {
   uiMode,
   storageService,
@@ -425,6 +434,7 @@ const app = await createApp(db as any, {
   bindHost: config.host,
   authReady,
   companyDeletionEnabled: config.companyDeletionEnabled,
+  telegramService: telegram,
   betterAuthHandler,
   resolveSession,
 });
@@ -450,8 +460,6 @@ setupLiveEventsWebSocketServer(server, db as any, {
 });
 
 if (config.heartbeatSchedulerEnabled) {
-  const heartbeat = heartbeatService(db as any);
-
   // Reap orphaned runs at startup (no threshold -- runningProcesses is empty)
   void heartbeat.reapOrphanedRuns().catch((err) => {
     logger.error({ err }, "startup reap of orphaned heartbeat runs failed");
@@ -478,6 +486,10 @@ if (config.heartbeatSchedulerEnabled) {
   }, config.heartbeatSchedulerIntervalMs);
 }
 
+await telegram.start().catch((err) => {
+  logger.error({ err }, "telegram service failed to start");
+});
+
 server.listen(listenPort, config.host, () => {
   logger.info(`Server listening on ${config.host}:${listenPort}`);
   if (process.env.PAPERCLIP_OPEN_ON_LISTEN === "true") {
@@ -492,6 +504,17 @@ server.listen(listenPort, config.host, () => {
         logger.warn({ err, url }, "Failed to open browser on startup");
       });
   }
+  let tailscaleServeActive = false;
+  if (config.tailscaleServe) {
+    try {
+      execFileSync("tailscale", ["serve", "--bg", String(listenPort)], { stdio: "pipe" });
+      tailscaleServeActive = true;
+      logger.info(`Tailscale serve enabled on port ${listenPort}`);
+    } catch (err) {
+      logger.error({ err }, "Failed to start tailscale serve");
+    }
+  }
+
   printStartupBanner({
     host: config.host,
     deploymentMode: config.deploymentMode,
@@ -504,6 +527,7 @@ server.listen(listenPort, config.host, () => {
     migrationSummary,
     heartbeatSchedulerEnabled: config.heartbeatSchedulerEnabled,
     heartbeatSchedulerIntervalMs: config.heartbeatSchedulerIntervalMs,
+    tailscaleServe: tailscaleServeActive,
   });
 
   const boardClaimUrl = getBoardClaimWarningUrl(config.host, listenPort);
@@ -523,8 +547,29 @@ server.listen(listenPort, config.host, () => {
   }
 });
 
+function shutdownTailscaleServe() {
+  if (config.tailscaleServe) {
+    try {
+      execFileSync("tailscale", ["serve", "off"], { stdio: "pipe" });
+      logger.info("Tailscale serve stopped");
+    } catch (err) {
+      logger.error({ err }, "Failed to stop tailscale serve");
+    }
+  }
+}
+
+async function stopTelegramService() {
+  try {
+    await telegram.stop();
+  } catch (err) {
+    logger.error({ err }, "failed to stop telegram service cleanly");
+  }
+}
+
 if (embeddedPostgres && embeddedPostgresStartedByThisProcess) {
   const shutdown = async (signal: "SIGINT" | "SIGTERM") => {
+    await stopTelegramService();
+    shutdownTailscaleServe();
     logger.info({ signal }, "Stopping embedded PostgreSQL");
     try {
       await embeddedPostgres?.stop();
@@ -533,6 +578,33 @@ if (embeddedPostgres && embeddedPostgresStartedByThisProcess) {
     } finally {
       process.exit(0);
     }
+  };
+
+  process.once("SIGINT", () => {
+    void shutdown("SIGINT");
+  });
+  process.once("SIGTERM", () => {
+    void shutdown("SIGTERM");
+  });
+} else if (config.tailscaleServe) {
+  const shutdown = async (signal: "SIGINT" | "SIGTERM") => {
+    await stopTelegramService();
+    shutdownTailscaleServe();
+    logger.info({ signal }, "Shutting down");
+    process.exit(0);
+  };
+
+  process.once("SIGINT", () => {
+    void shutdown("SIGINT");
+  });
+  process.once("SIGTERM", () => {
+    void shutdown("SIGTERM");
+  });
+} else {
+  const shutdown = async (signal: "SIGINT" | "SIGTERM") => {
+    await stopTelegramService();
+    logger.info({ signal }, "Shutting down");
+    process.exit(0);
   };
 
   process.once("SIGINT", () => {

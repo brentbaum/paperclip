@@ -24,7 +24,9 @@ import { sidebarBadgeRoutes } from "./routes/sidebar-badges.js";
 import { llmRoutes } from "./routes/llms.js";
 import { assetRoutes } from "./routes/assets.js";
 import { accessRoutes } from "./routes/access.js";
+import { telegramRoutes } from "./routes/telegram.js";
 import type { BetterAuthSessionResult } from "./auth/better-auth.js";
+import type { TelegramService } from "./services/telegram.js";
 
 type UiMode = "none" | "static" | "vite-dev";
 
@@ -39,6 +41,7 @@ export async function createApp(
     bindHost: string;
     authReady: boolean;
     companyDeletionEnabled: boolean;
+    telegramService?: Pick<TelegramService, "sendToAgentTopic">;
     betterAuthHandler?: express.RequestHandler;
     resolveSession?: (req: ExpressRequest) => Promise<BetterAuthSessionResult | null>;
   },
@@ -102,6 +105,9 @@ export async function createApp(
   );
   api.use("/companies", companyRoutes(db));
   api.use(agentRoutes(db));
+  if (opts.telegramService) {
+    api.use(telegramRoutes(opts.telegramService));
+  }
   api.use(assetRoutes(db, opts.storageService));
   api.use(projectRoutes(db));
   api.use(issueRoutes(db, opts.storageService));

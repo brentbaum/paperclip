@@ -37,6 +37,7 @@ export const serverConfigSchema = z.object({
   port: z.number().int().min(1).max(65535).default(3100),
   allowedHostnames: z.array(z.string().min(1)).default([]),
   serveUi: z.boolean().default(true),
+  tailscaleServe: z.boolean().default(false),
 });
 
 export const authConfigSchema = z.object({
@@ -81,6 +82,14 @@ export const secretsConfigSchema = z.object({
   }),
 });
 
+export const telegramConfigSchema = z.object({
+  botToken: z.string().min(1).optional(),
+  chatId: z.string().min(1).optional(),
+  topicMapping: z.record(z.string(), z.number().int().min(1)).default({}),
+  statusTopicId: z.number().int().min(1).optional(),
+  approvalsTopicId: z.number().int().min(1).optional(),
+});
+
 export const paperclipConfigSchema = z
   .object({
     $meta: configMetaSchema,
@@ -110,6 +119,7 @@ export const paperclipConfigSchema = z
         keyFilePath: "~/.paperclip/instances/default/secrets/master.key",
       },
     }),
+    telegram: telegramConfigSchema.optional(),
   })
   .superRefine((value, ctx) => {
     if (value.server.deploymentMode === "local_trusted") {
@@ -160,3 +170,4 @@ export type SecretsConfig = z.infer<typeof secretsConfigSchema>;
 export type SecretsLocalEncryptedConfig = z.infer<typeof secretsLocalEncryptedConfigSchema>;
 export type AuthConfig = z.infer<typeof authConfigSchema>;
 export type ConfigMeta = z.infer<typeof configMetaSchema>;
+export type TelegramConfig = z.infer<typeof telegramConfigSchema>;
