@@ -1,5 +1,5 @@
-import { useState } from "react";
-import { ArrowUp, ArrowDown, Minus, AlertTriangle } from "lucide-react";
+import { useEffect, useState } from "react";
+import { ArrowDown, ArrowUp, Check, AlertTriangle, Minus } from "lucide-react";
 import { cn } from "../lib/utils";
 import { priorityColor, priorityColorDefault } from "../lib/status-colors";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
@@ -19,12 +19,56 @@ interface PriorityIconProps {
   onChange?: (priority: string) => void;
   className?: string;
   showLabel?: boolean;
+  open?: boolean;
+  onOpenChange?: (open: boolean) => void;
 }
 
-export function PriorityIcon({ priority, onChange, className, showLabel }: PriorityIconProps) {
-  const [open, setOpen] = useState(false);
+function ShortcutBadge({ index }: { index: number }) {
+  return (
+    <span className="inline-flex min-w-4 items-center justify-center text-[11px] font-medium text-muted-foreground">
+      {index + 1}
+    </span>
+  );
+}
+
+export function PriorityIcon({
+  priority,
+  onChange,
+  className,
+  showLabel,
+  open: openProp,
+  onOpenChange,
+}: PriorityIconProps) {
+  const [internalOpen, setInternalOpen] = useState(false);
+  const open = openProp ?? internalOpen;
+  const setOpen = (next: boolean) => {
+    onOpenChange?.(next);
+    if (openProp === undefined) setInternalOpen(next);
+  };
   const config = priorityConfig[priority] ?? priorityConfig.medium!;
   const Icon = config.icon;
+  const selectPriority = (nextPriority: string) => {
+    if (!onChange) return;
+    onChange(nextPriority);
+    setOpen(false);
+  };
+
+  useEffect(() => {
+    if (!open || !onChange) return;
+
+    function handleKeyDown(event: KeyboardEvent) {
+      if (event.metaKey || event.ctrlKey || event.altKey) return;
+      if (event.key < "1" || event.key > "9") return;
+      const index = Number.parseInt(event.key, 10) - 1;
+      const nextPriority = allPriorities[index];
+      if (!nextPriority) return;
+      event.preventDefault();
+      selectPriority(nextPriority);
+    }
+
+    document.addEventListener("keydown", handleKeyDown);
+    return () => document.removeEventListener("keydown", handleKeyDown);
+  }, [onChange, open]);
 
   const icon = (
     <span
@@ -51,8 +95,8 @@ export function PriorityIcon({ priority, onChange, className, showLabel }: Prior
   return (
     <Popover open={open} onOpenChange={setOpen}>
       <PopoverTrigger asChild>{trigger}</PopoverTrigger>
-      <PopoverContent className="w-36 p-1" align="start">
-        {allPriorities.map((p) => {
+      <PopoverContent className="w-44 p-1" align="start">
+        {allPriorities.map((p, index) => {
           const c = priorityConfig[p]!;
           const PIcon = c.icon;
           return (
@@ -61,13 +105,14 @@ export function PriorityIcon({ priority, onChange, className, showLabel }: Prior
               variant="ghost"
               size="sm"
               className={cn("w-full justify-start gap-2 text-xs", p === priority && "bg-accent")}
-              onClick={() => {
-                onChange(p);
-                setOpen(false);
-              }}
+              onClick={() => selectPriority(p)}
             >
               <PIcon className={cn("h-3.5 w-3.5", c.color)} />
-              {c.label}
+              <span>{c.label}</span>
+              <span className="ml-auto inline-flex items-center gap-2">
+                {p === priority && <Check className="h-3 w-3 text-muted-foreground" />}
+                <ShortcutBadge index={index} />
+              </span>
             </Button>
           );
         })}

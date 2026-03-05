@@ -13,9 +13,11 @@ import { usePanel } from "../context/PanelContext";
 import { useBreadcrumbs } from "../context/BreadcrumbContext";
 import { queryKeys } from "../lib/queryKeys";
 import { useProjectOrder } from "../hooks/useProjectOrder";
+import { isTypingTarget } from "../lib/keyboard";
 import { relativeTime, cn, formatTokens } from "../lib/utils";
 import { InlineEditor } from "../components/InlineEditor";
 import { CommentThread } from "../components/CommentThread";
+import { IssueAssigneePicker } from "../components/IssueAssigneePicker";
 import { IssueProperties } from "../components/IssueProperties";
 import { LiveRunWidget } from "../components/LiveRunWidget";
 import type { MentionOption } from "../components/MarkdownEditor";
@@ -153,6 +155,9 @@ export function IssueDetail() {
   const navigate = useNavigate();
   const [moreOpen, setMoreOpen] = useState(false);
   const [mobilePropsOpen, setMobilePropsOpen] = useState(false);
+  const [statusPickerOpen, setStatusPickerOpen] = useState(false);
+  const [priorityPickerOpen, setPriorityPickerOpen] = useState(false);
+  const [assigneePickerOpen, setAssigneePickerOpen] = useState(false);
   const [detailTab, setDetailTab] = useState("comments");
   const [secondaryOpen, setSecondaryOpen] = useState({
     approvals: false,
@@ -498,6 +503,34 @@ export function IssueDetail() {
     return () => closePanel();
   }, [issue]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  useEffect(() => {
+    function handleKeyDown(event: KeyboardEvent) {
+      if (event.metaKey || event.ctrlKey || event.altKey) return;
+      if (isTypingTarget(event.target)) return;
+
+      const key = event.key.toLowerCase();
+      if (key === "s") {
+        event.preventDefault();
+        setPriorityPickerOpen(false);
+        setAssigneePickerOpen(false);
+        setStatusPickerOpen(true);
+      } else if (key === "p") {
+        event.preventDefault();
+        setStatusPickerOpen(false);
+        setAssigneePickerOpen(false);
+        setPriorityPickerOpen(true);
+      } else if (key === "a") {
+        event.preventDefault();
+        setStatusPickerOpen(false);
+        setPriorityPickerOpen(false);
+        setAssigneePickerOpen(true);
+      }
+    }
+
+    document.addEventListener("keydown", handleKeyDown);
+    return () => document.removeEventListener("keydown", handleKeyDown);
+  }, []);
+
   if (isLoading) return <p className="text-sm text-muted-foreground">Loading...</p>;
   if (error) return <p className="text-sm text-destructive">{error.message}</p>;
   if (!issue) return null;
@@ -549,11 +582,24 @@ export function IssueDetail() {
         <div className="flex items-center gap-2 min-w-0 flex-wrap">
           <StatusIcon
             status={issue.status}
+            open={statusPickerOpen}
+            onOpenChange={setStatusPickerOpen}
             onChange={(status) => updateIssue.mutate({ status })}
           />
           <PriorityIcon
             priority={issue.priority}
+            open={priorityPickerOpen}
+            onOpenChange={setPriorityPickerOpen}
             onChange={(priority) => updateIssue.mutate({ priority })}
+          />
+          <IssueAssigneePicker
+            issue={issue}
+            agents={agents}
+            currentUserId={currentUserId}
+            open={assigneePickerOpen}
+            onOpenChange={setAssigneePickerOpen}
+            compact
+            onChange={(assigneeAgentId, assigneeUserId) => updateIssue.mutate({ assigneeAgentId, assigneeUserId })}
           />
           <span className="text-sm font-mono text-muted-foreground shrink-0">{issue.identifier ?? issue.id.slice(0, 8)}</span>
 

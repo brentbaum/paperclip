@@ -11,13 +11,12 @@ import { queryKeys } from "../lib/queryKeys";
 import { useProjectOrder } from "../hooks/useProjectOrder";
 import { StatusIcon } from "./StatusIcon";
 import { PriorityIcon } from "./PriorityIcon";
-import { Identity } from "./Identity";
+import { IssueAssigneePicker } from "./IssueAssigneePicker";
 import { formatDate, cn, projectUrl } from "../lib/utils";
 import { timeAgo } from "../lib/timeAgo";
 import { Separator } from "@/components/ui/separator";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
-import { User, Hexagon, ArrowUpRight, Tag, Plus, Trash2 } from "lucide-react";
-import { AgentIcon } from "./AgentIconPicker";
+import { Hexagon, ArrowUpRight, Tag, Plus, Trash2 } from "lucide-react";
 
 interface IssuePropertiesProps {
   issue: Issue;
@@ -100,8 +99,6 @@ export function IssueProperties({ issue, onUpdate, inline }: IssuePropertiesProp
   const { selectedCompanyId } = useCompany();
   const queryClient = useQueryClient();
   const companyId = issue.companyId ?? selectedCompanyId;
-  const [assigneeOpen, setAssigneeOpen] = useState(false);
-  const [assigneeSearch, setAssigneeSearch] = useState("");
   const [projectOpen, setProjectOpen] = useState(false);
   const [projectSearch, setProjectSearch] = useState("");
   const [labelsOpen, setLabelsOpen] = useState(false);
@@ -164,12 +161,6 @@ export function IssueProperties({ issue, onUpdate, inline }: IssuePropertiesProp
     onUpdate({ labelIds: next });
   };
 
-  const agentName = (id: string | null) => {
-    if (!id || !agents) return null;
-    const agent = agents.find((a) => a.id === id);
-    return agent?.name ?? id.slice(0, 8);
-  };
-
   const projectName = (id: string | null) => {
     if (!id) return id?.slice(0, 8) ?? "None";
     const project = orderedProjects.find((p) => p.id === id);
@@ -181,9 +172,6 @@ export function IssueProperties({ issue, onUpdate, inline }: IssuePropertiesProp
     return project ? projectUrl(project) : `/projects/${id}`;
   };
 
-  const assignee = issue.assigneeAgentId
-    ? agents?.find((a) => a.id === issue.assigneeAgentId)
-    : null;
   const userLabel = (userId: string | null | undefined) =>
     userId
       ? userId === "local-board"
@@ -192,7 +180,6 @@ export function IssueProperties({ issue, onUpdate, inline }: IssuePropertiesProp
           ? "Me"
           : userId.slice(0, 5)
       : null;
-  const assigneeUserLabel = userLabel(issue.assigneeUserId);
   const creatorUserLabel = userLabel(issue.createdByUserId);
 
   const labelsTrigger = (issue.labels ?? []).length > 0 ? (
@@ -294,78 +281,6 @@ export function IssueProperties({ issue, onUpdate, inline }: IssuePropertiesProp
     </>
   );
 
-  const assigneeTrigger = assignee ? (
-    <Identity name={assignee.name} size="sm" />
-  ) : assigneeUserLabel ? (
-    <>
-      <User className="h-3.5 w-3.5 text-muted-foreground" />
-      <span className="text-sm">{assigneeUserLabel}</span>
-    </>
-  ) : (
-    <>
-      <User className="h-3.5 w-3.5 text-muted-foreground" />
-      <span className="text-sm text-muted-foreground">Unassigned</span>
-    </>
-  );
-
-  const assigneeContent = (
-    <>
-      <input
-        className="w-full px-2 py-1.5 text-xs bg-transparent outline-none border-b border-border mb-1 placeholder:text-muted-foreground/50"
-        placeholder="Search assignees..."
-        value={assigneeSearch}
-        onChange={(e) => setAssigneeSearch(e.target.value)}
-        autoFocus={!inline}
-      />
-      <div className="max-h-48 overflow-y-auto overscroll-contain">
-        <button
-          className={cn(
-            "flex items-center gap-2 w-full px-2 py-1.5 text-xs rounded hover:bg-accent/50",
-            !issue.assigneeAgentId && !issue.assigneeUserId && "bg-accent"
-          )}
-          onClick={() => { onUpdate({ assigneeAgentId: null, assigneeUserId: null }); setAssigneeOpen(false); }}
-        >
-          No assignee
-        </button>
-        {issue.createdByUserId && (
-          <button
-            className={cn(
-              "flex items-center gap-2 w-full px-2 py-1.5 text-xs rounded hover:bg-accent/50",
-              issue.assigneeUserId === issue.createdByUserId && "bg-accent",
-            )}
-            onClick={() => {
-              onUpdate({ assigneeAgentId: null, assigneeUserId: issue.createdByUserId });
-              setAssigneeOpen(false);
-            }}
-          >
-            <User className="h-3 w-3 shrink-0 text-muted-foreground" />
-            {creatorUserLabel ? `Assign to ${creatorUserLabel === "Me" ? "me" : creatorUserLabel}` : "Assign to requester"}
-          </button>
-        )}
-        {(agents ?? [])
-          .filter((a) => a.status !== "terminated")
-          .filter((a) => {
-            if (!assigneeSearch.trim()) return true;
-            const q = assigneeSearch.toLowerCase();
-            return a.name.toLowerCase().includes(q);
-          })
-          .map((a) => (
-          <button
-            key={a.id}
-            className={cn(
-              "flex items-center gap-2 w-full px-2 py-1.5 text-xs rounded hover:bg-accent/50",
-              a.id === issue.assigneeAgentId && "bg-accent"
-            )}
-            onClick={() => { onUpdate({ assigneeAgentId: a.id, assigneeUserId: null }); setAssigneeOpen(false); }}
-          >
-            <AgentIcon icon={a.icon} className="shrink-0 h-3 w-3 text-muted-foreground" />
-            {a.name}
-          </button>
-        ))}
-      </div>
-    </>
-  );
-
   const projectTrigger = issue.projectId ? (
     <>
       <span
@@ -457,25 +372,23 @@ export function IssueProperties({ issue, onUpdate, inline }: IssuePropertiesProp
           {labelsContent}
         </PropertyPicker>
 
-        <PropertyPicker
-          inline={inline}
-          label="Assignee"
-          open={assigneeOpen}
-          onOpenChange={(open) => { setAssigneeOpen(open); if (!open) setAssigneeSearch(""); }}
-          triggerContent={assigneeTrigger}
-          popoverClassName="w-52"
-          extra={issue.assigneeAgentId ? (
+        <PropertyRow label="Assignee">
+          <IssueAssigneePicker
+            issue={issue}
+            agents={agents}
+            currentUserId={currentUserId ?? null}
+            onChange={(assigneeAgentId, assigneeUserId) => onUpdate({ assigneeAgentId, assigneeUserId })}
+          />
+          {issue.assigneeAgentId ? (
             <Link
               to={`/agents/${issue.assigneeAgentId}`}
-              className="inline-flex items-center justify-center h-5 w-5 rounded hover:bg-accent/50 transition-colors text-muted-foreground hover:text-foreground"
+              className="inline-flex h-5 w-5 items-center justify-center rounded text-muted-foreground transition-colors hover:bg-accent/50 hover:text-foreground"
               onClick={(e) => e.stopPropagation()}
             >
               <ArrowUpRight className="h-3 w-3" />
             </Link>
           ) : undefined}
-        >
-          {assigneeContent}
-        </PropertyPicker>
+        </PropertyRow>
 
         <PropertyPicker
           inline={inline}
