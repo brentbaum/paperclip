@@ -1,19 +1,45 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { useNavigate, useParams } from "@/lib/router";
 import { useCompany } from "../context/CompanyContext";
 import { useBreadcrumbs } from "../context/BreadcrumbContext";
 import { companiesApi } from "../api/companies";
 import { accessApi } from "../api/access";
 import { queryKeys } from "../lib/queryKeys";
 import { Button } from "@/components/ui/button";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Settings } from "lucide-react";
 import { CompanyPatternIcon } from "../components/CompanyPatternIcon";
 import { Field, ToggleField, HintIcon } from "../components/agent-config-primitives";
+import { OrgChart } from "./OrgChart";
+import { Costs } from "./Costs";
+import { Activity } from "./Activity";
+
+const SETTINGS_TABS = [
+  { key: "general", label: "General" },
+  { key: "org", label: "Org" },
+  { key: "costs", label: "Costs" },
+  { key: "activity", label: "Activity" },
+] as const;
+
+type SettingsTab = (typeof SETTINGS_TABS)[number]["key"];
+
+function isSettingsTab(value: string | undefined): value is SettingsTab {
+  return SETTINGS_TABS.some((tab) => tab.key === value);
+}
 
 export function CompanySettings() {
+  const { tab } = useParams<{ tab?: string }>();
+  const navigate = useNavigate();
   const { companies, selectedCompany, selectedCompanyId, setSelectedCompanyId } = useCompany();
   const { setBreadcrumbs } = useBreadcrumbs();
   const queryClient = useQueryClient();
+
+  const activeTab: SettingsTab = isSettingsTab(tab) ? tab : "general";
+  const activeTabLabel = useMemo(
+    () => SETTINGS_TABS.find((entry) => entry.key === activeTab)?.label ?? "General",
+    [activeTab],
+  );
 
   // General settings local state
   const [companyName, setCompanyName] = useState("");
@@ -27,6 +53,16 @@ export function CompanySettings() {
     setDescription(selectedCompany.description ?? "");
     setBrandColor(selectedCompany.brandColor ?? "");
   }, [selectedCompany]);
+
+  useEffect(() => {
+    if (!tab) {
+      navigate("/company/settings/general", { replace: true });
+      return;
+    }
+    if (!isSettingsTab(tab)) {
+      navigate("/company/settings/general", { replace: true });
+    }
+  }, [tab, navigate]);
 
   const [inviteLink, setInviteLink] = useState<string | null>(null);
   const [inviteError, setInviteError] = useState<string | null>(null);
@@ -94,9 +130,10 @@ export function CompanySettings() {
   useEffect(() => {
     setBreadcrumbs([
       { label: selectedCompany?.name ?? "Company", href: "/dashboard" },
-      { label: "Settings" },
+      { label: "Settings", href: "/company/settings/general" },
+      ...(activeTab === "general" ? [] : [{ label: activeTabLabel }]),
     ]);
-  }, [setBreadcrumbs, selectedCompany?.name]);
+  }, [setBreadcrumbs, selectedCompany?.name, activeTab, activeTabLabel]);
 
   if (!selectedCompany) {
     return (
@@ -115,205 +152,223 @@ export function CompanySettings() {
   }
 
   return (
-    <div className="max-w-2xl space-y-6">
+    <div className="space-y-6">
       <div className="flex items-center gap-2">
         <Settings className="h-5 w-5 text-muted-foreground" />
         <h1 className="text-lg font-semibold">Company Settings</h1>
       </div>
 
-      {/* General */}
-      <div className="space-y-4">
-        <div className="text-xs font-medium text-muted-foreground uppercase tracking-wide">
-          General
-        </div>
-        <div className="space-y-3 rounded-md border border-border px-4 py-4">
-          <Field label="Company name" hint="The display name for your company.">
-            <input
-              className="w-full rounded-md border border-border bg-transparent px-2.5 py-1.5 text-sm outline-none"
-              type="text"
-              value={companyName}
-              onChange={(e) => setCompanyName(e.target.value)}
-            />
-          </Field>
-          <Field label="Description" hint="Optional description shown in the company profile.">
-            <input
-              className="w-full rounded-md border border-border bg-transparent px-2.5 py-1.5 text-sm outline-none"
-              type="text"
-              value={description}
-              placeholder="Optional company description"
-              onChange={(e) => setDescription(e.target.value)}
-            />
-          </Field>
-        </div>
-      </div>
+      <Tabs value={activeTab} onValueChange={(next) => navigate(`/company/settings/${next}`)} className="space-y-5">
+        <TabsList variant="line" className="w-full justify-start gap-1 overflow-x-auto">
+          {SETTINGS_TABS.map((settingsTab) => (
+            <TabsTrigger key={settingsTab.key} value={settingsTab.key}>
+              {settingsTab.label}
+            </TabsTrigger>
+          ))}
+        </TabsList>
 
-      {/* Appearance */}
-      <div className="space-y-4">
-        <div className="text-xs font-medium text-muted-foreground uppercase tracking-wide">
-          Appearance
-        </div>
-        <div className="space-y-3 rounded-md border border-border px-4 py-4">
-          <div className="flex items-start gap-4">
-            <div className="shrink-0">
-              <CompanyPatternIcon
-                companyName={companyName || selectedCompany.name}
-                brandColor={brandColor || null}
-                className="rounded-[14px]"
-              />
+        <TabsContent value="general" className="space-y-6 max-w-2xl">
+          <div className="space-y-4">
+            <div className="text-xs font-medium text-muted-foreground uppercase tracking-wide">
+              General
             </div>
-            <div className="flex-1 space-y-2">
-              <Field label="Brand color" hint="Sets the hue for the company icon. Leave empty for auto-generated color.">
-                <div className="flex items-center gap-2">
-                  <input
-                    type="color"
-                    value={brandColor || "#6366f1"}
-                    onChange={(e) => setBrandColor(e.target.value)}
-                    className="h-8 w-8 cursor-pointer rounded border border-border bg-transparent p-0"
-                  />
-                  <input
-                    type="text"
-                    value={brandColor}
-                    onChange={(e) => {
-                      const v = e.target.value;
-                      if (v === "" || /^#[0-9a-fA-F]{0,6}$/.test(v)) {
-                        setBrandColor(v);
-                      }
-                    }}
-                    placeholder="Auto"
-                    className="w-28 rounded-md border border-border bg-transparent px-2.5 py-1.5 text-sm font-mono outline-none"
-                  />
-                  {brandColor && (
-                    <Button
-                      size="sm"
-                      variant="ghost"
-                      onClick={() => setBrandColor("")}
-                      className="text-xs text-muted-foreground"
-                    >
-                      Clear
-                    </Button>
-                  )}
-                </div>
+            <div className="space-y-3 rounded-md border border-border px-4 py-4">
+              <Field label="Company name" hint="The display name for your company.">
+                <input
+                  className="w-full rounded-md border border-border bg-transparent px-2.5 py-1.5 text-sm outline-none"
+                  type="text"
+                  value={companyName}
+                  onChange={(e) => setCompanyName(e.target.value)}
+                />
+              </Field>
+              <Field label="Description" hint="Optional description shown in the company profile.">
+                <input
+                  className="w-full rounded-md border border-border bg-transparent px-2.5 py-1.5 text-sm outline-none"
+                  type="text"
+                  value={description}
+                  placeholder="Optional company description"
+                  onChange={(e) => setDescription(e.target.value)}
+                />
               </Field>
             </div>
           </div>
-        </div>
-      </div>
 
-      {/* Save button for General + Appearance */}
-      {generalDirty && (
-        <div className="flex items-center gap-2">
-          <Button
-            size="sm"
-            onClick={handleSaveGeneral}
-            disabled={generalMutation.isPending || !companyName.trim()}
-          >
-            {generalMutation.isPending ? "Saving..." : "Save changes"}
-          </Button>
-          {generalMutation.isSuccess && (
-            <span className="text-xs text-muted-foreground">Saved</span>
-          )}
-          {generalMutation.isError && (
-            <span className="text-xs text-destructive">
-              {generalMutation.error instanceof Error
-                ? generalMutation.error.message
-                : "Failed to save"}
-            </span>
-          )}
-        </div>
-      )}
-
-      {/* Hiring */}
-      <div className="space-y-4">
-        <div className="text-xs font-medium text-muted-foreground uppercase tracking-wide">
-          Hiring
-        </div>
-        <div className="rounded-md border border-border px-4 py-3">
-          <ToggleField
-            label="Require board approval for new hires"
-            hint="New agent hires stay pending until approved by board."
-            checked={!!selectedCompany.requireBoardApprovalForNewAgents}
-            onChange={(v) => settingsMutation.mutate(v)}
-          />
-        </div>
-      </div>
-
-      {/* Invites */}
-      <div className="space-y-4">
-        <div className="text-xs font-medium text-muted-foreground uppercase tracking-wide">
-          Invites
-        </div>
-        <div className="space-y-3 rounded-md border border-border px-4 py-4">
-          <div className="flex items-center gap-1.5">
-            <span className="text-xs text-muted-foreground">Generate a link to invite humans or agents to this company.</span>
-            <HintIcon text="Invite links expire after 72 hours and allow both human and agent joins." />
+          <div className="space-y-4">
+            <div className="text-xs font-medium text-muted-foreground uppercase tracking-wide">
+              Appearance
+            </div>
+            <div className="space-y-3 rounded-md border border-border px-4 py-4">
+              <div className="flex items-start gap-4">
+                <div className="shrink-0">
+                  <CompanyPatternIcon
+                    companyName={companyName || selectedCompany.name}
+                    brandColor={brandColor || null}
+                    className="rounded-[14px]"
+                  />
+                </div>
+                <div className="flex-1 space-y-2">
+                  <Field label="Brand color" hint="Sets the hue for the company icon. Leave empty for auto-generated color.">
+                    <div className="flex items-center gap-2">
+                      <input
+                        type="color"
+                        value={brandColor || "#6366f1"}
+                        onChange={(e) => setBrandColor(e.target.value)}
+                        className="h-8 w-8 cursor-pointer rounded border border-border bg-transparent p-0"
+                      />
+                      <input
+                        type="text"
+                        value={brandColor}
+                        onChange={(e) => {
+                          const v = e.target.value;
+                          if (v === "" || /^#[0-9a-fA-F]{0,6}$/.test(v)) {
+                            setBrandColor(v);
+                          }
+                        }}
+                        placeholder="Auto"
+                        className="w-28 rounded-md border border-border bg-transparent px-2.5 py-1.5 text-sm font-mono outline-none"
+                      />
+                      {brandColor && (
+                        <Button
+                          size="sm"
+                          variant="ghost"
+                          onClick={() => setBrandColor("")}
+                          className="text-xs text-muted-foreground"
+                        >
+                          Clear
+                        </Button>
+                      )}
+                    </div>
+                  </Field>
+                </div>
+              </div>
+            </div>
           </div>
-          <div className="flex flex-wrap items-center gap-2">
-            <Button size="sm" onClick={() => inviteMutation.mutate()} disabled={inviteMutation.isPending}>
-              {inviteMutation.isPending ? "Creating..." : "Create invite link"}
-            </Button>
-            {inviteLink && (
+
+          {generalDirty && (
+            <div className="flex items-center gap-2">
               <Button
                 size="sm"
-                variant="outline"
-                onClick={async () => {
-                  await navigator.clipboard.writeText(inviteLink);
-                }}
+                onClick={handleSaveGeneral}
+                disabled={generalMutation.isPending || !companyName.trim()}
               >
-                Copy link
+                {generalMutation.isPending ? "Saving..." : "Save changes"}
               </Button>
-            )}
-          </div>
-          {inviteError && <p className="text-sm text-destructive">{inviteError}</p>}
-          {inviteLink && (
-            <div className="rounded-md border border-border bg-muted/30 p-2">
-              <div className="text-xs text-muted-foreground">Share link</div>
-              <div className="mt-1 break-all font-mono text-xs">{inviteLink}</div>
+              {generalMutation.isSuccess && (
+                <span className="text-xs text-muted-foreground">Saved</span>
+              )}
+              {generalMutation.isError && (
+                <span className="text-xs text-destructive">
+                  {generalMutation.error instanceof Error
+                    ? generalMutation.error.message
+                    : "Failed to save"}
+                </span>
+              )}
             </div>
           )}
-        </div>
-      </div>
 
-      {/* Archive */}
-      <div className="space-y-4">
-        <div className="text-xs font-medium text-amber-700 uppercase tracking-wide">
-          Archive
-        </div>
-        <div className="space-y-3 rounded-md border border-amber-300/60 bg-amber-100/30 px-4 py-4">
-          <p className="text-sm text-muted-foreground">
-            Archive this company to hide it from the sidebar. This persists in the database.
-          </p>
-          <div className="flex items-center gap-2">
-            <Button
-              size="sm"
-              variant="outline"
-              disabled={archiveMutation.isPending || selectedCompany.status === "archived"}
-              onClick={() => {
-                if (!selectedCompanyId) return;
-                const confirmed = window.confirm(
-                  `Archive company "${selectedCompany.name}"? It will be hidden from the sidebar.`,
-                );
-                if (!confirmed) return;
-                const nextCompanyId = companies.find((company) =>
-                  company.id !== selectedCompanyId && company.status !== "archived")?.id ?? null;
-                archiveMutation.mutate({ companyId: selectedCompanyId, nextCompanyId });
-              }}
-            >
-              {archiveMutation.isPending
-                ? "Archiving..."
-                : selectedCompany.status === "archived"
-                  ? "Already archived"
-                  : "Archive company"}
-            </Button>
-            {archiveMutation.isError && (
-              <span className="text-xs text-destructive">
-                {archiveMutation.error instanceof Error
-                  ? archiveMutation.error.message
-                  : "Failed to archive company"}
-              </span>
-            )}
+          <div className="space-y-4">
+            <div className="text-xs font-medium text-muted-foreground uppercase tracking-wide">
+              Hiring
+            </div>
+            <div className="rounded-md border border-border px-4 py-3">
+              <ToggleField
+                label="Require board approval for new hires"
+                hint="New agent hires stay pending until approved by board."
+                checked={!!selectedCompany.requireBoardApprovalForNewAgents}
+                onChange={(v) => settingsMutation.mutate(v)}
+              />
+            </div>
           </div>
-        </div>
-      </div>
+
+          <div className="space-y-4">
+            <div className="text-xs font-medium text-muted-foreground uppercase tracking-wide">
+              Invites
+            </div>
+            <div className="space-y-3 rounded-md border border-border px-4 py-4">
+              <div className="flex items-center gap-1.5">
+                <span className="text-xs text-muted-foreground">Generate a link to invite humans or agents to this company.</span>
+                <HintIcon text="Invite links expire after 72 hours and allow both human and agent joins." />
+              </div>
+              <div className="flex flex-wrap items-center gap-2">
+                <Button size="sm" onClick={() => inviteMutation.mutate()} disabled={inviteMutation.isPending}>
+                  {inviteMutation.isPending ? "Creating..." : "Create invite link"}
+                </Button>
+                {inviteLink && (
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={async () => {
+                      await navigator.clipboard.writeText(inviteLink);
+                    }}
+                  >
+                    Copy link
+                  </Button>
+                )}
+              </div>
+              {inviteError && <p className="text-sm text-destructive">{inviteError}</p>}
+              {inviteLink && (
+                <div className="rounded-md border border-border bg-muted/30 p-2">
+                  <div className="text-xs text-muted-foreground">Share link</div>
+                  <div className="mt-1 break-all font-mono text-xs">{inviteLink}</div>
+                </div>
+              )}
+            </div>
+          </div>
+
+          <div className="space-y-4">
+            <div className="text-xs font-medium text-amber-700 uppercase tracking-wide">
+              Archive
+            </div>
+            <div className="space-y-3 rounded-md border border-amber-300/60 bg-amber-100/30 px-4 py-4">
+              <p className="text-sm text-muted-foreground">
+                Archive this company to hide it from the sidebar. This persists in the database.
+              </p>
+              <div className="flex items-center gap-2">
+                <Button
+                  size="sm"
+                  variant="outline"
+                  disabled={archiveMutation.isPending || selectedCompany.status === "archived"}
+                  onClick={() => {
+                    if (!selectedCompanyId) return;
+                    const confirmed = window.confirm(
+                      `Archive company "${selectedCompany.name}"? It will be hidden from the sidebar.`,
+                    );
+                    if (!confirmed) return;
+                    const nextCompanyId = companies.find((company) =>
+                      company.id !== selectedCompanyId && company.status !== "archived")?.id ?? null;
+                    archiveMutation.mutate({ companyId: selectedCompanyId, nextCompanyId });
+                  }}
+                >
+                  {archiveMutation.isPending
+                    ? "Archiving..."
+                    : selectedCompany.status === "archived"
+                      ? "Already archived"
+                      : "Archive company"}
+                </Button>
+                {archiveMutation.isError && (
+                  <span className="text-xs text-destructive">
+                    {archiveMutation.error instanceof Error
+                      ? archiveMutation.error.message
+                      : "Failed to archive company"}
+                  </span>
+                )}
+              </div>
+            </div>
+          </div>
+        </TabsContent>
+
+        <TabsContent value="org" className="space-y-4">
+          <OrgChart embedded />
+        </TabsContent>
+
+        <TabsContent value="costs" className="space-y-4 max-w-5xl">
+          <Costs embedded />
+        </TabsContent>
+
+        <TabsContent value="activity" className="space-y-4 max-w-5xl">
+          <Activity embedded />
+        </TabsContent>
+      </Tabs>
     </div>
   );
 }

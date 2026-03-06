@@ -135,7 +135,7 @@ const defaultDotColor = "#a3a3a3";
 
 // ── Main component ──────────────────────────────────────────────────────
 
-export function OrgChart() {
+export function OrgChart({ embedded = false }: { embedded?: boolean } = {}) {
   const { selectedCompanyId } = useCompany();
   const { setBreadcrumbs } = useBreadcrumbs();
   const navigate = useNavigate();
@@ -159,8 +159,10 @@ export function OrgChart() {
   }, [agents]);
 
   useEffect(() => {
-    setBreadcrumbs([{ label: "Org Chart" }]);
-  }, [setBreadcrumbs]);
+    if (!embedded) {
+      setBreadcrumbs([{ label: "Org Chart" }]);
+    }
+  }, [setBreadcrumbs, embedded]);
 
   // Layout computation
   const layout = useMemo(() => layoutForest(orgTree ?? []), [orgTree]);
@@ -266,7 +268,11 @@ export function OrgChart() {
   return (
     <div
       ref={containerRef}
-      className="w-full h-[calc(100vh-4rem)] overflow-hidden relative bg-muted/20 border border-border rounded-lg"
+      className={
+        embedded
+          ? "w-full h-[70vh] min-h-[520px] overflow-hidden relative bg-muted/20 border border-border rounded-lg"
+          : "w-full h-[calc(100vh-4rem)] overflow-hidden relative bg-muted/20 border border-border rounded-lg"
+      }
       style={{ cursor: dragging ? "grabbing" : "grab" }}
       onMouseDown={handleMouseDown}
       onMouseMove={handleMouseMove}

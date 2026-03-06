@@ -729,7 +729,7 @@ export function Inbox() {
               )}
               {showBudgetAlert && (
                 <Link
-                  to="/costs"
+                  to="/company/settings/costs"
                   className="flex cursor-pointer items-center gap-3 px-4 py-3 transition-colors hover:bg-accent/50 no-underline text-inherit"
                 >
                   <AlertTriangle className="h-4 w-4 shrink-0 text-yellow-400" />

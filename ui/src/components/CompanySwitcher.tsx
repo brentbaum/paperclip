@@ -64,7 +64,7 @@ export function CompanySwitcher() {
         )}
         <DropdownMenuSeparator />
         <DropdownMenuItem asChild>
-          <Link to="/company/settings" className="no-underline text-inherit">
+          <Link to="/company/settings/general" className="no-underline text-inherit">
             <Settings className="h-4 w-4 mr-2" />
             Company Settings
           </Link>

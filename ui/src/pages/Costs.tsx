@@ -51,7 +51,7 @@ function computeRange(preset: DatePreset): { from: string; to: string } {
   }
 }
 
-export function Costs() {
+export function Costs({ embedded = false }: { embedded?: boolean } = {}) {
   const { selectedCompanyId } = useCompany();
   const { setBreadcrumbs } = useBreadcrumbs();
 
@@ -60,8 +60,10 @@ export function Costs() {
   const [customTo, setCustomTo] = useState("");
 
   useEffect(() => {
-    setBreadcrumbs([{ label: "Costs" }]);
-  }, [setBreadcrumbs]);
+    if (!embedded) {
+      setBreadcrumbs([{ label: "Costs" }]);
+    }
+  }, [setBreadcrumbs, embedded]);
 
   const { from, to } = useMemo(() => {
     if (preset === "custom") {

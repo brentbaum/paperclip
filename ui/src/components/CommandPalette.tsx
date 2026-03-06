@@ -156,11 +156,11 @@ export function CommandPalette() {
             <Bot className="mr-2 h-4 w-4" />
             Agents
           </CommandItem>
-          <CommandItem onSelect={() => go("/costs")}>
+          <CommandItem onSelect={() => go("/company/settings/costs")}>
             <DollarSign className="mr-2 h-4 w-4" />
             Costs
           </CommandItem>
-          <CommandItem onSelect={() => go("/activity")}>
+          <CommandItem onSelect={() => go("/company/settings/activity")}>
             <History className="mr-2 h-4 w-4" />
             Activity
           </CommandItem>

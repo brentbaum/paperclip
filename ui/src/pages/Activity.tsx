@@ -21,14 +21,16 @@ import {
 import { History } from "lucide-react";
 import type { Agent } from "@paperclipai/shared";
 
-export function Activity() {
+export function Activity({ embedded = false }: { embedded?: boolean } = {}) {
   const { selectedCompanyId } = useCompany();
   const { setBreadcrumbs } = useBreadcrumbs();
   const [filter, setFilter] = useState("all");
 
   useEffect(() => {
-    setBreadcrumbs([{ label: "Activity" }]);
-  }, [setBreadcrumbs]);
+    if (!embedded) {
+      setBreadcrumbs([{ label: "Activity" }]);
+    }
+  }, [setBreadcrumbs, embedded]);
 
   const { data, isLoading, error } = useQuery({
     queryKey: queryKeys.activity(selectedCompanyId!),

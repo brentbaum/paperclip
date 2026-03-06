@@ -18,12 +18,9 @@ import { Goals } from "./pages/Goals";
 import { GoalDetail } from "./pages/GoalDetail";
 import { Approvals } from "./pages/Approvals";
 import { ApprovalDetail } from "./pages/ApprovalDetail";
-import { Costs } from "./pages/Costs";
-import { Activity } from "./pages/Activity";
 import { Inbox } from "./pages/Inbox";
 import { CompanySettings } from "./pages/CompanySettings";
 import { DesignGuide } from "./pages/DesignGuide";
-import { OrgChart } from "./pages/OrgChart";
 import { AuthPage } from "./pages/Auth";
 import { BoardClaimPage } from "./pages/BoardClaim";
 import { InviteLandingPage } from "./pages/InviteLanding";
@@ -94,8 +91,9 @@ function boardRoutes() {
       <Route index element={<Navigate to="dashboard" replace />} />
       <Route path="dashboard" element={<Dashboard />} />
       <Route path="companies" element={<Companies />} />
-      <Route path="company/settings" element={<CompanySettings />} />
-      <Route path="org" element={<OrgChart />} />
+      <Route path="company/settings" element={<Navigate to="/company/settings/general" replace />} />
+      <Route path="company/settings/:tab" element={<CompanySettings />} />
+      <Route path="org" element={<Navigate to="/company/settings/org" replace />} />
       <Route path="agents" element={<Navigate to="/agents/all" replace />} />
       <Route path="agents/all" element={<Agents />} />
       <Route path="agents/active" element={<Agents />} />
@@ -123,8 +121,8 @@ function boardRoutes() {
       <Route path="approvals/pending" element={<Approvals />} />
       <Route path="approvals/all" element={<Approvals />} />
       <Route path="approvals/:approvalId" element={<ApprovalDetail />} />
-      <Route path="costs" element={<Costs />} />
-      <Route path="activity" element={<Activity />} />
+      <Route path="costs" element={<Navigate to="/company/settings/costs" replace />} />
+      <Route path="activity" element={<Navigate to="/company/settings/activity" replace />} />
       <Route path="inbox" element={<Navigate to="/inbox/new" replace />} />
       <Route path="inbox/new" element={<Inbox />} />
       <Route path="inbox/all" element={<Inbox />} />

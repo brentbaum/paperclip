@@ -239,7 +239,7 @@ export function Dashboard() {
               icon={DollarSign}
               value={formatCents(data.costs.monthSpendCents)}
               label="Month Spend"
-              to="/costs"
+              to="/company/settings/costs"
               description={
                 <span>
                   {data.costs.monthBudgetCents > 0
