@@ -93,7 +93,10 @@ export const agentsApi = {
   listFiles: (id: string, companyId?: string) =>
     api.get<AgentFileEntry[]>(agentPath(id, companyId, "/files")),
   getFileContent: (id: string, filePath: string, companyId?: string) =>
-    api.get<AgentFileContent>(`${agentPath(id, companyId, "/files/content")}?path=${encodeURIComponent(filePath)}`),
+    api.get<AgentFileContent>(withCompanyScope(
+      `/agents/${encodeURIComponent(id)}/files/content?path=${encodeURIComponent(filePath)}`,
+      companyId,
+    )),
   updateFileContent: (id: string, data: { path: string; body: string }, companyId?: string) =>
     api.patch<AgentFileContent>(agentPath(id, companyId, "/files/content"), data),
   listConfigRevisions: (id: string, companyId?: string) =>
