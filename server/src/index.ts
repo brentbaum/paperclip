@@ -6,7 +6,7 @@ import net from "node:net";
 import { resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { stdin, stdout } from "node:process";
-import type { Request as ExpressRequest } from "express";
+import type { Request as ExpressRequest, RequestHandler } from "express";
 import { and, eq } from "drizzle-orm";
 import {
   createDb,
@@ -14,6 +14,8 @@ import {
   inspectMigrations,
   applyPendingMigrations,
   reconcilePendingMigrationHistory,
+  formatDatabaseBackupResult,
+  runDatabaseBackup,
   authUsers,
   companies,
   companyMemberships,
@@ -28,12 +30,17 @@ import { agentService, approvalService, companyService, heartbeatService, issueS
 import { createStorageServiceFromConfig } from "./storage/index.js";
 import { printStartupBanner } from "./startup-banner.js";
 import { getBoardClaimWarningUrl, initializeBoardClaimChallenge } from "./board-claim.js";
-import {
-  createBetterAuthHandler,
-  createBetterAuthInstance,
-  resolveBetterAuthSession,
-  resolveBetterAuthSessionFromHeaders,
-} from "./auth/better-auth.js";
+
+type BetterAuthSessionUser = {
+  id: string;
+  email?: string | null;
+  name?: string | null;
+};
+
+type BetterAuthSessionResult = {
+  session: { id: string; userId: string } | null;
+  user: BetterAuthSessionUser | null;
+};
 
 type EmbeddedPostgresInstance = {
   initialise(): Promise<void>;
@@ -236,6 +243,7 @@ let db;
 let embeddedPostgres: EmbeddedPostgresInstance | null = null;
 let embeddedPostgresStartedByThisProcess = false;
 let migrationSummary: MigrationSummary = "skipped";
+let activeDatabaseConnectionString: string;
 let startupDbInfo:
   | { mode: "external-postgres"; connectionString: string }
   | { mode: "embedded-postgres"; dataDir: string; port: number };
@@ -244,6 +252,7 @@ if (config.databaseUrl) {
 
   db = createDb(config.databaseUrl);
   logger.info("Using external PostgreSQL via DATABASE_URL/config");
+  activeDatabaseConnectionString = config.databaseUrl;
   startupDbInfo = { mode: "external-postgres", connectionString: config.databaseUrl };
 } else {
   const moduleName = "embedded-postgres";
@@ -253,7 +262,7 @@ if (config.databaseUrl) {
     EmbeddedPostgres = mod.default as EmbeddedPostgresCtor;
   } catch {
     throw new Error(
-      "Embedded PostgreSQL mode requires optional dependency `embedded-postgres`. Install optional dependencies or set DATABASE_URL for external Postgres.",
+      "Embedded PostgreSQL mode requires dependency `embedded-postgres`. Reinstall dependencies (without omitting required packages), or set DATABASE_URL for external Postgres.",
     );
   }
 
@@ -389,6 +398,7 @@ if (config.databaseUrl) {
 
   db = createDb(embeddedConnectionString);
   logger.info("Embedded PostgreSQL ready");
+  activeDatabaseConnectionString = embeddedConnectionString;
   startupDbInfo = { mode: "embedded-postgres", dataDir, port };
 }
 
@@ -418,17 +428,23 @@ if (config.deploymentMode === "authenticated") {
 }
 
 let authReady = config.deploymentMode === "local_trusted";
-let betterAuthHandler: ReturnType<typeof createBetterAuthHandler> | undefined;
+let betterAuthHandler: RequestHandler | undefined;
 let resolveSession:
-  | ((req: ExpressRequest) => Promise<Awaited<ReturnType<typeof resolveBetterAuthSession>>>)
+  | ((req: ExpressRequest) => Promise<BetterAuthSessionResult | null>)
   | undefined;
 let resolveSessionFromHeaders:
-  | ((headers: Headers) => Promise<Awaited<ReturnType<typeof resolveBetterAuthSession>>>)
+  | ((headers: Headers) => Promise<BetterAuthSessionResult | null>)
   | undefined;
 if (config.deploymentMode === "local_trusted") {
   await ensureLocalTrustedBoardPrincipal(db as any);
 }
 if (config.deploymentMode === "authenticated") {
+  const {
+    createBetterAuthHandler,
+    createBetterAuthInstance,
+    resolveBetterAuthSession,
+    resolveBetterAuthSessionFromHeaders,
+  } = await import("./auth/better-auth.js");
   const betterAuthSecret =
     process.env.BETTER_AUTH_SECRET?.trim() ?? process.env.PAPERCLIP_AGENT_JWT_SECRET?.trim();
   if (!betterAuthSecret) {
@@ -520,6 +536,54 @@ await telegram.start().catch((err) => {
   logger.error({ err }, "telegram service failed to start");
 });
 
+if (config.databaseBackupEnabled) {
+  const backupIntervalMs = config.databaseBackupIntervalMinutes * 60 * 1000;
+  let backupInFlight = false;
+
+  const runScheduledBackup = async () => {
+    if (backupInFlight) {
+      logger.warn("Skipping scheduled database backup because a previous backup is still running");
+      return;
+    }
+
+    backupInFlight = true;
+    try {
+      const result = await runDatabaseBackup({
+        connectionString: activeDatabaseConnectionString,
+        backupDir: config.databaseBackupDir,
+        retentionDays: config.databaseBackupRetentionDays,
+        filenamePrefix: "paperclip",
+      });
+      logger.info(
+        {
+          backupFile: result.backupFile,
+          sizeBytes: result.sizeBytes,
+          prunedCount: result.prunedCount,
+          backupDir: config.databaseBackupDir,
+          retentionDays: config.databaseBackupRetentionDays,
+        },
+        `Automatic database backup complete: ${formatDatabaseBackupResult(result)}`,
+      );
+    } catch (err) {
+      logger.error({ err, backupDir: config.databaseBackupDir }, "Automatic database backup failed");
+    } finally {
+      backupInFlight = false;
+    }
+  };
+
+  logger.info(
+    {
+      intervalMinutes: config.databaseBackupIntervalMinutes,
+      retentionDays: config.databaseBackupRetentionDays,
+      backupDir: config.databaseBackupDir,
+    },
+    "Automatic database backups enabled",
+  );
+  setInterval(() => {
+    void runScheduledBackup();
+  }, backupIntervalMs);
+}
+
 server.listen(listenPort, config.host, () => {
   logger.info(`Server listening on ${config.host}:${listenPort}`);
   if (process.env.PAPERCLIP_OPEN_ON_LISTEN === "true") {
@@ -558,6 +622,10 @@ server.listen(listenPort, config.host, () => {
     heartbeatSchedulerEnabled: config.heartbeatSchedulerEnabled,
     heartbeatSchedulerIntervalMs: config.heartbeatSchedulerIntervalMs,
     tailscaleServe: tailscaleServeActive,
+    databaseBackupEnabled: config.databaseBackupEnabled,
+    databaseBackupIntervalMinutes: config.databaseBackupIntervalMinutes,
+    databaseBackupRetentionDays: config.databaseBackupRetentionDays,
+    databaseBackupDir: config.databaseBackupDir,
   });
 
   const boardClaimUrl = getBoardClaimWarningUrl(config.host, listenPort);
