@@ -13,6 +13,7 @@ import { companies } from "./companies.js";
 import { projects } from "./projects.js";
 import { approvals } from "./approvals.js";
 import { agents } from "./agents.js";
+import { issues } from "./issues.js";
 
 export const documents = pgTable(
   "documents",
@@ -25,6 +26,7 @@ export const documents = pgTable(
     projectId: uuid("project_id").references(() => projects.id),
     approvalId: uuid("approval_id").references(() => approvals.id),
     agentId: uuid("agent_id").references(() => agents.id),
+    issueId: uuid("issue_id").references(() => issues.id),
     day: date("day"),
     latestRevisionId: uuid("latest_revision_id"),
     createdByAgentId: uuid("created_by_agent_id").references(() => agents.id),
@@ -42,6 +44,7 @@ export const documents = pgTable(
     projectUniqueIdx: uniqueIndex("documents_project_id_unique").on(table.projectId),
     approvalUniqueIdx: uniqueIndex("documents_approval_id_unique").on(table.approvalId),
     agentDayUniqueIdx: uniqueIndex("documents_agent_day_unique").on(table.agentId, table.day),
+    issueUniqueIdx: uniqueIndex("documents_issue_id_unique").on(table.issueId),
   }),
 );
 

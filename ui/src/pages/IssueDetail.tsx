@@ -21,6 +21,8 @@ import { CommentThread } from "../components/CommentThread";
 import { IssueAssigneePicker } from "../components/IssueAssigneePicker";
 import { IssueProperties } from "../components/IssueProperties";
 import { IssueRunRail } from "../components/IssueRunRail";
+import { IssuePlanRail } from "../components/IssuePlanRail";
+import { documentsApi } from "../api/documents";
 import type { MentionOption } from "../components/MarkdownEditor";
 import { StatusIcon } from "../components/StatusIcon";
 import { PriorityIcon } from "../components/PriorityIcon";
@@ -219,7 +221,15 @@ export function IssueDetail() {
     refetchInterval: 3000,
   });
 
+  const { data: planDoc } = useQuery({
+    queryKey: queryKeys.documents.issuePlan(issueId!),
+    queryFn: () => documentsApi.getIssuePlanDocument(issueId!),
+    enabled: !!issueId,
+  });
+
+  const hasPlan = !!(planDoc?.latestRevision?.body?.trim());
   const hasLiveRuns = (liveRuns ?? []).length > 0 || !!activeRun;
+  const showDesktopRightRail = (hasLiveRuns || hasPlan) && !isMobile;
   const showDesktopRunRail = hasLiveRuns && !isMobile;
 
   // Filter out runs already shown by the live widget to avoid duplication
@@ -553,7 +563,7 @@ export function IssueDetail() {
   const isImageAttachment = (attachment: IssueAttachment) => attachment.contentType.startsWith("image/");
 
   return (
-    <div className={cn("space-y-6", showDesktopRunRail ? "max-w-6xl" : "max-w-2xl")}>
+    <div className={cn("space-y-6", showDesktopRightRail ? "max-w-6xl" : "max-w-2xl")}>
       {/* Parent chain breadcrumb */}
       {ancestors.length > 0 && (
         <nav className="flex items-center gap-1 text-xs text-muted-foreground flex-wrap">
@@ -581,7 +591,7 @@ export function IssueDetail() {
         </div>
       )}
 
-      <div className={cn(showDesktopRunRail && "grid gap-6 xl:grid-cols-[minmax(0,1fr)_26rem] xl:items-start")}>
+      <div className={cn(showDesktopRightRail && "grid gap-6 xl:grid-cols-[minmax(0,1fr)_26rem] xl:items-start")}>
         <div className="min-w-0 space-y-6">
           <div className="space-y-3">
             <div className="flex items-center gap-2 min-w-0 flex-wrap">
@@ -725,6 +735,17 @@ export function IssueDetail() {
             />
           </div>
 
+          {hasPlan && isMobile ? (
+            <IssuePlanRail
+              issueId={issueId!}
+              onApprove={(body) => {
+                addComment.mutate({ body: `**Plan approved.**\n\n${body.length > 200 ? body.slice(0, 200) + "..." : ""}` });
+              }}
+              onRequestChanges={(feedback) => {
+                addComment.mutate({ body: `**Changes requested on plan:**\n\n${feedback}` });
+              }}
+            />
+          ) : null}
           {hasLiveRuns && isMobile ? <IssueRunRail issueId={issueId!} companyId={issue.companyId} /> : null}
 
           <div className="space-y-3">
@@ -969,9 +990,22 @@ export function IssueDetail() {
           )}
         </div>
 
-        {showDesktopRunRail ? (
-          <div className="min-w-0 xl:sticky xl:top-6">
-            <IssueRunRail issueId={issueId!} companyId={issue.companyId} />
+        {showDesktopRightRail ? (
+          <div className="min-w-0 xl:sticky xl:top-6 space-y-4">
+            {hasPlan && (
+              <IssuePlanRail
+                issueId={issueId!}
+                onApprove={(body) => {
+                  addComment.mutate({ body: `**Plan approved.**\n\n${body.length > 200 ? body.slice(0, 200) + "..." : ""}` });
+                }}
+                onRequestChanges={(feedback) => {
+                  addComment.mutate({ body: `**Changes requested on plan:**\n\n${feedback}` });
+                }}
+              />
+            )}
+            {showDesktopRunRail && (
+              <IssueRunRail issueId={issueId!} companyId={issue.companyId} />
+            )}
           </div>
         ) : null}
       </div>

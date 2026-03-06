@@ -22,11 +22,12 @@ type DocumentDb = Pick<Db, "select" | "insert" | "update">;
 
 type CreateScopeDocumentInput = {
   companyId: string;
-  scope: "project" | "approval" | "agent_daily";
+  scope: "project" | "approval" | "agent_daily" | "issue_plan";
   title: string;
   projectId?: string | null;
   approvalId?: string | null;
   agentId?: string | null;
+  issueId?: string | null;
   day?: string | null;
   initialBody?: string;
   initialSource?: string;
@@ -66,6 +67,11 @@ function dailyScratchpadTitle(agentName: string, day: string) {
 
 function utcDayString(value = new Date()) {
   return value.toISOString().slice(0, 10);
+}
+
+function extractPlanFromDescription(description: string): string {
+  const match = description.match(/<plan>([\s\S]*?)<\/plan>/i);
+  return match ? match[1]!.trim() : "";
 }
 
 async function hydrateDocuments(
@@ -118,6 +124,7 @@ async function hydrateDocuments(
       projectId: row.projectId ?? null,
       approvalId: row.approvalId ?? null,
       agentId: row.agentId ?? null,
+      issueId: row.issueId ?? null,
       day: row.day ?? null,
       latestRevisionId: row.latestRevisionId ?? null,
       latestRevisionNumber: latestRevision?.revisionNumber ?? null,
@@ -162,7 +169,8 @@ export function documentService(db: Db) {
     where:
       | { projectId: string }
       | { approvalId: string }
-      | { agentId: string; day: string },
+      | { agentId: string; day: string }
+      | { issueId: string },
     viewerAgentId?: string | null,
   ) {
     let row: typeof documents.$inferSelect | null = null;
@@ -177,6 +185,12 @@ export function documentService(db: Db) {
         .select()
         .from(documents)
         .where(eq(documents.approvalId, where.approvalId))
+        .then((rows) => rows[0] ?? null);
+    } else if ("issueId" in where) {
+      row = await db
+        .select()
+        .from(documents)
+        .where(eq(documents.issueId, where.issueId))
         .then((rows) => rows[0] ?? null);
     } else {
       row = await db
@@ -234,6 +248,7 @@ export function documentService(db: Db) {
           projectId: input.projectId ?? null,
           approvalId: input.approvalId ?? null,
           agentId: input.agentId ?? null,
+          issueId: input.issueId ?? null,
           day: input.day ?? null,
           latestRevisionId: null,
           createdByAgentId: actor.agentId ?? null,
@@ -365,6 +380,33 @@ export function documentService(db: Db) {
     });
   }
 
+  async function getOrCreateIssuePlanDocument(
+    issueId: string,
+    actor?: ActorRef,
+    viewerAgentId?: string | null,
+  ) {
+    const existing = await getDocumentByScope({ issueId }, viewerAgentId);
+    if (existing) return existing;
+
+    const issue = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    if (!issue) throw notFound("Issue not found");
+
+    const planBody = extractPlanFromDescription(issue.description ?? "");
+    return createScopedDocument({
+      companyId: issue.companyId,
+      scope: "issue_plan",
+      title: `Plan · ${issue.identifier ?? issue.id.slice(0, 8)}`,
+      issueId: issue.id,
+      initialBody: planBody,
+      initialSource: planBody ? "seed_from_issue_description" : "seed_empty",
+      actor,
+    });
+  }
+
   return {
     getById: async (documentId: string, viewerAgentId?: string | null) => {
       const row = await getDocumentRowById(documentId);
@@ -486,6 +528,7 @@ export function documentService(db: Db) {
     getOrCreateProjectDocument,
     getOrCreateApprovalDocument,
     getOrCreateAgentDailyDocument,
+    getOrCreateIssuePlanDocument,
 
     createRevision: async (
       documentId: string,

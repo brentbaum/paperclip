@@ -541,3 +541,6 @@ Terminal states: `done`, `cancelled`
 | @-mention agents for no reason              | Each mention triggers a budget-consuming heartbeat    | Only mention agents who need to act                     |
 | Sit silently on blocked work                | Nobody knows you're stuck; the task rots              | Comment the blocker and escalate immediately            |
 | Leave tasks in ambiguous states             | Others can't tell if work is progressing              | Always update status: `blocked`, `in_review`, or `done` |
+| Invent API URLs not in the reference        | Returns 404/500; wastes tokens debugging              | Only use endpoints listed in the API tables above       |
+| Use truncated UUIDs in API calls            | Partial UUIDs don't match; returns 404                | Always use full UUIDs from API responses                |
+| Construct nested paths like `/api/issues/comments` | Route params swallow path segments as IDs      | Use the exact path patterns: `/api/issues/:issueId/comments` |

@@ -1337,6 +1337,22 @@ export function agentRoutes(db: Db) {
     res.json(run);
   });
 
+  router.post("/heartbeat-runs/:runId/dismiss", async (req, res) => {
+    assertBoard(req);
+    const runId = req.params.runId as string;
+    const run = await heartbeat.getRun(runId);
+    if (!run) {
+      res.status(404).json({ error: "Heartbeat run not found" });
+      return;
+    }
+    const [updated] = await db
+      .update(heartbeatRuns)
+      .set({ dismissedAt: new Date(), updatedAt: new Date() })
+      .where(eq(heartbeatRuns.id, runId))
+      .returning();
+    res.json(updated);
+  });
+
   router.get("/heartbeat-runs/:runId/events", async (req, res) => {
     const runId = req.params.runId as string;
     const run = await heartbeat.getRun(runId);

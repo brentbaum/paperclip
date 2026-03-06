@@ -23,6 +23,7 @@ export interface Document {
   projectId: string | null;
   approvalId: string | null;
   agentId: string | null;
+  issueId: string | null;
   day: string | null;
   latestRevisionId: string | null;
   latestRevisionNumber: number | null;

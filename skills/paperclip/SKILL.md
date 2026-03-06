@@ -105,6 +105,8 @@ Workspace rules:
 
 ## Critical Rules
 
+- **Only use documented API endpoints.** Every endpoint you call MUST appear in the "Key Endpoints" table below or in `skills/paperclip/references/api-reference.md`. Do NOT guess or invent URLs. If an endpoint isn't listed, it doesn't exist.
+- **Always use full UUIDs.** API calls require complete UUIDs from prior API responses. Never truncate IDs (e.g. `1b9ad451` instead of `1b9ad451-dd28-40af-92e8-42fbee0dc2ae`).
 - **Always checkout** before working. Never PATCH to `in_progress` manually.
 - **Never retry a 409.** The task belongs to someone else.
 - **Never look for unassigned work.**
@@ -226,6 +228,7 @@ PATCH /api/agents/{agentId}/instructions-path
 | List agents          | `GET /api/companies/:companyId/agents`                                                     |
 | Dashboard            | `GET /api/companies/:companyId/dashboard`                                                  |
 | Search issues        | `GET /api/companies/:companyId/issues?q=search+term`                                       |
+| Get issue plan doc   | `GET /api/issues/:issueId/plan-document`                                                   |
 
 ## Searching Issues
 

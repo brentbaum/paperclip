@@ -7,10 +7,10 @@ export default defineConfig(async ({ command }) => ({
   plugins: [
     react(),
     tailwindcss(),
-    command === "build" &&
-      (await import("vite-plugin-pwa")).VitePWA({
+    (await import("vite-plugin-pwa")).VitePWA({
         registerType: "autoUpdate",
         manifest: false,
+        devOptions: { enabled: false },
         workbox: {
           globPatterns: ["**/*.{js,css,html,png,svg,ico}"],
           navigateFallback: "/index.html",

@@ -43,6 +43,7 @@ export const queryKeys = {
     project: (projectId: string) => ["documents", "project", projectId] as const,
     approval: (approvalId: string) => ["documents", "approval", approvalId] as const,
     agentDaily: (agentId: string, day?: string) => ["documents", "agent-daily", agentId, day ?? null] as const,
+    issuePlan: (issueId: string) => ["documents", "issue-plan", issueId] as const,
   },
   goals: {
     list: (companyId: string) => ["goals", companyId] as const,

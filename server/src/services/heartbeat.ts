@@ -940,16 +940,54 @@ export function heartbeatService(db: Db) {
       .from(heartbeatRuns)
       .where(inArray(heartbeatRuns.status, ["queued", "running"]));
 
+    logger.info(
+      {
+        activeRunCount: activeRuns.length,
+        runningProcessCount: runningProcesses.size,
+        runningProcessIds: [...runningProcesses.keys()],
+        staleThresholdMs,
+      },
+      "reapOrphanedRuns: scanning for orphans",
+    );
+
     const reaped: string[] = [];
 
     for (const run of activeRuns) {
-      if (runningProcesses.has(run.id)) continue;
+      const ageMs = now.getTime() - (run.updatedAt ? new Date(run.updatedAt).getTime() : 0);
+      const startedAgeMs = run.startedAt ? now.getTime() - new Date(run.startedAt).getTime() : null;
+
+      if (runningProcesses.has(run.id)) {
+        logger.debug({ runId: run.id, status: run.status }, "reapOrphanedRuns: skipping (tracked in runningProcesses)");
+        continue;
+      }
 
       // Apply staleness threshold to avoid false positives
       if (staleThresholdMs > 0) {
         const refTime = run.updatedAt ? new Date(run.updatedAt).getTime() : 0;
-        if (now.getTime() - refTime < staleThresholdMs) continue;
+        if (now.getTime() - refTime < staleThresholdMs) {
+          logger.debug(
+            { runId: run.id, status: run.status, ageMs, staleThresholdMs },
+            "reapOrphanedRuns: skipping (below staleness threshold)",
+          );
+          continue;
+        }
       }
+
+      logger.warn(
+        {
+          runId: run.id,
+          agentId: run.agentId,
+          status: run.status,
+          invocationSource: run.invocationSource,
+          startedAt: run.startedAt,
+          updatedAt: run.updatedAt,
+          ageMs,
+          startedAgeMs,
+          hasLogRef: !!run.logRef,
+          hasLogStore: !!run.logStore,
+        },
+        "reapOrphanedRuns: reaping orphaned run (not in runningProcesses)",
+      );
 
       await setRunStatus(run.id, "failed", {
         error: "Process lost -- server may have restarted",
@@ -977,7 +1015,9 @@ export function heartbeatService(db: Db) {
     }
 
     if (reaped.length > 0) {
-      logger.warn({ reapedCount: reaped.length, runIds: reaped }, "reaped orphaned heartbeat runs");
+      logger.warn({ reapedCount: reaped.length, runIds: reaped }, "reapOrphanedRuns: complete");
+    } else if (activeRuns.length > 0) {
+      logger.info({ activeRunCount: activeRuns.length }, "reapOrphanedRuns: no orphans found");
     }
     return { reaped: reaped.length, runIds: reaped };
   }

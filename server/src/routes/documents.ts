@@ -6,7 +6,7 @@ import {
   documentDiffQuerySchema,
 } from "@paperclipai/shared";
 import { validate } from "../middleware/validate.js";
-import { documentService, approvalService, projectService, agentService, logActivity } from "../services/index.js";
+import { documentService, approvalService, projectService, agentService, issueService, logActivity } from "../services/index.js";
 import { assertCompanyAccess, getActorInfo } from "./authz.js";
 
 export function documentRoutes(db: Db) {
@@ -15,6 +15,33 @@ export function documentRoutes(db: Db) {
   const approvalsSvc = approvalService(db);
   const projectsSvc = projectService(db);
   const agentsSvc = agentService(db);
+  const issuesSvc = issueService(db);
+
+  // Resolve issue identifiers (e.g. "PAP-39") to UUIDs for /issues/:id routes
+  router.param("id", async (req, res, next, rawId) => {
+    try {
+      if (/^[A-Z]+-\d+$/i.test(rawId)) {
+        const issue = await issuesSvc.getByIdentifier(rawId);
+        if (issue) {
+          req.params.id = issue.id;
+        }
+      }
+      next();
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  router.get("/issues/:id/plan-document", async (req, res) => {
+    const issue = await issuesSvc.getById(req.params.id as string);
+    if (!issue) {
+      res.status(404).json({ error: "Issue not found" });
+      return;
+    }
+    assertCompanyAccess(req, issue.companyId);
+    const document = await documentsSvc.getOrCreateIssuePlanDocument(issue.id);
+    res.json(document);
+  });
 
   router.get("/projects/:id/document", async (req, res) => {
     const project = await projectsSvc.getById(req.params.id as string);

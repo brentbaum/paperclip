@@ -30,6 +30,7 @@ export const heartbeatRuns = pgTable(
     stdoutExcerpt: text("stdout_excerpt"),
     stderrExcerpt: text("stderr_excerpt"),
     errorCode: text("error_code"),
+    dismissedAt: timestamp("dismissed_at", { withTimezone: true }),
     externalRunId: text("external_run_id"),
     contextSnapshot: jsonb("context_snapshot").$type<Record<string, unknown>>(),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),

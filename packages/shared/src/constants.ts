@@ -113,7 +113,7 @@ export const PROJECT_STATUSES = [
 ] as const;
 export type ProjectStatus = (typeof PROJECT_STATUSES)[number];
 
-export const DOCUMENT_SCOPES = ["project", "approval", "agent_daily"] as const;
+export const DOCUMENT_SCOPES = ["project", "approval", "agent_daily", "issue_plan"] as const;
 export type DocumentScope = (typeof DOCUMENT_SCOPES)[number];
 
 export const DOCUMENT_FORMATS = ["markdown"] as const;

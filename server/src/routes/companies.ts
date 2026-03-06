@@ -7,6 +7,7 @@ import {
   createCompanySchema,
   updateCompanySchema,
 } from "@paperclipai/shared";
+import { isUuidLike } from "@paperclipai/shared";
 import { forbidden } from "../errors.js";
 import { validate } from "../middleware/validate.js";
 import { accessService, companyPortabilityService, companyService, logActivity } from "../services/index.js";
@@ -17,6 +18,17 @@ export function companyRoutes(db: Db) {
   const svc = companyService(db);
   const portability = companyPortabilityService(db);
   const access = accessService(db);
+
+  // Infer companyId from bearer token when agents drop it from the URL
+  router.param("companyId", (req, res, next, rawId) => {
+    if (isUuidLike(rawId)) return next();
+    const inferred = req.actor?.companyId ?? req.actor?.companyIds?.[0];
+    if (inferred) {
+      req.params.companyId = inferred;
+      return next();
+    }
+    res.status(400).json({ error: "Invalid companyId. Use a valid UUID or authenticate as an agent." });
+  });
 
   router.get("/", async (req, res) => {
     assertBoard(req);

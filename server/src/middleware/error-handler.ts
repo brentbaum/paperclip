@@ -36,5 +36,7 @@ export function errorHandler(
     req.originalUrl,
     err instanceof Error ? err.message : String(err),
   );
-  res.status(500).json({ error: "Internal server error" });
+  if (!res.headersSent) {
+    res.status(500).json({ error: "Internal server error" });
+  }
 }

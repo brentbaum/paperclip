@@ -91,7 +91,15 @@ When changing data model:
 pnpm db:generate
 ```
 
-4. Validate compile:
+4. **Apply migration to running dev database:**
+
+```sh
+pnpm db:migrate
+```
+
+If `DATABASE_URL` is not set (embedded-postgres mode), the server auto-applies pending migrations on startup — restart the dev server to apply. Always verify the migration ran successfully before moving on.
+
+5. Validate compile:
 
 ```sh
 pnpm -r typecheck
@@ -100,6 +108,7 @@ pnpm -r typecheck
 Notes:
 - `packages/db/drizzle.config.ts` reads compiled schema from `dist/schema/*.js`
 - `pnpm db:generate` compiles `packages/db` first
+- **Never leave generated migrations unapplied** — the Drizzle schema and DB must stay in sync or all queries against affected tables will fail at runtime
 
 ## 7. Verification Before Hand-off
 

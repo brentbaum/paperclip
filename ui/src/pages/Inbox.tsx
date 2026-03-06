@@ -36,6 +36,7 @@ import {
   XCircle,
   UserCheck,
   RotateCcw,
+  EyeOff,
 } from "lucide-react";
 import { Identity } from "../components/Identity";
 import { PageTabBar } from "../components/PageTabBar";
@@ -82,9 +83,11 @@ function getStaleIssues(issues: Issue[]): Issue[] {
 }
 
 function getLatestFailedRunsByAgent(runs: HeartbeatRun[]): HeartbeatRun[] {
-  const sorted = [...runs].sort(
-    (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime(),
-  );
+  const sorted = [...runs]
+    .filter((r) => !r.dismissedAt)
+    .sort(
+      (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime(),
+    );
   const latestByAgent = new Map<string, HeartbeatRun>();
 
   for (const run of sorted) {
@@ -134,6 +137,14 @@ function FailedRunCard({
   const issue = issueId ? issueById.get(issueId) ?? null : null;
   const sourceLabel = RUN_SOURCE_LABELS[run.invocationSource] ?? "Manual";
   const displayError = runFailureMessage(run);
+
+  const dismissRun = useMutation({
+    mutationFn: () => heartbeatsApi.dismiss(run.id),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.heartbeats(run.companyId) });
+      queryClient.invalidateQueries({ queryKey: queryKeys.heartbeats(run.companyId, run.agentId) });
+    },
+  });
 
   const retryRun = useMutation({
     mutationFn: async () => {
@@ -200,6 +211,17 @@ function FailedRunCard({
             </p>
           </div>
           <div className="flex items-center gap-2">
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              className="h-8 px-2.5"
+              onClick={() => dismissRun.mutate()}
+              disabled={dismissRun.isPending}
+            >
+              <EyeOff className="mr-1.5 h-3.5 w-3.5" />
+              {dismissRun.isPending ? "Dismissing…" : "Dismiss"}
+            </Button>
             <Button
               type="button"
               variant="outline"

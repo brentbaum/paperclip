@@ -36,4 +36,6 @@ export const documentsApi = {
     api.get<Document>(
       `/agents/${encodeURIComponent(agentId)}/daily-document${day ? `?day=${encodeURIComponent(day)}` : ""}`,
     ),
+  getIssuePlanDocument: (issueId: string) =>
+    api.get<Document>(`/issues/${encodeURIComponent(issueId)}/plan-document`),
 };
