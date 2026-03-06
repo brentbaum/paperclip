@@ -1,4 +1,5 @@
 import type { Db } from "@paperclipai/db";
+import type { PaperclipConfig } from "@paperclipai/shared";
 import type { LiveEvent } from "@paperclipai/shared";
 import { HttpError } from "../errors.js";
 import { logger } from "../middleware/logger.js";
@@ -9,6 +10,7 @@ import type { heartbeatService } from "./heartbeat.js";
 import { logActivity, type LogActivityInput } from "./activity-log.js";
 import { subscribeCompanyLiveEvents } from "./live-events.js";
 import { parseNewCommand } from "./telegram-new-parser.js";
+import { readConfigFile, writeConfigFile } from "../config-file.js";
 
 type AgentService = ReturnType<typeof agentService>;
 type IssueService = ReturnType<typeof issueService>;
@@ -82,6 +84,9 @@ interface TelegramServiceDeps {
   approvals: Pick<ApprovalService, "approve" | "reject" | "getById">;
   issues: Pick<IssueService, "create">;
   agents: Pick<AgentService, "list" | "getById" | "resolveByReference">;
+  companies?: {
+    list: () => Promise<Array<{ id: string; status: string }>>;
+  };
   createBot?: (token: string) => TelegramBotLike | Promise<TelegramBotLike>;
   logActivityFn?: (db: Db, input: LogActivityInput) => Promise<void>;
 }
@@ -496,8 +501,33 @@ export function telegramService(db: Db, deps: TelegramServiceDeps) {
       const agent = await deps.agents.getById(agentId);
       if (agent) companyIds.add(agent.companyId);
     }
+    if (companyIds.size === 0 && deps.companies) {
+      const companies = await deps.companies.list();
+      const activeCompanies = companies.filter((company) => company.status !== "archived");
+      for (const company of activeCompanies) {
+        companyIds.add(company.id);
+      }
+      if (activeCompanies.length > 1) {
+        logger.info(
+          { companyCount: activeCompanies.length },
+          "telegram startup topic sync will provision all active companies",
+        );
+      }
+    }
     for (const companyId of companyIds) {
       subscribeToLiveEvents(companyId);
+    }
+    return companyIds;
+  }
+
+  async function autoSyncTopicsOnStart() {
+    const companyIds = await subscribeToMappedCompanyEvents();
+    for (const companyId of companyIds) {
+      try {
+        await syncTopics(companyId);
+      } catch (err) {
+        logger.warn({ err, companyId }, "telegram startup topic sync failed");
+      }
     }
   }
 
@@ -747,7 +777,7 @@ export function telegramService(db: Db, deps: TelegramServiceDeps) {
           logger.info("telegram bot started");
         },
       });
-      await subscribeToMappedCompanyEvents();
+      await autoSyncTopicsOnStart();
     })();
     try {
       await startPromise;
@@ -794,15 +824,18 @@ export function telegramService(db: Db, deps: TelegramServiceDeps) {
       };
     }
 
+    let didCreateTopics = false;
     if (!deps.config.telegramStatusTopicId) {
       const statusTopic = await retryTelegramCall(() => activeBot.api.createForumTopic(chatId, "Status"));
       deps.config.telegramStatusTopicId = statusTopic.message_thread_id;
+      didCreateTopics = true;
     }
     if (!deps.config.telegramApprovalsTopicId) {
       const approvalsTopic = await retryTelegramCall(() =>
         activeBot.api.createForumTopic(chatId, "Approvals"),
       );
       deps.config.telegramApprovalsTopicId = approvalsTopic.message_thread_id;
+      didCreateTopics = true;
     }
 
     const createdTopics: Array<{ agentId: string; topicId: number }> = [];
@@ -813,6 +846,11 @@ export function telegramService(db: Db, deps: TelegramServiceDeps) {
       const topic = await retryTelegramCall(() => activeBot.api.createForumTopic(chatId, agent.name));
       deps.config.telegramTopicMapping[agent.id] = topic.message_thread_id;
       createdTopics.push({ agentId: agent.id, topicId: topic.message_thread_id });
+      didCreateTopics = true;
+    }
+
+    if (didCreateTopics) {
+      persistTelegramTopicState();
     }
 
     subscribeToLiveEvents(companyId);
@@ -823,6 +861,27 @@ export function telegramService(db: Db, deps: TelegramServiceDeps) {
       topicMapping: { ...deps.config.telegramTopicMapping },
       createdTopics,
     };
+  }
+
+  function persistTelegramTopicState() {
+    const existingConfig = readConfigFile();
+    if (!existingConfig) return;
+
+    const nextConfig: PaperclipConfig = {
+      ...existingConfig,
+      telegram: {
+        ...(existingConfig.telegram ?? {}),
+        topicMapping: { ...deps.config.telegramTopicMapping },
+        ...(deps.config.telegramStatusTopicId
+          ? { statusTopicId: deps.config.telegramStatusTopicId }
+          : {}),
+        ...(deps.config.telegramApprovalsTopicId
+          ? { approvalsTopicId: deps.config.telegramApprovalsTopicId }
+          : {}),
+      },
+    };
+
+    writeConfigFile(nextConfig);
   }
 
   async function sendToAgentTopic(input: SendToAgentTopicInput): Promise<SendTelegramResult> {
@@ -845,7 +904,15 @@ export function telegramService(db: Db, deps: TelegramServiceDeps) {
       return { ok: false as const, error: "agent-company mismatch" };
     }
 
-    const topicId = deps.config.telegramTopicMapping[input.agentId];
+    let topicId = deps.config.telegramTopicMapping[input.agentId];
+    if (!topicId) {
+      try {
+        await syncTopics(owner.companyId);
+      } catch (err) {
+        logger.warn({ err, agentId: input.agentId, companyId: owner.companyId }, "telegram send sync failed");
+      }
+      topicId = deps.config.telegramTopicMapping[input.agentId];
+    }
     if (!topicId) {
       return { ok: false as const, error: "agent topic not configured" };
     }

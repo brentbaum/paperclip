@@ -148,6 +148,43 @@ describe("telegramService", () => {
     expect(second.createdTopics).toEqual([]);
   });
 
+  it("provisions topics for all active companies on startup when no mappings exist", async () => {
+    const fakeBot = new FakeBot();
+    const deps = baseDeps({
+      createBot: async () => fakeBot,
+      companies: {
+        list: vi.fn(async () => [
+          { id: "company-1", status: "active" },
+          { id: "company-2", status: "active" },
+        ]),
+      },
+      agents: {
+        list: vi.fn(async (companyId: string) => {
+          if (companyId === "company-1") {
+            return [{ id: "agent-1", name: "Alice", status: "idle" }];
+          }
+          if (companyId === "company-2") {
+            return [{ id: "agent-2", name: "Bob", status: "idle" }];
+          }
+          return [];
+        }),
+        getById: vi.fn(async () => null),
+        resolveByReference: vi.fn(async () => ({ agent: null, ambiguous: false })),
+      } as any,
+    });
+
+    const svc = telegramService({} as any, deps);
+    await svc.start();
+
+    expect(deps.agents.list).toHaveBeenCalledWith("company-1");
+    expect(deps.agents.list).toHaveBeenCalledWith("company-2");
+    expect(fakeBot.api.createForumTopic).toHaveBeenCalledTimes(4);
+    expect(deps.config.telegramStatusTopicId).toBeGreaterThan(0);
+    expect(deps.config.telegramApprovalsTopicId).toBeGreaterThan(0);
+    expect(deps.config.telegramTopicMapping["agent-1"]).toBeGreaterThan(0);
+    expect(deps.config.telegramTopicMapping["agent-2"]).toBeGreaterThan(0);
+  });
+
   it("routes non-command messages in mapped topics to heartbeat wakeup", async () => {
     const fakeBot = new FakeBot();
     const wakeup = vi.fn(async () => null);

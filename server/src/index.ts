@@ -23,7 +23,7 @@ import { createApp } from "./app.js";
 import { loadConfig } from "./config.js";
 import { logger } from "./middleware/logger.js";
 import { setupLiveEventsWebSocketServer } from "./realtime/live-events-ws.js";
-import { agentService, approvalService, heartbeatService, issueService, telegramService } from "./services/index.js";
+import { agentService, approvalService, companyService, heartbeatService, issueService, telegramService } from "./services/index.js";
 import { createStorageServiceFromConfig } from "./storage/index.js";
 import { printStartupBanner } from "./startup-banner.js";
 import { getBoardClaimWarningUrl, initializeBoardClaimChallenge } from "./board-claim.js";
@@ -424,6 +424,7 @@ const telegram = telegramService(db as any, {
   approvals: approvalService(db as any),
   issues: issueService(db as any),
   agents: agentService(db as any),
+  companies: companyService(db as any),
 });
 const app = await createApp(db as any, {
   uiMode,
