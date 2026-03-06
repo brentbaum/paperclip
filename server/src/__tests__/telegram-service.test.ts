@@ -179,6 +179,63 @@ describe("telegramService", () => {
     });
   });
 
+  it("does not crash startup on telegram polling conflict and still allows outbound sends", async () => {
+    const fakeBot = new FakeBot();
+    fakeBot.start = vi.fn(async () => {
+      throw {
+        error_code: 409,
+        description:
+          "Conflict: terminated by other getUpdates request; make sure that only one bot instance is running",
+      };
+    });
+
+    const deps = baseDeps({
+      createBot: async () => fakeBot,
+      companies: {
+        list: vi.fn(async () => [
+          {
+            id: "company-1",
+            name: "Acme",
+            status: "active",
+            createdAt: "2026-03-04T00:00:00.000Z",
+          },
+        ]),
+        getById: vi.fn(async () => ({
+          id: "company-1",
+          name: "Acme",
+          status: "active",
+          createdAt: "2026-03-04T00:00:00.000Z",
+        })),
+      },
+      agents: {
+        list: vi.fn(async () => [
+          { id: "agent-1", name: "Alice", role: "engineer", status: "idle", createdAt: "2026-03-04T01:00:00.000Z" },
+        ]),
+        getById: vi.fn(async (id: string) =>
+          id === "agent-1" ? { id: "agent-1", companyId: "company-1", status: "idle" } : null,
+        ),
+        resolveByReference: vi.fn(async () => ({ agent: null, ambiguous: false })),
+      } as any,
+    });
+
+    const svc = telegramService({} as any, deps);
+    await expect(svc.start()).resolves.toBeUndefined();
+
+    const sendResult = await svc.sendToAgentTopic({
+      companyId: "company-1",
+      agentId: "agent-1",
+      text: "hello",
+    });
+
+    expect(fakeBot.start).toHaveBeenCalledTimes(1);
+    expect(sendResult).toEqual({ ok: true, messageId: expect.any(Number) });
+    expect(fakeBot.api.sendMessage).toHaveBeenCalledWith(
+      "-100123",
+      "hello",
+      expect.objectContaining({ message_thread_id: expect.any(Number) }),
+    );
+  });
+
   it("syncs system topics and missing active agent topics idempotently", async () => {
     const fakeBot = new FakeBot();
     const deps = baseDeps({

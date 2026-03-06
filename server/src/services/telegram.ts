@@ -279,6 +279,12 @@ function isTopicNotModifiedError(err: unknown) {
   return Boolean(description && description.includes("TOPIC_NOT_MODIFIED"));
 }
 
+function isLongPollingConflictError(err: unknown) {
+  const description = readTelegramDescription(err);
+  return readTelegramStatusCode(err) === 409
+    && Boolean(description && description.includes("other getUpdates request"));
+}
+
 function isNetworkError(err: unknown): boolean {
   const asObj = asRecord(err);
   const code = asObj.code;
@@ -874,6 +880,22 @@ export function telegramService(db: Db, deps: TelegramServiceDeps) {
           started = true;
           logger.info("telegram bot started");
         },
+      }).catch((err) => {
+        started = false;
+        if (isLongPollingConflictError(err)) {
+          logger.error(
+            {
+              err,
+              chatId: getChatId(),
+            },
+            "telegram bot polling conflict at startup: another process is already polling this bot token; inbound Telegram handling is disabled in this process until the other poller is stopped",
+          );
+          return;
+        }
+        logger.error(
+          { err, chatId: getChatId() },
+          "telegram bot failed to start polling; inbound Telegram handling is disabled in this process",
+        );
       });
       await autoSyncTopicsOnStart();
     })();
