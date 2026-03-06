@@ -8,6 +8,7 @@ import { agentsApi } from "../api/agents";
 import { authApi } from "../api/auth";
 import { projectsApi } from "../api/projects";
 import { useCompany } from "../context/CompanyContext";
+import { useSidebar } from "../context/SidebarContext";
 import { useToast } from "../context/ToastContext";
 import { usePanel } from "../context/PanelContext";
 import { useBreadcrumbs } from "../context/BreadcrumbContext";
@@ -19,7 +20,7 @@ import { InlineEditor } from "../components/InlineEditor";
 import { CommentThread } from "../components/CommentThread";
 import { IssueAssigneePicker } from "../components/IssueAssigneePicker";
 import { IssueProperties } from "../components/IssueProperties";
-import { LiveRunWidget } from "../components/LiveRunWidget";
+import { IssueRunRail } from "../components/IssueRunRail";
 import type { MentionOption } from "../components/MarkdownEditor";
 import { StatusIcon } from "../components/StatusIcon";
 import { PriorityIcon } from "../components/PriorityIcon";
@@ -148,6 +149,7 @@ function ActorIdentity({ evt, agentMap }: { evt: ActivityEvent; agentMap: Map<st
 export function IssueDetail() {
   const { issueId } = useParams<{ issueId: string }>();
   const { selectedCompanyId } = useCompany();
+  const { isMobile } = useSidebar();
   const { pushToast } = useToast();
   const { openPanel, closePanel, panelVisible, setPanelVisible } = usePanel();
   const { setBreadcrumbs } = useBreadcrumbs();
@@ -218,6 +220,7 @@ export function IssueDetail() {
   });
 
   const hasLiveRuns = (liveRuns ?? []).length > 0 || !!activeRun;
+  const showDesktopRunRail = hasLiveRuns && !isMobile;
 
   // Filter out runs already shown by the live widget to avoid duplication
   const timelineRuns = useMemo(() => {
@@ -550,7 +553,7 @@ export function IssueDetail() {
   const isImageAttachment = (attachment: IssueAttachment) => attachment.contentType.startsWith("image/");
 
   return (
-    <div className="max-w-2xl space-y-6">
+    <div className={cn("space-y-6", showDesktopRunRail ? "max-w-6xl" : "max-w-2xl")}>
       {/* Parent chain breadcrumb */}
       {ancestors.length > 0 && (
         <nav className="flex items-center gap-1 text-xs text-muted-foreground flex-wrap">
@@ -578,149 +581,153 @@ export function IssueDetail() {
         </div>
       )}
 
-      <div className="space-y-3">
-        <div className="flex items-center gap-2 min-w-0 flex-wrap">
-          <StatusIcon
-            status={issue.status}
-            open={statusPickerOpen}
-            onOpenChange={setStatusPickerOpen}
-            onChange={(status) => updateIssue.mutate({ status })}
-          />
-          <PriorityIcon
-            priority={issue.priority}
-            open={priorityPickerOpen}
-            onOpenChange={setPriorityPickerOpen}
-            onChange={(priority) => updateIssue.mutate({ priority })}
-          />
-          <IssueAssigneePicker
-            issue={issue}
-            agents={agents}
-            currentUserId={currentUserId}
-            open={assigneePickerOpen}
-            onOpenChange={setAssigneePickerOpen}
-            compact
-            onChange={(assigneeAgentId, assigneeUserId) => updateIssue.mutate({ assigneeAgentId, assigneeUserId })}
-          />
-          <span className="text-sm font-mono text-muted-foreground shrink-0">{issue.identifier ?? issue.id.slice(0, 8)}</span>
+      <div className={cn(showDesktopRunRail && "grid gap-6 xl:grid-cols-[minmax(0,1fr)_26rem] xl:items-start")}>
+        <div className="min-w-0 space-y-6">
+          <div className="space-y-3">
+            <div className="flex items-center gap-2 min-w-0 flex-wrap">
+              <StatusIcon
+                status={issue.status}
+                open={statusPickerOpen}
+                onOpenChange={setStatusPickerOpen}
+                onChange={(status) => updateIssue.mutate({ status })}
+              />
+              <PriorityIcon
+                priority={issue.priority}
+                open={priorityPickerOpen}
+                onOpenChange={setPriorityPickerOpen}
+                onChange={(priority) => updateIssue.mutate({ priority })}
+              />
+              <IssueAssigneePicker
+                issue={issue}
+                agents={agents}
+                currentUserId={currentUserId}
+                open={assigneePickerOpen}
+                onOpenChange={setAssigneePickerOpen}
+                compact
+                onChange={(assigneeAgentId, assigneeUserId) => updateIssue.mutate({ assigneeAgentId, assigneeUserId })}
+              />
+              <span className="text-sm font-mono text-muted-foreground shrink-0">{issue.identifier ?? issue.id.slice(0, 8)}</span>
 
-          {hasLiveRuns && (
-            <span className="inline-flex items-center gap-1.5 rounded-full bg-cyan-500/10 border border-cyan-500/30 px-2 py-0.5 text-[10px] font-medium text-cyan-600 dark:text-cyan-400 shrink-0">
-              <span className="relative flex h-1.5 w-1.5">
-                <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-cyan-400 opacity-75" />
-                <span className="relative inline-flex rounded-full h-1.5 w-1.5 bg-cyan-400" />
-              </span>
-              Live
-            </span>
-          )}
-
-          {issue.projectId ? (
-            <Link
-              to={`/projects/${issue.projectId}`}
-              className="inline-flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground transition-colors rounded px-1 -mx-1 py-0.5 min-w-0"
-            >
-              <Hexagon className="h-3 w-3 shrink-0" />
-              <span className="truncate">{(projects ?? []).find((p) => p.id === issue.projectId)?.name ?? issue.projectId.slice(0, 8)}</span>
-            </Link>
-          ) : (
-            <span className="inline-flex items-center gap-1 text-xs text-muted-foreground opacity-50 px-1 -mx-1 py-0.5">
-              <Hexagon className="h-3 w-3 shrink-0" />
-              No project
-            </span>
-          )}
-
-          {(issue.labels ?? []).length > 0 && (
-            <div className="hidden sm:flex items-center gap-1">
-              {(issue.labels ?? []).slice(0, 4).map((label) => (
-                <span
-                  key={label.id}
-                  className="inline-flex items-center rounded-full border px-2 py-0.5 text-[10px] font-medium"
-                  style={{
-                    borderColor: label.color,
-                    color: label.color,
-                    backgroundColor: `${label.color}1f`,
-                  }}
-                >
-                  {label.name}
+              {hasLiveRuns && (
+                <span className="inline-flex items-center gap-1.5 rounded-full bg-cyan-500/10 border border-cyan-500/30 px-2 py-0.5 text-[10px] font-medium text-cyan-600 dark:text-cyan-400 shrink-0">
+                  <span className="relative flex h-1.5 w-1.5">
+                    <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-cyan-400 opacity-75" />
+                    <span className="relative inline-flex rounded-full h-1.5 w-1.5 bg-cyan-400" />
+                  </span>
+                  Live
                 </span>
-              ))}
-              {(issue.labels ?? []).length > 4 && (
-                <span className="text-[10px] text-muted-foreground">+{(issue.labels ?? []).length - 4}</span>
               )}
-            </div>
-          )}
 
-          <Button
-            variant="ghost"
-            size="icon-xs"
-            className="ml-auto md:hidden shrink-0"
-            onClick={() => setMobilePropsOpen(true)}
-            title="Properties"
-          >
-            <SlidersHorizontal className="h-4 w-4" />
-          </Button>
-
-          <div className="hidden md:flex items-center md:ml-auto shrink-0">
-            <Button
-              variant="ghost"
-              size="icon-xs"
-              className={cn(
-                "shrink-0 transition-opacity duration-200",
-                panelVisible ? "opacity-0 pointer-events-none w-0 overflow-hidden" : "opacity-100",
+              {issue.projectId ? (
+                <Link
+                  to={`/projects/${issue.projectId}`}
+                  className="inline-flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground transition-colors rounded px-1 -mx-1 py-0.5 min-w-0"
+                >
+                  <Hexagon className="h-3 w-3 shrink-0" />
+                  <span className="truncate">{(projects ?? []).find((p) => p.id === issue.projectId)?.name ?? issue.projectId.slice(0, 8)}</span>
+                </Link>
+              ) : (
+                <span className="inline-flex items-center gap-1 text-xs text-muted-foreground opacity-50 px-1 -mx-1 py-0.5">
+                  <Hexagon className="h-3 w-3 shrink-0" />
+                  No project
+                </span>
               )}
-              onClick={() => setPanelVisible(true)}
-              title="Show properties"
-            >
-              <SlidersHorizontal className="h-4 w-4" />
-            </Button>
 
-            <Popover open={moreOpen} onOpenChange={setMoreOpen}>
-              <PopoverTrigger asChild>
-                <Button variant="ghost" size="icon-xs" className="shrink-0">
-                  <MoreHorizontal className="h-4 w-4" />
-                </Button>
-              </PopoverTrigger>
-            <PopoverContent className="w-44 p-1" align="end">
-              <button
-                className="flex items-center gap-2 w-full px-2 py-1.5 text-xs rounded hover:bg-accent/50 text-destructive"
-                onClick={() => {
-                  updateIssue.mutate(
-                    { hiddenAt: new Date().toISOString() },
-                    { onSuccess: () => navigate("/issues/all") },
-                  );
-                  setMoreOpen(false);
-                }}
+              {(issue.labels ?? []).length > 0 && (
+                <div className="hidden sm:flex items-center gap-1">
+                  {(issue.labels ?? []).slice(0, 4).map((label) => (
+                    <span
+                      key={label.id}
+                      className="inline-flex items-center rounded-full border px-2 py-0.5 text-[10px] font-medium"
+                      style={{
+                        borderColor: label.color,
+                        color: label.color,
+                        backgroundColor: `${label.color}1f`,
+                      }}
+                    >
+                      {label.name}
+                    </span>
+                  ))}
+                  {(issue.labels ?? []).length > 4 && (
+                    <span className="text-[10px] text-muted-foreground">+{(issue.labels ?? []).length - 4}</span>
+                  )}
+                </div>
+              )}
+
+              <Button
+                variant="ghost"
+                size="icon-xs"
+                className="ml-auto md:hidden shrink-0"
+                onClick={() => setMobilePropsOpen(true)}
+                title="Properties"
               >
-                <EyeOff className="h-3 w-3" />
-                Hide this Issue
-              </button>
-            </PopoverContent>
-            </Popover>
+                <SlidersHorizontal className="h-4 w-4" />
+              </Button>
+
+              <div className="hidden md:flex items-center md:ml-auto shrink-0">
+                <Button
+                  variant="ghost"
+                  size="icon-xs"
+                  className={cn(
+                    "shrink-0 transition-opacity duration-200",
+                    panelVisible ? "opacity-0 pointer-events-none w-0 overflow-hidden" : "opacity-100",
+                  )}
+                  onClick={() => setPanelVisible(true)}
+                  title="Show properties"
+                >
+                  <SlidersHorizontal className="h-4 w-4" />
+                </Button>
+
+                <Popover open={moreOpen} onOpenChange={setMoreOpen}>
+                  <PopoverTrigger asChild>
+                    <Button variant="ghost" size="icon-xs" className="shrink-0">
+                      <MoreHorizontal className="h-4 w-4" />
+                    </Button>
+                  </PopoverTrigger>
+                  <PopoverContent className="w-44 p-1" align="end">
+                    <button
+                      className="flex items-center gap-2 w-full px-2 py-1.5 text-xs rounded hover:bg-accent/50 text-destructive"
+                      onClick={() => {
+                        updateIssue.mutate(
+                          { hiddenAt: new Date().toISOString() },
+                          { onSuccess: () => navigate("/issues/all") },
+                        );
+                        setMoreOpen(false);
+                      }}
+                    >
+                      <EyeOff className="h-3 w-3" />
+                      Hide this Issue
+                    </button>
+                  </PopoverContent>
+                </Popover>
+              </div>
+            </div>
+
+            <InlineEditor
+              value={issue.title}
+              onSave={(title) => updateIssue.mutate({ title })}
+              as="h2"
+              className="text-xl font-bold"
+            />
+
+            <InlineEditor
+              value={issue.description ?? ""}
+              onSave={(description) => updateIssue.mutate({ description })}
+              as="p"
+              className="text-sm text-muted-foreground"
+              placeholder="Add a description..."
+              multiline
+              mentions={mentionOptions}
+              imageUploadHandler={async (file) => {
+                const attachment = await uploadAttachment.mutateAsync(file);
+                return attachment.contentPath;
+              }}
+            />
           </div>
-        </div>
 
-        <InlineEditor
-          value={issue.title}
-          onSave={(title) => updateIssue.mutate({ title })}
-          as="h2"
-          className="text-xl font-bold"
-        />
+          {hasLiveRuns && isMobile ? <IssueRunRail issueId={issueId!} companyId={issue.companyId} /> : null}
 
-        <InlineEditor
-          value={issue.description ?? ""}
-          onSave={(description) => updateIssue.mutate({ description })}
-          as="p"
-          className="text-sm text-muted-foreground"
-          placeholder="Add a description..."
-          multiline
-          mentions={mentionOptions}
-          imageUploadHandler={async (file) => {
-            const attachment = await uploadAttachment.mutateAsync(file);
-            return attachment.contentPath;
-          }}
-        />
-      </div>
-
-      <div className="space-y-3">
+          <div className="space-y-3">
         <div className="flex items-center justify-between gap-2">
           <h3 className="text-sm font-medium text-muted-foreground">Attachments</h3>
           <div className="flex items-center gap-2">
@@ -790,11 +797,11 @@ export function IssueDetail() {
             ))}
           </div>
         )}
-      </div>
+          </div>
 
-      <Separator />
+          <Separator />
 
-      <Tabs value={detailTab} onValueChange={setDetailTab} className="space-y-3">
+          <Tabs value={detailTab} onValueChange={setDetailTab} className="space-y-3">
         <TabsList variant="line" className="w-full justify-start gap-1">
           <TabsTrigger value="comments" className="gap-1.5">
             <MessageSquare className="h-3.5 w-3.5" />
@@ -835,7 +842,6 @@ export function IssueDetail() {
             onAttachImage={async (file) => {
               await uploadAttachment.mutateAsync(file);
             }}
-            liveRunSlot={<LiveRunWidget issueId={issueId!} companyId={issue.companyId} />}
           />
         </TabsContent>
 
@@ -885,82 +891,90 @@ export function IssueDetail() {
             </div>
           )}
         </TabsContent>
-      </Tabs>
+          </Tabs>
 
-      {linkedApprovals && linkedApprovals.length > 0 && (
-        <Collapsible
-          open={secondaryOpen.approvals}
-          onOpenChange={(open) => setSecondaryOpen((prev) => ({ ...prev, approvals: open }))}
-          className="rounded-lg border border-border"
-        >
-          <CollapsibleTrigger className="flex w-full items-center justify-between px-3 py-2 text-left">
-            <span className="text-sm font-medium text-muted-foreground">
-              Linked Approvals ({linkedApprovals.length})
-            </span>
-            <ChevronDown
-              className={cn("h-4 w-4 text-muted-foreground transition-transform", secondaryOpen.approvals && "rotate-180")}
-            />
-          </CollapsibleTrigger>
-          <CollapsibleContent>
-            <div className="border-t border-border divide-y divide-border">
-              {linkedApprovals.map((approval) => (
-                <Link
-                  key={approval.id}
-                  to={`/approvals/${approval.id}`}
-                  className="flex items-center justify-between px-3 py-2 text-xs hover:bg-accent/20 transition-colors"
-                >
-                  <div className="flex items-center gap-2">
-                    <StatusBadge status={approval.status} />
-                    <span className="font-medium">
-                      {approval.type.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase())}
-                    </span>
-                    <span className="font-mono text-muted-foreground">{approval.id.slice(0, 8)}</span>
-                  </div>
-                  <span className="text-muted-foreground">{relativeTime(approval.createdAt)}</span>
-                </Link>
-              ))}
-            </div>
-          </CollapsibleContent>
-        </Collapsible>
-      )}
+          {linkedApprovals && linkedApprovals.length > 0 && (
+            <Collapsible
+              open={secondaryOpen.approvals}
+              onOpenChange={(open) => setSecondaryOpen((prev) => ({ ...prev, approvals: open }))}
+              className="rounded-lg border border-border"
+            >
+              <CollapsibleTrigger className="flex w-full items-center justify-between px-3 py-2 text-left">
+                <span className="text-sm font-medium text-muted-foreground">
+                  Linked Approvals ({linkedApprovals.length})
+                </span>
+                <ChevronDown
+                  className={cn("h-4 w-4 text-muted-foreground transition-transform", secondaryOpen.approvals && "rotate-180")}
+                />
+              </CollapsibleTrigger>
+              <CollapsibleContent>
+                <div className="border-t border-border divide-y divide-border">
+                  {linkedApprovals.map((approval) => (
+                    <Link
+                      key={approval.id}
+                      to={`/approvals/${approval.id}`}
+                      className="flex items-center justify-between px-3 py-2 text-xs hover:bg-accent/20 transition-colors"
+                    >
+                      <div className="flex items-center gap-2">
+                        <StatusBadge status={approval.status} />
+                        <span className="font-medium">
+                          {approval.type.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase())}
+                        </span>
+                        <span className="font-mono text-muted-foreground">{approval.id.slice(0, 8)}</span>
+                      </div>
+                      <span className="text-muted-foreground">{relativeTime(approval.createdAt)}</span>
+                    </Link>
+                  ))}
+                </div>
+              </CollapsibleContent>
+            </Collapsible>
+          )}
 
-      {linkedRuns && linkedRuns.length > 0 && (
-        <Collapsible
-          open={secondaryOpen.cost}
-          onOpenChange={(open) => setSecondaryOpen((prev) => ({ ...prev, cost: open }))}
-          className="rounded-lg border border-border"
-        >
-          <CollapsibleTrigger className="flex w-full items-center justify-between px-3 py-2 text-left">
-            <span className="text-sm font-medium text-muted-foreground">Cost Summary</span>
-            <ChevronDown
-              className={cn("h-4 w-4 text-muted-foreground transition-transform", secondaryOpen.cost && "rotate-180")}
-            />
-          </CollapsibleTrigger>
-          <CollapsibleContent>
-            <div className="border-t border-border px-3 py-2">
-              {!issueCostSummary.hasCost && !issueCostSummary.hasTokens ? (
-                <div className="text-xs text-muted-foreground">No cost data yet.</div>
-              ) : (
-                <div className="flex flex-wrap gap-3 text-xs text-muted-foreground">
-                  {issueCostSummary.hasCost && (
-                    <span className="font-medium text-foreground">
-                      ${issueCostSummary.cost.toFixed(4)}
-                    </span>
-                  )}
-                  {issueCostSummary.hasTokens && (
-                    <span>
-                      Tokens {formatTokens(issueCostSummary.totalTokens)}
-                      {issueCostSummary.cached > 0
-                        ? ` (in ${formatTokens(issueCostSummary.input)}, out ${formatTokens(issueCostSummary.output)}, cached ${formatTokens(issueCostSummary.cached)})`
-                        : ` (in ${formatTokens(issueCostSummary.input)}, out ${formatTokens(issueCostSummary.output)})`}
-                    </span>
+          {linkedRuns && linkedRuns.length > 0 && (
+            <Collapsible
+              open={secondaryOpen.cost}
+              onOpenChange={(open) => setSecondaryOpen((prev) => ({ ...prev, cost: open }))}
+              className="rounded-lg border border-border"
+            >
+              <CollapsibleTrigger className="flex w-full items-center justify-between px-3 py-2 text-left">
+                <span className="text-sm font-medium text-muted-foreground">Cost Summary</span>
+                <ChevronDown
+                  className={cn("h-4 w-4 text-muted-foreground transition-transform", secondaryOpen.cost && "rotate-180")}
+                />
+              </CollapsibleTrigger>
+              <CollapsibleContent>
+                <div className="border-t border-border px-3 py-2">
+                  {!issueCostSummary.hasCost && !issueCostSummary.hasTokens ? (
+                    <div className="text-xs text-muted-foreground">No cost data yet.</div>
+                  ) : (
+                    <div className="flex flex-wrap gap-3 text-xs text-muted-foreground">
+                      {issueCostSummary.hasCost && (
+                        <span className="font-medium text-foreground">
+                          ${issueCostSummary.cost.toFixed(4)}
+                        </span>
+                      )}
+                      {issueCostSummary.hasTokens && (
+                        <span>
+                          Tokens {formatTokens(issueCostSummary.totalTokens)}
+                          {issueCostSummary.cached > 0
+                            ? ` (in ${formatTokens(issueCostSummary.input)}, out ${formatTokens(issueCostSummary.output)}, cached ${formatTokens(issueCostSummary.cached)})`
+                            : ` (in ${formatTokens(issueCostSummary.input)}, out ${formatTokens(issueCostSummary.output)})`}
+                        </span>
+                      )}
+                    </div>
                   )}
                 </div>
-              )}
-            </div>
-          </CollapsibleContent>
-        </Collapsible>
-      )}
+              </CollapsibleContent>
+            </Collapsible>
+          )}
+        </div>
+
+        {showDesktopRunRail ? (
+          <div className="min-w-0 xl:sticky xl:top-6">
+            <IssueRunRail issueId={issueId!} companyId={issue.companyId} />
+          </div>
+        ) : null}
+      </div>
 
       {/* Mobile properties drawer */}
       <Sheet open={mobilePropsOpen} onOpenChange={setMobilePropsOpen}>
