@@ -10,6 +10,8 @@ export const queryKeys = {
     runtimeState: (id: string) => ["agents", "runtime-state", id] as const,
     taskSessions: (id: string) => ["agents", "task-sessions", id] as const,
     keys: (agentId: string) => ["agents", "keys", agentId] as const,
+    files: (agentId: string) => ["agents", "files", agentId] as const,
+    fileContent: (agentId: string, filePath: string) => ["agents", "files", agentId, filePath] as const,
     configRevisions: (agentId: string) => ["agents", "config-revisions", agentId] as const,
   },
   issues: {

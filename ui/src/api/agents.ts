@@ -2,6 +2,8 @@ import type {
   Agent,
   AdapterEnvironmentTestResult,
   AgentKeyCreated,
+  AgentFileContent,
+  AgentFileEntry,
   AgentRuntimeState,
   AgentTaskSession,
   HeartbeatRun,
@@ -88,6 +90,12 @@ export const agentsApi = {
   },
   getConfiguration: (id: string, companyId?: string) =>
     api.get<Record<string, unknown>>(agentPath(id, companyId, "/configuration")),
+  listFiles: (id: string, companyId?: string) =>
+    api.get<AgentFileEntry[]>(agentPath(id, companyId, "/files")),
+  getFileContent: (id: string, filePath: string, companyId?: string) =>
+    api.get<AgentFileContent>(`${agentPath(id, companyId, "/files/content")}?path=${encodeURIComponent(filePath)}`),
+  updateFileContent: (id: string, data: { path: string; body: string }, companyId?: string) =>
+    api.patch<AgentFileContent>(agentPath(id, companyId, "/files/content"), data),
   listConfigRevisions: (id: string, companyId?: string) =>
     api.get<AgentConfigRevision[]>(agentPath(id, companyId, "/config-revisions")),
   getConfigRevision: (id: string, revisionId: string, companyId?: string) =>

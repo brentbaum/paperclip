@@ -28,6 +28,7 @@ This starts:
 
 - API server: `http://localhost:3100`
 - UI: served by the API server in dev middleware mode (same origin as API)
+- server changes auto-reload by default
 
 Tailscale/private-auth dev mode:
 

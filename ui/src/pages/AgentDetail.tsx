@@ -24,6 +24,7 @@ import { CopyText } from "../components/CopyText";
 import { EntityRow } from "../components/EntityRow";
 import { Identity } from "../components/Identity";
 import { PageSkeleton } from "../components/PageSkeleton";
+import { AgentFilesWorkspace } from "../components/AgentFilesWorkspace";
 import { DocumentWorkspace } from "../components/DocumentWorkspace";
 import { formatCents, formatDate, relativeTime, formatTokens } from "../lib/utils";
 import { cn } from "../lib/utils";
@@ -173,11 +174,12 @@ function scrollToContainerBottom(container: ScrollContainer, behavior: ScrollBeh
   container.scrollTo({ top: container.scrollHeight, behavior });
 }
 
-type AgentDetailView = "overview" | "scratchpad" | "configure" | "runs";
+type AgentDetailView = "overview" | "scratchpad" | "files" | "configure" | "runs";
 
 function parseAgentDetailView(value: string | null): AgentDetailView {
   if (value === "configure" || value === "configuration") return "configure";
   if (value === "scratchpad") return "scratchpad";
+  if (value === "files") return "files";
   if (value === "runs") return value;
   return "overview";
 }
@@ -250,6 +252,7 @@ export function AgentDetail() {
   const [actionError, setActionError] = useState<string | null>(null);
   const [moreOpen, setMoreOpen] = useState(false);
   const activeView = urlRunId ? "runs" as AgentDetailView : parseAgentDetailView(urlTab ?? null);
+  const [selectedFilePath, setSelectedFilePath] = useState<string | null>(null);
   const [configDirty, setConfigDirty] = useState(false);
   const [configSaving, setConfigSaving] = useState(false);
   const saveConfigActionRef = useRef<(() => void) | null>(null);
@@ -312,6 +315,18 @@ export function AgentDetail() {
       : ["documents", "revisions", "none"],
     queryFn: () => documentsApi.listRevisions(scratchpadDocument!.id),
     enabled: Boolean(scratchpadDocument?.id),
+  });
+  const { data: agentFiles } = useQuery({
+    queryKey: agent?.id ? queryKeys.agents.files(agent.id) : ["agents", "files", "none"],
+    queryFn: () => agentsApi.listFiles(agent!.id, resolvedCompanyId ?? undefined),
+    enabled: Boolean(agent?.id) && activeView === "files",
+  });
+  const { data: selectedAgentFile } = useQuery({
+    queryKey: agent?.id && selectedFilePath
+      ? queryKeys.agents.fileContent(agent.id, selectedFilePath)
+      : ["agents", "files", "content", "none"],
+    queryFn: () => agentsApi.getFileContent(agent!.id, selectedFilePath!, resolvedCompanyId ?? undefined),
+    enabled: Boolean(agent?.id && selectedFilePath) && activeView === "files",
   });
 
   const assignedIssues = (allIssues ?? [])
@@ -428,6 +443,31 @@ export function AgentDetail() {
       setActionError(err instanceof Error ? err.message : "Failed to save scratchpad");
     },
   });
+  const saveAgentFile = useMutation({
+    mutationFn: (data: { path: string; body: string }) =>
+      agentsApi.updateFileContent(agentLookupRef, data, resolvedCompanyId ?? undefined),
+    onSuccess: (updated) => {
+      setActionError(null);
+      if (!agent?.id) return;
+      queryClient.invalidateQueries({ queryKey: queryKeys.agents.files(agent.id) });
+      queryClient.invalidateQueries({ queryKey: queryKeys.agents.fileContent(agent.id, updated.path) });
+    },
+    onError: (err) => {
+      setActionError(err instanceof Error ? err.message : "Failed to save agent file");
+    },
+  });
+
+  useEffect(() => {
+    if (!agentFiles || agentFiles.length === 0) {
+      setSelectedFilePath(null);
+      return;
+    }
+    if (selectedFilePath && agentFiles.some((file) => file.path === selectedFilePath)) {
+      return;
+    }
+    const preferred = agentFiles.find((file) => file.isInstructionsFile) ?? agentFiles[0] ?? null;
+    setSelectedFilePath(preferred?.path ?? null);
+  }, [agentFiles, selectedFilePath]);
 
   useEffect(() => {
     const crumbs: { label: string; href?: string }[] = [
@@ -443,6 +483,8 @@ export function AgentDetail() {
         crumbs.push({ label: `Run ${urlRunId.slice(0, 8)}` });
       } else if (activeView === "scratchpad") {
         crumbs.push({ label: "Scratchpad" });
+      } else if (activeView === "files") {
+        crumbs.push({ label: "Files" });
       } else if (activeView === "configure") {
         crumbs.push({ label: "Configure" });
       } else if (activeView === "runs") {
@@ -631,6 +673,17 @@ export function AgentDetail() {
         <button
           className={cn(
             "px-3 py-2 text-sm font-medium transition-colors border-b-2",
+            activeView === "files"
+              ? "border-foreground text-foreground"
+              : "border-transparent text-muted-foreground hover:text-foreground",
+          )}
+          onClick={() => navigate(`/agents/${canonicalAgentRef}/files`)}
+        >
+          Files
+        </button>
+        <button
+          className={cn(
+            "px-3 py-2 text-sm font-medium transition-colors border-b-2",
             activeView === "runs"
               ? "border-foreground text-foreground"
               : "border-transparent text-muted-foreground hover:text-foreground",
@@ -734,6 +787,19 @@ export function AgentDetail() {
           isSaving={saveScratchpad.isPending}
           saveSource="board_edit"
           emptyLabel="No scratchpad document yet."
+        />
+      )}
+
+      {activeView === "files" && (
+        <AgentFilesWorkspace
+          files={agentFiles ?? []}
+          selectedPath={selectedFilePath}
+          onSelectPath={setSelectedFilePath}
+          selectedFile={selectedAgentFile}
+          onSave={async (data) => {
+            await saveAgentFile.mutateAsync(data);
+          }}
+          isSaving={saveAgentFile.isPending}
         />
       )}
 

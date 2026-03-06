@@ -5,12 +5,14 @@ import type { Db } from "@paperclipai/db";
 import { agents as agentsTable, companies, heartbeatRuns } from "@paperclipai/db";
 import { and, desc, eq, inArray, not, sql } from "drizzle-orm";
 import {
+  agentFilePathQuerySchema,
   createAgentKeySchema,
   createAgentHireSchema,
   createAgentSchema,
   isUuidLike,
   resetAgentSessionSchema,
   testAdapterEnvironmentSchema,
+  updateAgentFileSchema,
   updateAgentPermissionsSchema,
   updateAgentInstructionsPathSchema,
   wakeAgentSchema,
@@ -19,6 +21,7 @@ import {
 import { validate } from "../middleware/validate.js";
 import {
   agentService,
+  agentFileService,
   accessService,
   approvalService,
   heartbeatService,
@@ -46,6 +49,7 @@ export function agentRoutes(db: Db) {
 
   const router = Router();
   const svc = agentService(db);
+  const agentFiles = agentFileService();
   const access = accessService(db);
   const approvalsSvc = approvalService(db);
   const heartbeat = heartbeatService(db);
@@ -425,6 +429,66 @@ export function agentRoutes(db: Db) {
     }
     const chainOfCommand = await svc.getChainOfCommand(agent.id);
     res.json({ ...agent, chainOfCommand });
+  });
+
+  router.get("/agents/:id/files", async (req, res) => {
+    assertBoard(req);
+    const id = req.params.id as string;
+    const agent = await svc.getById(id);
+    if (!agent) {
+      res.status(404).json({ error: "Agent not found" });
+      return;
+    }
+    assertCompanyAccess(req, agent.companyId);
+    const files = await agentFiles.listFiles(agent);
+    res.json(files);
+  });
+
+  router.get("/agents/:id/files/content", async (req, res) => {
+    assertBoard(req);
+    const id = req.params.id as string;
+    const agent = await svc.getById(id);
+    if (!agent) {
+      res.status(404).json({ error: "Agent not found" });
+      return;
+    }
+    assertCompanyAccess(req, agent.companyId);
+    const query = agentFilePathQuerySchema.parse(req.query);
+    const file = await agentFiles.readFile(agent, query.path);
+    res.json(file);
+  });
+
+  router.patch("/agents/:id/files/content", validate(updateAgentFileSchema), async (req, res) => {
+    assertBoard(req);
+    const id = req.params.id as string;
+    const agent = await svc.getById(id);
+    if (!agent) {
+      res.status(404).json({ error: "Agent not found" });
+      return;
+    }
+    assertCompanyAccess(req, agent.companyId);
+    const actor = getActorInfo(req);
+    const file = await agentFiles.writeFile(agent, req.body.path, req.body.body);
+
+    await logActivity(db, {
+      companyId: agent.companyId,
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      agentId: actor.agentId,
+      runId: actor.runId,
+      action: "agent.updated",
+      entityType: "agent",
+      entityId: agent.id,
+      details: {
+        changedTopLevelKeys: ["files"],
+        fileName: file.name,
+        relativePath: file.relativePath,
+        rootLabel: file.rootLabel,
+        isInstructionsFile: file.isInstructionsFile,
+      },
+    });
+
+    res.json(file);
   });
 
   router.get("/agents/:id/configuration", async (req, res) => {

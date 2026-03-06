@@ -43,6 +43,12 @@ export {
   type TestAdapterEnvironment,
   type UpdateAgentPermissions,
 } from "./agent.js";
+export {
+  agentFilePathQuerySchema,
+  updateAgentFileSchema,
+  type AgentFilePathQuery,
+  type UpdateAgentFile,
+} from "./agent-file.js";
 
 export {
   createProjectSchema,

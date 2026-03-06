@@ -41,6 +41,7 @@ This starts:
 
 - API: `http://localhost:3100`
 - UI: `http://localhost:3100` (served by API server in dev middleware mode)
+- server changes auto-reload by default
 
 Quick checks:
 

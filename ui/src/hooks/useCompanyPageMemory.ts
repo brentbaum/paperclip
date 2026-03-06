@@ -62,10 +62,11 @@ export function useCompanyPageMemory() {
       selectedCompanyId !== prevCompanyId.current
     ) {
       if (selectionSource !== "route_sync" && selectedCompany) {
+        const fallbackPath = selectionSource === "manual" ? "/issues" : "/dashboard";
         const paths = getCompanyPaths();
-        const savedPath = paths[selectedCompanyId];
-        const relativePath = savedPath ? toCompanyRelativePath(savedPath) : "/dashboard";
-        const targetPath = isRememberableCompanyPath(relativePath) ? relativePath : "/dashboard";
+        const savedPath = selectionSource === "manual" ? null : paths[selectedCompanyId];
+        const relativePath = savedPath ? toCompanyRelativePath(savedPath) : fallbackPath;
+        const targetPath = isRememberableCompanyPath(relativePath) ? relativePath : fallbackPath;
         navigate(`/${selectedCompany.issuePrefix}${targetPath}`, { replace: true });
       }
     }
