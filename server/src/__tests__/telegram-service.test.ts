@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const { readConfigFileMock, writeConfigFileMock } = vi.hoisted(() => ({
   readConfigFileMock: vi.fn(() => ({
@@ -75,6 +75,7 @@ class FakeBot {
       message_thread_id: this.nextTopicId++,
     })),
     editForumTopic: vi.fn(async () => true),
+    sendChatAction: vi.fn(async () => true),
     sendMessage: vi.fn(async (_chatId: string, _text: string, _opts?: Record<string, unknown>) => ({
       message_id: this.nextMessageId++,
     })),
@@ -126,6 +127,7 @@ function baseDeps(overrides?: Partial<Parameters<typeof telegramService>[1]>) {
     },
     heartbeat: {
       wakeup: vi.fn(async () => null),
+      getRun: vi.fn(async () => null),
     },
     approvals: {} as any,
     issues: {
@@ -145,6 +147,10 @@ describe("telegramService", () => {
   beforeEach(() => {
     readConfigFileMock.mockClear();
     writeConfigFileMock.mockClear();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
   });
 
   it("is a no-op when telegram config is missing", async () => {
@@ -389,6 +395,50 @@ describe("telegramService", () => {
         reason: "telegram_message",
       }),
     );
+  });
+
+  it("sends typing indicator while a telegram-triggered run is active", async () => {
+    vi.useFakeTimers();
+
+    const fakeBot = new FakeBot();
+    const wakeup = vi.fn(async () => ({
+      id: "run-1",
+      status: "queued",
+    }));
+    const getRun = vi
+      .fn(async () => ({ id: "run-1", status: "running" }))
+      .mockResolvedValueOnce({ id: "run-1", status: "succeeded" });
+    const deps = baseDeps({
+      createBot: async () => fakeBot,
+      heartbeat: { wakeup, getRun },
+      config: {
+        telegramBotToken: "bot-token",
+        telegramChatId: "-100123",
+        telegramTopicMapping: { "agent-1": 5001 },
+        telegramStatusTopicId: undefined,
+        telegramApprovalsTopicId: undefined,
+      },
+    });
+
+    const svc = telegramService({} as any, deps);
+    await svc.start();
+    await fakeBot.emitMessage({
+      text: "please investigate this",
+      chatId: "-100123",
+      topicId: 5001,
+      messageId: 77,
+      fromId: 42,
+      username: "operator",
+    });
+    await vi.runOnlyPendingTimersAsync();
+
+    expect(fakeBot.api.sendChatAction).toHaveBeenCalledWith(
+      "-100123",
+      "typing",
+      { message_thread_id: 5001 },
+    );
+
+    await svc.stop();
   });
 
   it("handles /new in mapped topic using default topic owner", async () => {

@@ -62,6 +62,11 @@ interface TelegramBotLike {
       messageThreadId: number,
       other?: Record<string, unknown>,
     ): Promise<unknown>;
+    sendChatAction?(
+      chatId: string,
+      action: string,
+      options?: Record<string, unknown>,
+    ): Promise<unknown>;
     sendMessage(
       chatId: string,
       text: string,
@@ -85,7 +90,7 @@ interface TelegramBotLike {
 
 interface TelegramServiceDeps {
   config: TelegramConfigView;
-  heartbeat: Pick<HeartbeatService, "wakeup">;
+  heartbeat: Pick<HeartbeatService, "wakeup" | "getRun">;
   approvals: Pick<ApprovalService, "approve" | "reject" | "getById">;
   issues: Pick<IssueService, "create">;
   agents: Pick<AgentService, "list" | "getById" | "resolveByReference">;
@@ -146,6 +151,7 @@ const STATUS_MIRROR_DEDUP_TTL_MS = 30_000;
 const MAX_CALLBACK_DATA_BYTES = 64;
 const TELEGRAM_MAX_RETRY_ATTEMPTS = 3;
 const TELEGRAM_RETRY_BASE_DELAY_MS = 250;
+const TELEGRAM_TYPING_REFRESH_MS = 4_000;
 
 const importDynamic = new Function(
   "moduleName",
@@ -327,6 +333,22 @@ async function defaultSleep(ms: number) {
   });
 }
 
+async function sleepWithAbort(ms: number, signal: AbortSignal) {
+  if (signal.aborted) return;
+  await new Promise<void>((resolve) => {
+    const timeout = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timeout);
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
 export async function retryTelegramCall<T>(
   fn: () => Promise<T>,
   options: RetryTelegramCallOptions = {},
@@ -422,6 +444,7 @@ export function telegramService(db: Db, deps: TelegramServiceDeps) {
   let startPromise: Promise<void> | null = null;
   const liveEventUnsubscribers = new Map<string, () => void>();
   const statusMirrorDedupUntil = new Map<string, number>();
+  const typingIndicators = new Map<string, AbortController>();
 
   const createBot = deps.createBot ?? defaultCreateBot;
   const logActivityFn = deps.logActivityFn ?? logActivity;
@@ -452,6 +475,10 @@ export function telegramService(db: Db, deps: TelegramServiceDeps) {
     for (const [key, expiresAt] of statusMirrorDedupUntil.entries()) {
       if (expiresAt <= now) statusMirrorDedupUntil.delete(key);
     }
+  }
+
+  function isActiveRunStatus(status: string | null | undefined) {
+    return status === "queued" || status === "running";
   }
 
   function shouldMirrorStatus(dedupeKey: string) {
@@ -729,7 +756,7 @@ export function telegramService(db: Db, deps: TelegramServiceDeps) {
 
     const messageId =
       typeof ctx.message?.message_id === "number" ? ctx.message.message_id : null;
-    await deps.heartbeat.wakeup(mappedAgentId, {
+    const run = await deps.heartbeat.wakeup(mappedAgentId, {
       source: "automation",
       triggerDetail: "system",
       reason: "telegram_message",
@@ -751,6 +778,52 @@ export function telegramService(db: Db, deps: TelegramServiceDeps) {
         messageId,
       },
     });
+    if (run && topicId) {
+      startTypingIndicator(run.id, configuredChatId, topicId, run.status);
+    }
+  }
+
+  function startTypingIndicator(
+    runId: string,
+    chatId: string,
+    topicId: number,
+    initialStatus: string | null | undefined,
+  ) {
+    if (!isActiveRunStatus(initialStatus)) return;
+    if (typingIndicators.has(runId)) return;
+
+    const controller = new AbortController();
+    typingIndicators.set(runId, controller);
+
+    void (async () => {
+      try {
+        const activeBot = await ensureBot();
+        if (!activeBot || typeof activeBot.api.sendChatAction !== "function") return;
+
+        let currentStatus = initialStatus;
+        while (!controller.signal.aborted && isActiveRunStatus(currentStatus)) {
+          try {
+            await retryTelegramCall(() =>
+              activeBot.api.sendChatAction?.(chatId, "typing", { message_thread_id: topicId }) ??
+              Promise.resolve(undefined),
+            );
+          } catch (err) {
+            logger.warn({ err, runId, topicId }, "telegram typing indicator failed");
+            return;
+          }
+
+          await sleepWithAbort(TELEGRAM_TYPING_REFRESH_MS, controller.signal);
+          if (controller.signal.aborted) return;
+
+          const run = await deps.heartbeat.getRun(runId);
+          currentStatus = run?.status ?? null;
+        }
+      } finally {
+        if (typingIndicators.get(runId) === controller) {
+          typingIndicators.delete(runId);
+        }
+      }
+    })();
   }
 
   async function answerApprovalCallback(
@@ -912,6 +985,10 @@ export function telegramService(db: Db, deps: TelegramServiceDeps) {
     }
     liveEventUnsubscribers.clear();
     statusMirrorDedupUntil.clear();
+    for (const controller of typingIndicators.values()) {
+      controller.abort();
+    }
+    typingIndicators.clear();
 
     if (!bot) return;
     if (started) {
