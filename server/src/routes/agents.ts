@@ -24,10 +24,12 @@ import {
   agentFileService,
   accessService,
   approvalService,
+  goalService,
   heartbeatService,
   issueApprovalService,
   issueService,
   logActivity,
+  projectService,
   secretService,
 } from "../services/index.js";
 import { conflict, forbidden, unprocessable } from "../errors.js";
@@ -59,7 +61,18 @@ export function agentRoutes(db: Db) {
   const heartbeat = heartbeatService(db);
   const issueApprovalsSvc = issueApprovalService(db);
   const secretsSvc = secretService(db);
+  const issueSvcForResolve = issueService(db);
+  const projectsSvc = projectService(db);
+  const goalsSvc = goalService(db);
   const strictSecretsMode = process.env.PAPERCLIP_SECRETS_STRICT_MODE === "true";
+
+  /** Resolve an issue identifier like "EVO-18" to its UUID. Passes UUIDs through unchanged. */
+  async function resolveIssueId(raw: string | null | undefined): Promise<string | null> {
+    if (!raw || typeof raw !== "string") return null;
+    if (isUuidLike(raw)) return raw;
+    const issue = await issueSvcForResolve.getByIdentifier(raw);
+    return issue?.id ?? null;
+  }
 
   function canCreateAgents(agent: { role: string; permissions: Record<string, unknown> | null | undefined }) {
     if (!agent.permissions || typeof agent.permissions !== "object") return false;
@@ -422,6 +435,67 @@ export function agentRoutes(db: Db) {
     res.json({ ...agent, chainOfCommand });
   });
 
+  router.get("/agents/me/boot", async (req, res) => {
+    if (req.actor.type !== "agent" || !req.actor.agentId) {
+      res.status(401).json({ error: "Agent authentication required" });
+      return;
+    }
+    const agent = await svc.getById(req.actor.agentId);
+    if (!agent) {
+      res.status(404).json({ error: "Agent not found" });
+      return;
+    }
+    const chainOfCommand = await svc.getChainOfCommand(agent.id);
+
+    const assignments = await issueSvcForResolve.list(agent.companyId, {
+      assigneeAgentId: agent.id,
+      status: "backlog,todo,in_progress,blocked",
+    });
+
+    const taskIdRaw = (req.query.taskId as string | undefined)?.trim() || null;
+    const commentIdRaw = (req.query.commentId as string | undefined)?.trim() || null;
+    const taskId = taskIdRaw ? await resolveIssueId(taskIdRaw) : null;
+
+    let wakeIssue: Record<string, unknown> | null = null;
+    let wakeComment: Record<string, unknown> | null = null;
+
+    if (taskId) {
+      const issue = await issueSvcForResolve.getById(taskId);
+      if (issue) {
+        const [ancestors, project, goal, mentionedProjectIds, comments] = await Promise.all([
+          issueSvcForResolve.getAncestors(issue.id),
+          issue.projectId ? projectsSvc.getById(issue.projectId) : null,
+          issue.goalId ? goalsSvc.getById(issue.goalId) : null,
+          issueSvcForResolve.findMentionedProjectIds(issue.id),
+          issueSvcForResolve.listComments(issue.id),
+        ]);
+        const mentionedProjects = mentionedProjectIds.length > 0
+          ? await projectsSvc.listByIds(issue.companyId, mentionedProjectIds)
+          : [];
+        wakeIssue = {
+          ...issue,
+          ancestors,
+          project: project ?? null,
+          goal: goal ?? null,
+          mentionedProjects,
+          comments,
+        };
+
+        if (commentIdRaw) {
+          const comment = comments.find((c: { id: string }) => c.id === commentIdRaw);
+          if (comment) wakeComment = comment as Record<string, unknown>;
+        }
+      }
+    }
+
+    res.json({
+      agent: { ...agent, chainOfCommand },
+      assignments,
+      wakeIssue,
+      wakeComment,
+    });
+  });
+
   router.get("/agents/:id", async (req, res) => {
     const id = req.params.id as string;
     const agent = await svc.getById(id);
@@ -589,6 +663,11 @@ export function agentRoutes(db: Db) {
 
     const state = await heartbeat.getRuntimeState(id);
     res.json(state);
+  });
+
+  // Alias: agents sometimes call /tasks instead of /task-sessions
+  router.get("/agents/:id/tasks", (req, res) => {
+    res.redirect(307, `/api/agents/${req.params.id}/task-sessions`);
   });
 
   router.get("/agents/:id/task-sessions", async (req, res) => {
@@ -1136,11 +1215,22 @@ export function agentRoutes(db: Db) {
       return;
     }
 
+    // Resolve issue identifiers (e.g. "EVO-18") in payload to UUIDs
+    const payload = req.body.payload ? { ...req.body.payload } : null;
+    if (payload) {
+      for (const key of ["issueId", "taskId", "taskKey"] as const) {
+        if (typeof payload[key] === "string" && !isUuidLike(payload[key])) {
+          const resolved = await resolveIssueId(payload[key]);
+          if (resolved) payload[key] = resolved;
+        }
+      }
+    }
+
     const run = await heartbeat.wakeup(id, {
       source: req.body.source,
       triggerDetail: req.body.triggerDetail ?? "manual",
       reason: req.body.reason ?? null,
-      payload: req.body.payload ?? null,
+      payload,
       idempotencyKey: req.body.idempotencyKey ?? null,
       requestedByActorType: req.actor.type === "agent" ? "agent" : "user",
       requestedByActorId: req.actor.type === "agent" ? req.actor.agentId ?? null : req.actor.userId ?? null,

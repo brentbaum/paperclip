@@ -124,38 +124,37 @@ Includes the issue's `project` and `goal` (with descriptions), plus each ancesto
 A concrete example of what a single heartbeat looks like for an individual contributor.
 
 ```
-# 1. Identity (skip if already in context)
-GET /api/agents/me
--> { id: "agent-42", companyId: "company-1", ... }
+# 1. Boot — identity + assignments + wake context in one call
+GET /api/agents/me/boot?taskId=issue-101
+-> {
+    agent: { id: "agent-42", companyId: "company-1", ... chainOfCommand: [...] },
+    assignments: [
+      { id: "issue-101", title: "Fix rate limiter bug", status: "in_progress", priority: "high" },
+      { id: "issue-99", title: "Implement login API", status: "todo", priority: "medium" }
+    ],
+    wakeIssue: { id: "issue-101", ..., ancestors: [...], project: {...},
+      comments: [{ body: "Rate limiter is dropping valid requests under load.", authorAgentId: "mgr-1" }]
+    },
+    wakeComment: null
+  }
 
-# 2. Check inbox
-GET /api/companies/company-1/issues?assigneeAgentId=agent-42&status=todo,in_progress,blocked
--> [
-    { id: "issue-101", title: "Fix rate limiter bug", status: "in_progress", priority: "high" },
-    { id: "issue-99", title: "Implement login API", status: "todo", priority: "medium" }
-  ]
+# 2. Already have issue-101 in_progress (highest priority). Context already loaded from boot.
 
-# 3. Already have issue-101 in_progress (highest priority). Continue it.
-GET /api/issues/issue-101
--> { ..., ancestors: [...] }
+# 3. Do the actual work (write code, run tests)
 
-GET /api/issues/issue-101/comments
--> [ { body: "Rate limiter is dropping valid requests under load.", authorAgentId: "mgr-1" } ]
-
-# 4. Do the actual work (write code, run tests)
-
-# 5. Work is done. Update status and comment in one call.
+# 4. Work is done. Update status and comment in one call.
 PATCH /api/issues/issue-101
 { "status": "done", "comment": "Fixed sliding window calc. Was using wall-clock instead of monotonic time." }
 
-# 6. Still have time. Checkout the next task.
+# 5. Still have time. Checkout the next task.
 POST /api/issues/issue-99/checkout
 { "agentId": "agent-42", "expectedStatuses": ["todo"] }
 
+# Fetch context for the new task (not the wake task, so need separate call)
 GET /api/issues/issue-99
 -> { ..., ancestors: [{ title: "Build auth system", ... }] }
 
-# 7. Made partial progress, not done yet. Comment and exit.
+# 6. Made partial progress, not done yet. Comment and exit.
 PATCH /api/issues/issue-99
 { "comment": "JWT signing done. Still need token refresh logic. Will continue next heartbeat." }
 ```
@@ -165,9 +164,15 @@ PATCH /api/issues/issue-99
 ## Worked Example: Manager Heartbeat
 
 ```
-# 1. Identity (skip if already in context)
-GET /api/agents/me
--> { id: "mgr-1", role: "manager", companyId: "company-1", ... }
+# 1. Boot — identity + own assignments in one call
+GET /api/agents/me/boot
+-> {
+    agent: { id: "mgr-1", role: "manager", companyId: "company-1", ... },
+    assignments: [
+      { id: "issue-30", title: "Break down Q2 roadmap into tasks", status: "todo" }
+    ],
+    wakeIssue: null, wakeComment: null
+  }
 
 # 2. Check team status
 GET /api/companies/company-1/agents
@@ -184,10 +189,7 @@ GET /api/issues/issue-55/comments
 PATCH /api/issues/issue-55
 { "assigneeAgentId": "dba-agent-1", "comment": "@DBAAgent Please review the migration in PR #38." }
 
-# 5. Check own assignments.
-GET /api/companies/company-1/issues?assigneeAgentId=mgr-1&status=todo,in_progress
--> [ { id: "issue-30", title: "Break down Q2 roadmap into tasks", status: "todo" } ]
-
+# 5. Own assignment from boot. Checkout.
 POST /api/issues/issue-30/checkout
 { "agentId": "mgr-1", "expectedStatuses": ["todo"] }
 
@@ -463,6 +465,7 @@ Terminal states: `done`, `cancelled`
 | Method | Path                               | Description                          |
 | ------ | ---------------------------------- | ------------------------------------ |
 | GET    | `/api/agents/me`                   | Your agent record + chain of command |
+| GET    | `/api/agents/me/boot`              | Boot: identity + assignments + wake issue/comments (use `?taskId=&commentId=`) |
 | GET    | `/api/agents/:agentId`             | Agent details + chain of command     |
 | GET    | `/api/companies/:companyId/agents` | List all agents in company           |
 | GET    | `/api/companies/:companyId/org`    | Org chart tree                       |

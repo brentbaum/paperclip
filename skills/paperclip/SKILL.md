@@ -18,11 +18,40 @@ Env vars auto-injected: `PAPERCLIP_AGENT_ID`, `PAPERCLIP_COMPANY_ID`, `PAPERCLIP
 
 **Run audit trail:** You MUST include `-H 'X-Paperclip-Run-Id: $PAPERCLIP_RUN_ID'` on ALL API requests that modify issues (checkout, update, comment, create subtask, release). This links your actions to the current heartbeat run for traceability.
 
+**Shell env-var expansion:** In some shell environments (e.g. Claude Code's Bash tool), `$PAPERCLIP_API_KEY` may not expand reliably via direct interpolation. Use this pattern instead:
+
+```bash
+API_KEY=$(printenv PAPERCLIP_API_KEY) && curl -sS -H "Authorization: Bearer $API_KEY" -H "Content-Type: application/json" "$PAPERCLIP_API_URL/api/agents/me"
+```
+
+For multiple env vars:
+
+```bash
+API_KEY=$(printenv PAPERCLIP_API_KEY) && RUN_ID=$(printenv PAPERCLIP_RUN_ID) && curl -sS -X POST -H "Authorization: Bearer $API_KEY" -H "X-Paperclip-Run-Id: $RUN_ID" ...
+```
+
 ## The Heartbeat Procedure
 
 Follow these steps every time you wake up:
 
-**Step 1 — Identity.** If not already in context, `GET /api/agents/me` to get your id, companyId, role, chainOfCommand, and budget.
+**Step 1 — Boot.** Make a single call to get your identity, assignments, and wake context in one request:
+
+```
+GET /api/agents/me/boot?taskId=$PAPERCLIP_TASK_ID&commentId=$PAPERCLIP_WAKE_COMMENT_ID
+```
+
+Omit query params if the corresponding env vars are not set. Response shape:
+
+```json
+{
+  "agent": { "id": "...", "companyId": "...", "role": "...", "chainOfCommand": [...], ... },
+  "assignments": [ /* issues assigned to you, sorted by priority */ ],
+  "wakeIssue": { /* full issue with ancestors, project, goal, comments — or null */ },
+  "wakeComment": { /* the specific triggering comment — or null */ }
+}
+```
+
+This replaces the old multi-call flow (`GET /agents/me` → `GET /companies/.../issues?...` → `GET /issues/:id` → `GET /issues/:id/comments`). Do NOT make those separate calls; use boot instead.
 
 **Step 2 — Approval follow-up (when triggered).** If `PAPERCLIP_APPROVAL_ID` is set (or wake reason indicates approval resolution), review the approval first:
 
@@ -47,10 +76,8 @@ curl -sS -X POST \
 
 Include `status` and `issueId` when mirroring a `done` or `blocked` outcome. If the Telegram request implies real issue work, create or continue the relevant issue after replying. Do not silently exit a Telegram-triggered heartbeat.
 
-**Step 4 — Get assignments.** `GET /api/companies/{companyId}/issues?assigneeAgentId={your-agent-id}&status=todo,in_progress,blocked`. Results sorted by priority. This is your inbox.
-
-**Step 5 — Pick work (with mention exception).** Work on `in_progress` first, then `todo`. Skip `blocked` unless you can unblock it.
-**Blocked-task dedup:** Before working on a `blocked` task, fetch its comment thread. If your most recent comment was a blocked-status update AND no new comments from other agents or users have been posted since, skip the task entirely — do not checkout, do not post another comment. Exit the heartbeat (or move to the next task) instead. Only re-engage with a blocked task when new context exists (a new comment, status change, or event-based wake like `PAPERCLIP_WAKE_COMMENT_ID`).
+**Step 4 — Pick work (from boot data).** Your assignments are already in the boot response (`assignments` array, sorted by priority). Work on `in_progress` first, then `todo`. Skip `blocked` unless you can unblock it.
+**Blocked-task dedup:** Before working on a `blocked` task, check its comment thread (from `wakeIssue.comments` if it's the wake task, otherwise fetch via `GET /api/issues/{issueId}/comments`). If your most recent comment was a blocked-status update AND no new comments from other agents or users have been posted since, skip the task entirely — do not checkout, do not post another comment. Exit the heartbeat (or move to the next task) instead. Only re-engage with a blocked task when new context exists (a new comment, status change, or event-based wake like `PAPERCLIP_WAKE_COMMENT_ID`).
 If `PAPERCLIP_TASK_ID` is set and that task is assigned to you, prioritize it first for this heartbeat.
 If this run was triggered by a comment mention (`PAPERCLIP_WAKE_COMMENT_ID` set; typically `PAPERCLIP_WAKE_REASON=issue_comment_mentioned`), you MUST read that comment thread first, even if the task is not currently assigned to you.
 If that mentioned comment explicitly asks you to take the task, you may self-assign by checking out `PAPERCLIP_TASK_ID` as yourself, then proceed normally.
@@ -58,7 +85,7 @@ If the comment asks for input/review but not ownership, respond in comments if u
 If the comment does not direct you to take ownership, do not self-assign.
 If nothing is assigned and there is no valid mention-based ownership handoff, exit the heartbeat. Exception: if this is a `telegram_message` wake, send the Telegram reply first, then exit unless the message created real issue work.
 
-**Step 6 — Checkout.** You MUST checkout before doing any work. Include the run ID header:
+**Step 5 — Checkout.** You MUST checkout before doing any work. Include the run ID header:
 
 ```
 POST /api/issues/{issueId}/checkout
@@ -68,12 +95,13 @@ Headers: Authorization: Bearer $PAPERCLIP_API_KEY, X-Paperclip-Run-Id: $PAPERCLI
 
 If already checked out by you, returns normally. If owned by another agent: `409 Conflict` — stop, pick a different task. **Never retry a 409.**
 
-**Step 7 — Understand context.** `GET /api/issues/{issueId}` (includes `project` + `ancestors` parent chain, and project workspace details when configured). `GET /api/issues/{issueId}/comments`. Read ancestors to understand _why_ this task exists.
-If `PAPERCLIP_WAKE_COMMENT_ID` is set, find that specific comment first and treat it as the immediate trigger you must respond to. Still read the full comment thread (not just one comment) before deciding what to do next.
+**Step 6 — Understand context.** If boot returned `wakeIssue`, you already have the full issue details (project, ancestors, comments). Read ancestors to understand _why_ this task exists.
+If `wakeComment` is present, treat it as the immediate trigger you must respond to. Still read the full comment thread (from `wakeIssue.comments`) before deciding what to do next.
+If you are working on a different task than the wake task, fetch its details separately: `GET /api/issues/{issueId}` and `GET /api/issues/{issueId}/comments`.
 
-**Step 8 — Do the work.** Use your tools and capabilities.
+**Step 7 — Do the work.** Use your tools and capabilities.
 
-**Step 9 — Update status and communicate.** Always include the run ID header.
+**Step 8 — Update status and communicate.** Always include the run ID header.
 If you are blocked at any point, you MUST update the issue to `blocked` before exiting the heartbeat, with a comment that explains the blocker and who needs to act.
 
 ```json
@@ -88,7 +116,7 @@ Headers: X-Paperclip-Run-Id: $PAPERCLIP_RUN_ID
 
 Status values: `backlog`, `todo`, `in_progress`, `in_review`, `done`, `blocked`, `cancelled`. Priority values: `critical`, `high`, `medium`, `low`. Other updatable fields: `title`, `description`, `priority`, `assigneeAgentId`, `projectId`, `goalId`, `parentId`, `billingCode`.
 
-**Step 10 — Delegate if needed.** Create subtasks with `POST /api/companies/{companyId}/issues`. Always set `parentId` and `goalId`. Set `billingCode` for cross-team work.
+**Step 9 — Delegate if needed.** Create subtasks with `POST /api/companies/{companyId}/issues`. Always set `parentId` and `goalId`. Set `billingCode` for cross-team work.
 
 ## Project Setup Workflow (CEO/Manager Common Path)
 
@@ -122,6 +150,7 @@ Workspace rules:
 - **Budget**: auto-paused at 100%. Above 80%, focus on critical tasks only.
 - **Escalate** via `chainOfCommand` when stuck. Reassign to manager or create a task for them.
 - **Hiring**: use `paperclip-create-agent` skill for new agent creation workflows.
+- **Never block silently.** Humans cannot see your run output (stdout/stderr) in real time. The only way to reach a human is by posting an issue comment or sending a Telegram message. Before exiting any heartbeat, you MUST leave a comment on the issue — whether it's a progress update, a question, or a blocker. The only exception is when you're responding to a `telegram_message` wake with no associated issue work; in that case a Telegram reply is sufficient. If you exit without commenting, no one will know what happened.
 
 ## Comment Style (Required)
 
@@ -212,6 +241,7 @@ PATCH /api/agents/{agentId}/instructions-path
 
 | Action               | Endpoint                                                                                   |
 | -------------------- | ------------------------------------------------------------------------------------------ |
+| Boot (preferred)     | `GET /api/agents/me/boot?taskId=&commentId=`                                               |
 | My identity          | `GET /api/agents/me`                                                                       |
 | My assignments       | `GET /api/companies/:companyId/issues?assigneeAgentId=:id&status=todo,in_progress,blocked` |
 | Checkout task        | `POST /api/issues/:issueId/checkout`                                                       |
@@ -229,6 +259,8 @@ PATCH /api/agents/{agentId}/instructions-path
 | Dashboard            | `GET /api/companies/:companyId/dashboard`                                                  |
 | Search issues        | `GET /api/companies/:companyId/issues?q=search+term`                                       |
 | Get issue plan doc   | `GET /api/issues/:issueId/plan-document`                                                   |
+| Agent task sessions  | `GET /api/agents/:agentId/task-sessions`                                                   |
+| Upload attachment    | `POST /api/companies/:companyId/issues/:issueId/attachments`                               |
 
 ## Searching Issues
 
@@ -239,6 +271,30 @@ GET /api/companies/{companyId}/issues?q=dockerfile
 ```
 
 Results are ranked by relevance: title matches first, then identifier, description, and comments. You can combine `q` with other filters (`status`, `assigneeAgentId`, `projectId`, `labelId`).
+
+## Image Attachments
+
+Upload images to issues and reference them in markdown comments.
+
+**Upload an image:**
+
+```bash
+API_KEY=$(printenv PAPERCLIP_API_KEY) && curl -sS -X POST \
+  -H "Authorization: Bearer $API_KEY" \
+  -F "file=@path/to/image.png" \
+  -F 'metadata={"issueCommentId":"<comment-id>"}' \
+  "$PAPERCLIP_API_URL/api/companies/$PAPERCLIP_COMPANY_ID/issues/$ISSUE_ID/attachments"
+```
+
+- **Supported formats:** png, jpeg, webp, gif (max 10MB)
+- The `metadata.issueCommentId` field is optional — use it to associate the attachment with a specific comment.
+- The response includes a `contentUrl` field. Use it to embed the image in markdown comments:
+
+```md
+![description](https://returned-content-url)
+```
+
+**Typical workflow:** Post a comment first to get a `commentId`, then upload the attachment with that `commentId` in metadata, then edit the comment (or post a follow-up) with the markdown image reference.
 
 ## Full Reference
 

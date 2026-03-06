@@ -547,6 +547,7 @@ export function issueRoutes(db: Db, storage: StorageService) {
 
         for (const mentionedId of mentionedIds) {
           if (wakeups.has(mentionedId)) continue;
+          if (mentionedId === actor.agentId) continue;
           wakeups.set(mentionedId, {
             source: "automation",
             triggerDetail: "system",
@@ -696,6 +697,22 @@ export function issueRoutes(db: Db, storage: StorageService) {
     });
 
     res.json(released);
+  });
+
+  router.post("/issues/:id/view", async (req, res) => {
+    const id = req.params.id as string;
+    const issue = await svc.getById(id);
+    if (!issue) {
+      res.status(404).json({ error: "Issue not found" });
+      return;
+    }
+    assertCompanyAccess(req, issue.companyId);
+    const updated = await svc.markViewed(id);
+    if (!updated) {
+      res.status(404).json({ error: "Issue not found" });
+      return;
+    }
+    res.json(updated);
   });
 
   router.get("/issues/:id/comments", async (req, res) => {
@@ -848,8 +865,10 @@ export function issueRoutes(db: Db, storage: StorageService) {
     // Merge all wakeups from this comment into one enqueue per agent to avoid duplicate runs.
     void (async () => {
       const wakeups = new Map<string, Parameters<typeof heartbeat.wakeup>[1]>();
+      // Skip waking the assignee if the comment author is the same agent
+      const actorAgentId = actor.agentId;
       const assigneeId = currentIssue.assigneeAgentId;
-      if (assigneeId) {
+      if (assigneeId && assigneeId !== actorAgentId) {
         if (reopened) {
           wakeups.set(assigneeId, {
             source: "automation",
@@ -908,6 +927,7 @@ export function issueRoutes(db: Db, storage: StorageService) {
 
       for (const mentionedId of mentionedIds) {
         if (wakeups.has(mentionedId)) continue;
+        if (mentionedId === actorAgentId) continue;
         wakeups.set(mentionedId, {
           source: "automation",
           triggerDetail: "system",

@@ -463,6 +463,10 @@ export function issueService(db: Db) {
       }
 
       applyStatusSideEffects(issueData.status, patch);
+      // Reset viewedAt when status changes (so it re-enters inbox)
+      if (issueData.status && issueData.status !== existing.status) {
+        patch.viewedAt = null;
+      }
       if (issueData.status && issueData.status !== "done") {
         patch.completedAt = null;
       }
@@ -807,9 +811,13 @@ export function issueService(db: Db) {
         .returning();
 
       // Update issue's updatedAt so comment activity is reflected in recency sorting
+      const updatePatch: Partial<typeof issues.$inferInsert> = { updatedAt: new Date() };
+      if (actor.agentId) {
+        updatePatch.viewedAt = null;
+      }
       await db
         .update(issues)
-        .set({ updatedAt: new Date() })
+        .set(updatePatch)
         .where(eq(issues.id, issueId));
 
       return comment;
@@ -1146,6 +1154,17 @@ export function issueService(db: Db) {
         project: a.projectId ? projectMap.get(a.projectId) ?? null : null,
         goal: a.goalId ? goalMap.get(a.goalId) ?? null : null,
       }));
+    },
+
+    markViewed: async (id: string) => {
+      const [updated] = await db
+        .update(issues)
+        .set({ viewedAt: new Date() })
+        .where(eq(issues.id, id))
+        .returning();
+      if (!updated) return null;
+      const [enriched] = await withIssueLabels(db, [updated]);
+      return enriched;
     },
 
     staleCount: async (companyId: string, minutes = 60) => {
