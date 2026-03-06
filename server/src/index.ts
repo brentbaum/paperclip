@@ -2,6 +2,7 @@
 import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync, rmSync } from "node:fs";
 import { createServer } from "node:http";
+import net from "node:net";
 import { resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { stdin, stdout } from "node:process";
@@ -89,6 +90,25 @@ async function promptApplyMigrations(migrations: string[]): Promise<boolean> {
   } finally {
     prompt.close();
   }
+}
+
+async function isTcpPortAcceptingConnections(port: number, host = "127.0.0.1"): Promise<boolean> {
+  await new Promise<void>((resolvePromise) => setTimeout(resolvePromise, 0));
+  return await new Promise<boolean>((resolvePromise) => {
+    const socket = net.connect({ host, port });
+    const onFailure = () => {
+      socket.destroy();
+      resolvePromise(false);
+    };
+
+    socket.setTimeout(750);
+    socket.once("connect", () => {
+      socket.end();
+      resolvePromise(true);
+    });
+    socket.once("error", onFailure);
+    socket.once("timeout", onFailure);
+  });
 }
 
 type EnsureMigrationsOptions = {
@@ -299,7 +319,16 @@ if (config.databaseUrl) {
     }
   };
 
-  const runningPid = getRunningPid();
+  let runningPid = getRunningPid();
+  if (runningPid && !(await isTcpPortAcceptingConnections(port))) {
+    logger.warn(
+      `Embedded PostgreSQL pid file points at pid=${runningPid}, but port ${port} is not accepting connections; starting a fresh instance`,
+    );
+    runningPid = null;
+    if (existsSync(postmasterPidFile)) {
+      rmSync(postmasterPidFile, { force: true });
+    }
+  }
   if (runningPid) {
     logger.warn(`Embedded PostgreSQL already running; reusing existing process (pid=${runningPid}, port=${port})`);
   } else {

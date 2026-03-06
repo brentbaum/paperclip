@@ -57,6 +57,11 @@ interface TelegramCallbackContextLike {
 interface TelegramBotLike {
   api: {
     createForumTopic(chatId: string, name: string): Promise<{ message_thread_id: number }>;
+    editForumTopic?(
+      chatId: string,
+      messageThreadId: number,
+      other?: Record<string, unknown>,
+    ): Promise<unknown>;
     sendMessage(
       chatId: string,
       text: string,
@@ -85,7 +90,18 @@ interface TelegramServiceDeps {
   issues: Pick<IssueService, "create">;
   agents: Pick<AgentService, "list" | "getById" | "resolveByReference">;
   companies?: {
-    list: () => Promise<Array<{ id: string; status: string }>>;
+    list: () => Promise<Array<{
+      id: string;
+      status: string;
+      name?: string | null;
+      createdAt?: unknown;
+    }>>;
+    getById?: (companyId: string) => Promise<{
+      id: string;
+      status: string;
+      name?: string | null;
+      createdAt?: unknown;
+    } | null>;
   };
   createBot?: (token: string) => TelegramBotLike | Promise<TelegramBotLike>;
   logActivityFn?: (db: Db, input: LogActivityInput) => Promise<void>;
@@ -146,6 +162,51 @@ function parseChatId(value: string | undefined): string | null {
   return asNonEmptyString(value);
 }
 
+function normalizeSortTimestamp(value: unknown): number {
+  if (value instanceof Date) return value.getTime();
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "string") {
+    const parsed = Date.parse(value);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return Number.POSITIVE_INFINITY;
+}
+
+function compareNullableStrings(left: string | null | undefined, right: string | null | undefined) {
+  return (left ?? "").localeCompare(right ?? "", undefined, { sensitivity: "base" });
+}
+
+function sortCompaniesForTopicProvision<
+  T extends { id: string; name?: string | null; createdAt?: unknown },
+>(companies: T[]): T[] {
+  return [...companies].sort((left, right) => {
+    const byCreatedAt = normalizeSortTimestamp(left.createdAt) - normalizeSortTimestamp(right.createdAt);
+    if (byCreatedAt !== 0) return byCreatedAt;
+    const byName = compareNullableStrings(left.name, right.name);
+    if (byName !== 0) return byName;
+    return left.id.localeCompare(right.id);
+  });
+}
+
+function sortAgentsForTopicProvision<
+  T extends { id: string; name?: string | null; createdAt?: unknown; role?: string | null },
+>(agents: T[]): T[] {
+  return [...agents].sort((left, right) => {
+    const leftRoleRank = left.role === "ceo" ? 0 : 1;
+    const rightRoleRank = right.role === "ceo" ? 0 : 1;
+    if (leftRoleRank !== rightRoleRank) return leftRoleRank - rightRoleRank;
+    const byCreatedAt = normalizeSortTimestamp(left.createdAt) - normalizeSortTimestamp(right.createdAt);
+    if (byCreatedAt !== 0) return byCreatedAt;
+    const byName = compareNullableStrings(left.name, right.name);
+    if (byName !== 0) return byName;
+    return left.id.localeCompare(right.id);
+  });
+}
+
+function formatAgentTopicName(companyName: string | null, agentName: string) {
+  return companyName ? `${companyName} / ${agentName}` : agentName;
+}
+
 function asRecord(value: unknown): Record<string, unknown> {
   return typeof value === "object" && value !== null ? (value as Record<string, unknown>) : {};
 }
@@ -193,6 +254,29 @@ function readRetryAfterSeconds(err: unknown): number | null {
   }
 
   return null;
+}
+
+function readTelegramDescription(err: unknown): string | null {
+  const asObj = asRecord(err);
+  if (typeof asObj.description === "string" && asObj.description.length > 0) {
+    return asObj.description;
+  }
+
+  const response = asRecord(asObj.response);
+  if (typeof response.description === "string" && response.description.length > 0) {
+    return response.description;
+  }
+
+  if (err instanceof Error && err.message.length > 0) {
+    return err.message;
+  }
+
+  return null;
+}
+
+function isTopicNotModifiedError(err: unknown) {
+  const description = readTelegramDescription(err);
+  return Boolean(description && description.includes("TOPIC_NOT_MODIFIED"));
 }
 
 function isNetworkError(err: unknown): boolean {
@@ -514,10 +598,24 @@ export function telegramService(db: Db, deps: TelegramServiceDeps) {
         );
       }
     }
-    for (const companyId of companyIds) {
+    let orderedCompanyIds = [...companyIds];
+    if (deps.companies && companyIds.size > 1) {
+      const companies = await deps.companies.list();
+      const orderedCompanies = sortCompaniesForTopicProvision(
+        companies.filter((company) => companyIds.has(company.id)),
+      );
+      const matchedIds = new Set(orderedCompanies.map((company) => company.id));
+      orderedCompanyIds = [
+        ...orderedCompanies.map((company) => company.id),
+        ...orderedCompanyIds.filter((companyId) => !matchedIds.has(companyId)).sort(),
+      ];
+    } else {
+      orderedCompanyIds.sort();
+    }
+    for (const companyId of orderedCompanyIds) {
       subscribeToLiveEvents(companyId);
     }
-    return companyIds;
+    return orderedCompanyIds;
   }
 
   async function autoSyncTopicsOnStart() {
@@ -838,12 +936,37 @@ export function telegramService(db: Db, deps: TelegramServiceDeps) {
       didCreateTopics = true;
     }
 
+    const company = deps.companies?.getById
+      ? await deps.companies.getById(companyId)
+      : (await deps.companies?.list?.())?.find((candidate) => candidate.id === companyId) ?? null;
+    const companyName = asNonEmptyString(company?.name ?? undefined);
+
     const createdTopics: Array<{ agentId: string; topicId: number }> = [];
-    const companyAgents = await deps.agents.list(companyId);
+    const companyAgents = sortAgentsForTopicProvision(await deps.agents.list(companyId));
     for (const agent of companyAgents) {
       if (agent.status === "terminated") continue;
-      if (deps.config.telegramTopicMapping[agent.id]) continue;
-      const topic = await retryTelegramCall(() => activeBot.api.createForumTopic(chatId, agent.name));
+      const desiredTopicName = formatAgentTopicName(companyName, agent.name);
+      const existingTopicId = deps.config.telegramTopicMapping[agent.id];
+      if (existingTopicId) {
+        if (typeof activeBot.api.editForumTopic === "function") {
+          try {
+            await retryTelegramCall(() =>
+              activeBot.api.editForumTopic?.(chatId, existingTopicId, { name: desiredTopicName }) ??
+              Promise.resolve(undefined),
+            );
+          } catch (err) {
+            if (isTopicNotModifiedError(err)) {
+              continue;
+            }
+            logger.warn(
+              { err, companyId, agentId: agent.id, topicId: existingTopicId },
+              "telegram topic rename failed",
+            );
+          }
+        }
+        continue;
+      }
+      const topic = await retryTelegramCall(() => activeBot.api.createForumTopic(chatId, desiredTopicName));
       deps.config.telegramTopicMapping[agent.id] = topic.message_thread_id;
       createdTopics.push({ agentId: agent.id, topicId: topic.message_thread_id });
       didCreateTopics = true;

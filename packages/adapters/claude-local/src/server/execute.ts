@@ -64,6 +64,38 @@ async function buildSkillsDir(): Promise<string> {
   return tmp;
 }
 
+function buildTelegramWakePrompt(context: Record<string, unknown>, agentId: string) {
+  const wakeReason = asString(context.wakeReason, "").trim();
+  const telegramContext = parseObject(context.paperclipTelegram);
+  const tools = parseObject(context.paperclipTools);
+  const telegramTool = parseObject(tools.telegram);
+  const messageText = asString(telegramContext.messageText, "").trim();
+  if (wakeReason !== "telegram_message" || messageText.length === 0) return "";
+
+  const chatId = asString(telegramContext.chatId, "").trim();
+  const topicId = Math.floor(asNumber(telegramContext.topicId, 0));
+  const username = asString(telegramContext.username, "").trim();
+  const userId = Math.floor(asNumber(telegramContext.userId, 0));
+  const sendEndpoint = asString(telegramTool.sendEndpoint, "/api/agent-tools/telegram/send").trim();
+  const senderLabel =
+    username.length > 0 ? `@${username}` : userId > 0 ? `user ${userId}` : "the operator";
+  const location = [
+    chatId.length > 0 ? `chat ${chatId}` : null,
+    topicId > 0 ? `topic ${topicId}` : null,
+  ].filter(Boolean).join(", ");
+
+  return [
+    "Telegram wake context:",
+    `- From: ${senderLabel}${location ? ` in ${location}` : ""}`,
+    `- Message: ${JSON.stringify(messageText)}`,
+    "",
+    "Before you end this run, you must send a reply back to Telegram.",
+    `Use POST ${sendEndpoint} with JSON like {\"agentId\":\"${agentId}\",\"text\":\"your reply\"}.`,
+    "If no issue work is required, send a concise acknowledgement and stop. Do not only write an internal status update.",
+    "",
+  ].join("\n");
+}
+
 interface ClaudeExecutionInput {
   runId: string;
   agent: AdapterExecutionContext["agent"];
@@ -113,6 +145,7 @@ async function buildClaudeRuntimeConfig(input: ClaudeExecutionInput): Promise<Cl
 
   const command = asString(config.command, "claude");
   const workspaceContext = parseObject(context.paperclipWorkspace);
+  const telegramContext = parseObject(context.paperclipTelegram);
   const workspaceCwd = asString(workspaceContext.cwd, "");
   const workspaceSource = asString(workspaceContext.source, "");
   const workspaceId = asString(workspaceContext.workspaceId, "") || null;
@@ -158,6 +191,12 @@ async function buildClaudeRuntimeConfig(input: ClaudeExecutionInput): Promise<Cl
   const linkedIssueIds = Array.isArray(context.issueIds)
     ? context.issueIds.filter((value): value is string => typeof value === "string" && value.trim().length > 0)
     : [];
+  const telegramMessageText = asString(telegramContext.messageText, "");
+  const telegramChatId = asString(telegramContext.chatId, "");
+  const telegramTopicId = Math.floor(asNumber(telegramContext.topicId, 0));
+  const telegramMessageId = Math.floor(asNumber(telegramContext.messageId, 0));
+  const telegramUserId = Math.floor(asNumber(telegramContext.userId, 0));
+  const telegramUsername = asString(telegramContext.username, "");
 
   if (wakeTaskId) {
     env.PAPERCLIP_TASK_ID = wakeTaskId;
@@ -176,6 +215,24 @@ async function buildClaudeRuntimeConfig(input: ClaudeExecutionInput): Promise<Cl
   }
   if (linkedIssueIds.length > 0) {
     env.PAPERCLIP_LINKED_ISSUE_IDS = linkedIssueIds.join(",");
+  }
+  if (telegramMessageText) {
+    env.PAPERCLIP_TELEGRAM_MESSAGE_TEXT = telegramMessageText;
+  }
+  if (telegramChatId) {
+    env.PAPERCLIP_TELEGRAM_CHAT_ID = telegramChatId;
+  }
+  if (telegramTopicId > 0) {
+    env.PAPERCLIP_TELEGRAM_TOPIC_ID = String(telegramTopicId);
+  }
+  if (telegramMessageId > 0) {
+    env.PAPERCLIP_TELEGRAM_MESSAGE_ID = String(telegramMessageId);
+  }
+  if (telegramUserId > 0) {
+    env.PAPERCLIP_TELEGRAM_USER_ID = String(telegramUserId);
+  }
+  if (telegramUsername) {
+    env.PAPERCLIP_TELEGRAM_USERNAME = telegramUsername;
   }
   if (effectiveWorkspaceCwd) {
     env.PAPERCLIP_WORKSPACE_CWD = effectiveWorkspaceCwd;
@@ -340,6 +397,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     run: { id: runId, source: "on_demand" },
     context,
   });
+  const telegramWakePrompt = buildTelegramWakePrompt(context, agent.id);
+  const promptWithWakeContext = `${telegramWakePrompt}${prompt}`;
 
   const buildClaudeArgs = (resumeSessionId: string | null) => {
     const args = ["--print", "-", "--output-format", "stream-json", "--verbose"];
@@ -383,7 +442,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         commandArgs: args,
         commandNotes,
         env: redactEnvForLogs(env),
-        prompt,
+        prompt: promptWithWakeContext,
         context,
       });
     }
@@ -391,7 +450,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     const proc = await runChildProcess(runId, command, args, {
       cwd,
       env,
-      stdin: prompt,
+      stdin: promptWithWakeContext,
       timeoutSec,
       graceSec,
       onLog,

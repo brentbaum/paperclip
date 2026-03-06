@@ -74,6 +74,7 @@ class FakeBot {
     createForumTopic: vi.fn(async (_chatId: string, _name: string) => ({
       message_thread_id: this.nextTopicId++,
     })),
+    editForumTopic: vi.fn(async () => true),
     sendMessage: vi.fn(async (_chatId: string, _text: string, _opts?: Record<string, unknown>) => ({
       message_id: this.nextMessageId++,
     })),
@@ -182,10 +183,26 @@ describe("telegramService", () => {
     const fakeBot = new FakeBot();
     const deps = baseDeps({
       createBot: async () => fakeBot,
+      companies: {
+        list: vi.fn(async () => [
+          {
+            id: "company-1",
+            name: "Acme",
+            status: "active",
+            createdAt: "2026-03-04T00:00:00.000Z",
+          },
+        ]),
+        getById: vi.fn(async () => ({
+          id: "company-1",
+          name: "Acme",
+          status: "active",
+          createdAt: "2026-03-04T00:00:00.000Z",
+        })),
+      },
       agents: {
         list: vi.fn(async () => [
-          { id: "agent-1", name: "Alice", status: "idle" },
-          { id: "agent-2", name: "Bob", status: "terminated" },
+          { id: "agent-1", name: "Alice", status: "idle", createdAt: "2026-03-04T01:00:00.000Z" },
+          { id: "agent-2", name: "Bob", status: "terminated", createdAt: "2026-03-04T02:00:00.000Z" },
         ]),
         getById: vi.fn(async () => null),
         resolveByReference: vi.fn(async () => ({ agent: null, ambiguous: false })),
@@ -197,6 +214,7 @@ describe("telegramService", () => {
     const second = await svc.syncTopics("company-1");
 
     expect(fakeBot.api.createForumTopic).toHaveBeenCalledTimes(3);
+    expect(fakeBot.api.createForumTopic).toHaveBeenNthCalledWith(3, "-100123", "Acme / Alice");
     expect(first.statusTopicId).toBeGreaterThan(0);
     expect(first.approvalsTopicId).toBeGreaterThan(0);
     expect(first.topicMapping["agent-1"]).toBeGreaterThan(0);
@@ -204,26 +222,60 @@ describe("telegramService", () => {
     expect(first.createdTopics).toEqual([
       { agentId: "agent-1", topicId: first.topicMapping["agent-1"]! },
     ]);
+    expect(fakeBot.api.editForumTopic).toHaveBeenCalledWith(
+      "-100123",
+      first.topicMapping["agent-1"],
+      { name: "Acme / Alice" },
+    );
     expect(second.createdTopics).toEqual([]);
   });
 
-  it("provisions topics for all active companies on startup when no mappings exist", async () => {
+  it("provisions topics in company order on startup when no mappings exist", async () => {
     const fakeBot = new FakeBot();
     const deps = baseDeps({
       createBot: async () => fakeBot,
       companies: {
         list: vi.fn(async () => [
-          { id: "company-1", status: "active" },
-          { id: "company-2", status: "active" },
+          {
+            id: "company-1",
+            name: "Evolve",
+            status: "active",
+            createdAt: "2026-03-05T11:21:40.182Z",
+          },
+          {
+            id: "company-2",
+            name: "Refract",
+            status: "active",
+            createdAt: "2026-03-04T22:11:15.017Z",
+          },
         ]),
+        getById: vi.fn(async (companyId: string) => {
+          if (companyId === "company-1") {
+            return {
+              id: "company-1",
+              name: "Evolve",
+              status: "active",
+              createdAt: "2026-03-05T11:21:40.182Z",
+            };
+          }
+          if (companyId === "company-2") {
+            return {
+              id: "company-2",
+              name: "Refract",
+              status: "active",
+              createdAt: "2026-03-04T22:11:15.017Z",
+            };
+          }
+          return null;
+        }),
       },
       agents: {
         list: vi.fn(async (companyId: string) => {
           if (companyId === "company-1") {
-            return [{ id: "agent-1", name: "Alice", status: "idle" }];
+            return [{ id: "agent-1", name: "Alice", status: "idle", createdAt: "2026-03-05T12:00:00.000Z" }];
           }
           if (companyId === "company-2") {
-            return [{ id: "agent-2", name: "Bob", status: "idle" }];
+            return [{ id: "agent-2", name: "Bob", status: "idle", createdAt: "2026-03-04T23:00:00.000Z" }];
           }
           return [];
         }),
@@ -235,9 +287,11 @@ describe("telegramService", () => {
     const svc = telegramService({} as any, deps);
     await svc.start();
 
-    expect(deps.agents.list).toHaveBeenCalledWith("company-1");
     expect(deps.agents.list).toHaveBeenCalledWith("company-2");
+    expect(deps.agents.list).toHaveBeenCalledWith("company-1");
     expect(fakeBot.api.createForumTopic).toHaveBeenCalledTimes(4);
+    expect(fakeBot.api.createForumTopic).toHaveBeenNthCalledWith(3, "-100123", "Refract / Bob");
+    expect(fakeBot.api.createForumTopic).toHaveBeenNthCalledWith(4, "-100123", "Evolve / Alice");
     expect(deps.config.telegramStatusTopicId).toBeGreaterThan(0);
     expect(deps.config.telegramApprovalsTopicId).toBeGreaterThan(0);
     expect(deps.config.telegramTopicMapping["agent-1"]).toBeGreaterThan(0);
