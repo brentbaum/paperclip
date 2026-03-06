@@ -574,6 +574,13 @@ export function IssuesList({
                   to={`/issues/${issue.identifier ?? issue.id}`}
                   className="flex items-center gap-2 py-2 pl-1 pr-3 text-sm border-b border-border last:border-b-0 cursor-pointer hover:bg-accent/50 transition-colors no-underline text-inherit"
                 >
+                  {/* Unread dot — shown when issue has no viewedAt or was updated since last view */}
+                  {(!issue.viewedAt || new Date(issue.viewedAt).getTime() < new Date(issue.updatedAt).getTime()) && (
+                    <span className="h-2 w-2 shrink-0 rounded-full bg-blue-500" title="Unread" />
+                  )}
+                  {issue.viewedAt && new Date(issue.viewedAt).getTime() >= new Date(issue.updatedAt).getTime() && (
+                    <div className="w-2 shrink-0" />
+                  )}
                   {/* Spacer matching caret width so status icon aligns with group title (hidden on mobile) */}
                   <div className="w-3.5 shrink-0 hidden sm:block" />
                   <div className="shrink-0" onClick={(e) => { e.preventDefault(); e.stopPropagation(); }}>

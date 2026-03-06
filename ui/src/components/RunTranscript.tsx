@@ -35,15 +35,24 @@ function asRecord(value: unknown): Record<string, unknown> | null {
 function isNoiseSystemLine(text: string) {
   return (
     text === "turn started" ||
+    text === "status" ||
+    text === "compact_boundary" ||
+    text.startsWith("system: status") ||
+    text.startsWith("system: compact_boundary") ||
     text.startsWith("item started:") ||
     text.startsWith("item completed:") ||
-    text.startsWith("[paperclip] Loaded agent instructions file:")
+    text.startsWith("hook started:") ||
+    text === "rate limit: allowed"
   );
 }
 
 export function shouldRenderEntry(entry: TranscriptEntry) {
   if (entry.kind === "init") return false;
   if (entry.kind === "system") return !isNoiseSystemLine(entry.text.trim());
+  // Filter raw JSON that leaked through as stdout
+  if (entry.kind === "stdout" && entry.text.trim().startsWith("{")) return false;
+  // Filter paperclip infrastructure messages
+  if ((entry.kind === "stdout" || entry.kind === "stderr") && entry.text.trim().startsWith("[paperclip]")) return false;
   return true;
 }
 
@@ -59,7 +68,14 @@ export function normalizeToolResult(content: string): string[] {
     }
   }
 
-  return lines.filter((line) => line.trim() !== "");
+  const filtered = lines.filter((line) => {
+    const trimmed = line.trim();
+    if (!trimmed) return false;
+    if (trimmed.match(/^The file .+ has been (updated|created) successfully/)) return false;
+    if (trimmed.startsWith("Todos have been modified successfully")) return false;
+    return true;
+  });
+  return filtered;
 }
 
 // ---------------------------------------------------------------------------
@@ -144,6 +160,14 @@ export function formatToolHeadline(name: string, input: unknown): string {
   if (name === "AskUserQuestion" && typeof rec.question === "string") {
     const q = rec.question.length > 80 ? `${rec.question.slice(0, 77)}...` : rec.question;
     return `AskUser(${q})`;
+  }
+  if (name === "command_execution" && typeof rec.command === "string") {
+    // Strip shell wrapper (e.g. `/bin/zsh -lc '...'`)
+    let cmd = rec.command;
+    const shellMatch = cmd.match(/^\/bin\/(?:ba)?sh\s+-\w+\s+["'](.+)["']$/s);
+    if (shellMatch?.[1]) cmd = shellMatch[1];
+    if (cmd.length > 120) cmd = `${cmd.slice(0, 117)}...`;
+    return `Bash(${cmd})`;
   }
   if (name.startsWith("mcp__")) {
     const parts = name.split("__");

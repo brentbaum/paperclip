@@ -349,12 +349,24 @@ export function Inbox() {
   });
 
   const staleIssues = issues ? getStaleIssues(issues) : [];
+
+  const isUnviewed = (issue: Issue) => {
+    const viewedAt = issue.viewedAt;
+    if (!viewedAt) return true;
+    return new Date(viewedAt).getTime() < new Date(issue.updatedAt).getTime();
+  };
+
   const assignedToMeIssues = useMemo(
     () =>
       [...assignedToMeIssuesRaw].sort(
         (a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime(),
       ),
     [assignedToMeIssuesRaw],
+  );
+
+  const unviewedAssignedToMe = useMemo(
+    () => assignedToMeIssues.filter(isUnviewed),
+    [assignedToMeIssues],
   );
 
   const agentById = useMemo(() => {
@@ -456,6 +468,11 @@ export function Inbox() {
     return <EmptyState icon={InboxIcon} message="Select a company to view inbox." />;
   }
 
+  const unviewedStaleIssues = useMemo(
+    () => staleIssues.filter(isUnviewed),
+    [staleIssues],
+  );
+
   const hasRunFailures = failedRuns.length > 0;
   const showAggregateAgentError = !!dashboard && dashboard.agents.error > 0 && !hasRunFailures;
   const showBudgetAlert =
@@ -468,11 +485,11 @@ export function Inbox() {
   const hasAssignedToMe = assignedToMeIssues.length > 0;
 
   const newItemCount =
-    assignedToMeIssues.length +
+    unviewedAssignedToMe.length +
     joinRequests.length +
     actionableApprovals.length +
     failedRuns.length +
-    staleIssues.length +
+    unviewedStaleIssues.length +
     (showAggregateAgentError ? 1 : 0) +
     (showBudgetAlert ? 1 : 0);
 
@@ -487,7 +504,7 @@ export function Inbox() {
   const showStaleCategory = allCategoryFilter === "everything" || allCategoryFilter === "stale_work";
 
   const approvalsToRender = tab === "new" ? actionableApprovals : filteredAllApprovals;
-  const showAssignedSection = tab === "new" ? hasAssignedToMe : showAssignedCategory && hasAssignedToMe;
+  const showAssignedSection = tab === "new" ? unviewedAssignedToMe.length > 0 : showAssignedCategory && hasAssignedToMe;
   const showJoinRequestsSection =
     tab === "new" ? hasJoinRequests : showJoinRequestsCategory && hasJoinRequests;
   const showApprovalsSection =
@@ -497,7 +514,7 @@ export function Inbox() {
   const showFailedRunsSection =
     tab === "new" ? hasRunFailures : showFailedRunsCategory && hasRunFailures;
   const showAlertsSection = tab === "new" ? hasAlerts : showAlertsCategory && hasAlerts;
-  const showStaleSection = tab === "new" ? hasStale : showStaleCategory && hasStale;
+  const showStaleSection = tab === "new" ? unviewedStaleIssues.length > 0 : showStaleCategory && hasStale;
 
   const visibleSections = [
     showAssignedSection ? "assigned_to_me" : null,
@@ -603,7 +620,7 @@ export function Inbox() {
               Assigned To Me
             </h3>
             <div className="divide-y divide-border border border-border">
-              {assignedToMeIssues.map((issue) => (
+              {(tab === "new" ? unviewedAssignedToMe : assignedToMeIssues).map((issue) => (
                 <Link
                   key={issue.id}
                   to={`/issues/${issue.identifier ?? issue.id}`}
@@ -775,7 +792,7 @@ export function Inbox() {
               Stale Work
             </h3>
             <div className="divide-y divide-border border border-border">
-              {staleIssues.map((issue) => (
+              {(tab === "new" ? unviewedStaleIssues : staleIssues).map((issue) => (
                 <Link
                   key={issue.id}
                   to={`/issues/${issue.identifier ?? issue.id}`}

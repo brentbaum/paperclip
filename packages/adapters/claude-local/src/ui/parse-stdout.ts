@@ -41,15 +41,37 @@ export function parseClaudeStdoutLine(line: string, ts: string): TranscriptEntry
   }
 
   const type = typeof parsed.type === "string" ? parsed.type : "";
-  if (type === "system" && parsed.subtype === "init") {
-    return [
-      {
-        kind: "init",
-        ts,
-        model: typeof parsed.model === "string" ? parsed.model : "unknown",
-        sessionId: typeof parsed.session_id === "string" ? parsed.session_id : "",
-      },
-    ];
+  // System events: hooks, rate limits, etc. → formatted system entries
+  if (type === "system") {
+    const subtype = typeof parsed.subtype === "string" ? parsed.subtype : "";
+    if (subtype === "init") {
+      return [
+        {
+          kind: "init",
+          ts,
+          model: typeof parsed.model === "string" ? parsed.model : "unknown",
+          sessionId: typeof parsed.session_id === "string" ? parsed.session_id : "",
+        },
+      ];
+    }
+    const hookName = typeof parsed.hook_name === "string" ? parsed.hook_name : "";
+    if (subtype === "hook_started") {
+      return [{ kind: "system", ts, text: `hook started: ${hookName}` }];
+    }
+    if (subtype === "hook_response") {
+      const outcome = typeof parsed.outcome === "string" ? parsed.outcome : "unknown";
+      return [{ kind: "system", ts, text: `hook ${outcome}: ${hookName}` }];
+    }
+    // Other system subtypes → short formatted line
+    const text = subtype || "system";
+    return [{ kind: "system", ts, text }];
+  }
+
+  // Rate limit events → system entry
+  if (type === "rate_limit_event") {
+    const info = asRecord(parsed.rate_limit_info);
+    const status = info && typeof info.status === "string" ? info.status : "unknown";
+    return [{ kind: "system", ts, text: `rate limit: ${status}` }];
   }
 
   if (type === "assistant") {
@@ -132,6 +154,14 @@ export function parseClaudeStdoutLine(line: string, ts: string): TranscriptEntry
       isError,
       errors,
     }];
+  }
+
+  // Parsed JSON that doesn't match any known type — format as system entry
+  // instead of dumping raw JSON into the transcript
+  if (parsed) {
+    const subtype = typeof parsed.subtype === "string" ? parsed.subtype : "";
+    const summary = type ? (subtype ? `${type}: ${subtype}` : type) : "event";
+    return [{ kind: "system", ts, text: summary }];
   }
 
   return [{ kind: "stdout", ts, text: line }];

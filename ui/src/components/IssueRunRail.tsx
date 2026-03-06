@@ -1,7 +1,9 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { RotateCcw } from "lucide-react";
 import type { HeartbeatRunEvent } from "@paperclipai/shared";
 import { buildTranscript, getUIAdapter } from "../adapters";
+import { agentsApi } from "../api/agents";
 import { heartbeatsApi, type ActiveRunForIssue, type LiveRunForIssue } from "../api/heartbeats";
 import { queryKeys } from "../lib/queryKeys";
 import { cn } from "../lib/utils";
@@ -16,9 +18,11 @@ interface IssueRunRailProps {
   issueId: string;
   companyId?: string | null;
   className?: string;
+  /** A historical run to display in the rail (e.g. clicked from a comment). */
+  pinnedRun?: RailRun | null;
 }
 
-type RailRun = LiveRunForIssue;
+export type RailRun = LiveRunForIssue;
 type RunLogChunk = { ts: string; stream: "stdout" | "stderr" | "system"; chunk: string };
 
 function toIsoString(value: string | Date | null | undefined): string | null {
@@ -80,6 +84,10 @@ function isLiveStatus(status: string) {
 }
 
 
+function isFailedStatus(status: string) {
+  return status === "failed" || status === "timed_out";
+}
+
 function IssueRunPane({ run }: { run: RailRun }) {
   const [events, setEvents] = useState<HeartbeatRunEvent[]>([]);
   const [logLines, setLogLines] = useState<RunLogChunk[]>([]);
@@ -126,7 +134,12 @@ function IssueRunPane({ run }: { run: RailRun }) {
         }
       } catch (error) {
         if (!cancelled) {
-          setLogError(error instanceof Error ? error.message : "Failed to load run log");
+          // For live/queued runs, a missing log is expected (run hasn't started output yet)
+          if (isLive) {
+            setLogError(null);
+          } else {
+            setLogError(error instanceof Error ? error.message : "Failed to load run log");
+          }
         }
       } finally {
         if (!cancelled) setLogLoading(false);
@@ -204,7 +217,31 @@ function IssueRunPane({ run }: { run: RailRun }) {
   );
   const workingDir = adapterInvokePayload && typeof adapterInvokePayload.cwd === "string"
     ? adapterInvokePayload.cwd
-    : "cwd unavailable";
+    : isLive && visibleTranscript.length === 0 ? "starting…" : "";
+
+  const queryClient = useQueryClient();
+  const retryRun = useMutation({
+    mutationFn: async () => {
+      const payload: Record<string, unknown> = {};
+      if (run.issueId) payload.issueId = run.issueId;
+      const result = await agentsApi.wakeup(run.agentId, {
+        source: "on_demand",
+        triggerDetail: "manual",
+        reason: "retry_failed_run",
+        payload,
+      });
+      if (!("id" in result)) {
+        throw new Error("Retry was skipped because the agent is not currently invokable.");
+      }
+      return result;
+    },
+    onSuccess: () => {
+      if (run.issueId) {
+        queryClient.invalidateQueries({ queryKey: queryKeys.issues.liveRuns(run.issueId) });
+        queryClient.invalidateQueries({ queryKey: queryKeys.issues.activeRun(run.issueId) });
+      }
+    },
+  });
 
   // Auto-scroll to bottom on new content (always, not just when live)
   const userScrolledUpRef = useRef(false);
@@ -238,15 +275,10 @@ function IssueRunPane({ run }: { run: RailRun }) {
           scrollbarColor: `${TONE.warn} transparent`,
         }}
       >
-        {logLoading && visibleTranscript.length === 0 ? (
-          <div className="py-2 text-[12px]" style={{ color: RAIL_MUTED }}>
-            Streaming transcript...
-          </div>
-        ) : null}
-
-        {!logLoading && visibleTranscript.length === 0 && !logError ? (
-          <div className="py-2 text-[12px]" style={{ color: RAIL_MUTED }}>
-            Waiting for agent output...
+        {visibleTranscript.length === 0 && !logError ? (
+          <div className="flex items-center gap-2 py-4 text-[12px]" style={{ color: RAIL_MUTED }}>
+            <span className="inline-block h-3 w-3 animate-spin rounded-full border-2 border-current border-t-transparent" />
+            {isLive ? "Starting run…" : logLoading ? "Loading transcript…" : "Waiting for agent output…"}
           </div>
         ) : null}
 
@@ -264,13 +296,30 @@ function IssueRunPane({ run }: { run: RailRun }) {
         style={{ borderColor: RAIL_BORDER, backgroundColor: RAIL_BG, color: RAIL_MUTED }}
       >
         <span className="shrink-0 truncate">model {modelName}</span>
-        <span className="truncate text-right">{workingDir}</span>
+        {isFailedStatus(run.status) ? (
+          <button
+            onClick={() => retryRun.mutate()}
+            disabled={retryRun.isPending}
+            className="flex shrink-0 items-center gap-1 rounded px-2 py-0.5 text-[11px] font-medium transition-colors hover:bg-white/10 disabled:opacity-50"
+            style={{ color: TONE.error }}
+          >
+            <RotateCcw className="h-3 w-3" />
+            {retryRun.isPending ? "Retrying…" : "Retry"}
+          </button>
+        ) : (
+          <span className="truncate text-right">{workingDir}</span>
+        )}
       </div>
+      {retryRun.isError && (
+        <div className="border-t px-3 py-1.5 text-[11px]" style={{ borderColor: RAIL_BORDER, color: TONE.error }}>
+          {retryRun.error instanceof Error ? retryRun.error.message : "Failed to retry run"}
+        </div>
+      )}
     </div>
   );
 }
 
-export function IssueRunRail({ issueId, className }: IssueRunRailProps) {
+export function IssueRunRail({ issueId, className, pinnedRun }: IssueRunRailProps) {
   const { data: liveRuns } = useQuery({
     queryKey: queryKeys.issues.liveRuns(issueId),
     queryFn: () => heartbeatsApi.liveRunsForIssue(issueId),
@@ -287,6 +336,9 @@ export function IssueRunRail({ issueId, className }: IssueRunRailProps) {
 
   const runs = useMemo(() => {
     const deduped = new Map<string, RailRun>();
+    if (pinnedRun) {
+      deduped.set(pinnedRun.id, pinnedRun);
+    }
     for (const run of liveRuns ?? []) {
       deduped.set(run.id, run);
     }
@@ -296,9 +348,16 @@ export function IssueRunRail({ issueId, className }: IssueRunRailProps) {
     return [...deduped.values()].sort(
       (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime(),
     );
-  }, [activeRun, issueId, liveRuns]);
+  }, [activeRun, issueId, liveRuns, pinnedRun]);
 
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
+
+  // Auto-select pinned run when it changes
+  useEffect(() => {
+    if (pinnedRun) {
+      setSelectedRunId(pinnedRun.id);
+    }
+  }, [pinnedRun]);
 
   useEffect(() => {
     if (runs.length === 0) {

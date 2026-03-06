@@ -20,7 +20,7 @@ import { InlineEditor } from "../components/InlineEditor";
 import { CommentThread } from "../components/CommentThread";
 import { IssueAssigneePicker } from "../components/IssueAssigneePicker";
 import { IssueProperties } from "../components/IssueProperties";
-import { IssueRunRail } from "../components/IssueRunRail";
+import { IssueRunRail, type RailRun } from "../components/IssueRunRail";
 import { IssuePlanRail } from "../components/IssuePlanRail";
 import { documentsApi } from "../api/documents";
 import type { MentionOption } from "../components/MarkdownEditor";
@@ -168,6 +168,7 @@ export function IssueDetail() {
     cost: false,
   });
   const [attachmentError, setAttachmentError] = useState<string | null>(null);
+  const [pinnedRun, setPinnedRun] = useState<RailRun | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   const { data: issue, isLoading, error } = useQuery({
@@ -229,8 +230,9 @@ export function IssueDetail() {
 
   const hasPlan = !!(planDoc?.latestRevision?.body?.trim());
   const hasLiveRuns = (liveRuns ?? []).length > 0 || !!activeRun;
-  const showDesktopRightRail = (hasLiveRuns || hasPlan) && !isMobile;
-  const showDesktopRunRail = hasLiveRuns && !isMobile;
+  const hasRunsToShow = hasLiveRuns || !!pinnedRun;
+  const showDesktopRightRail = (hasRunsToShow || hasPlan) && !isMobile;
+  const showDesktopRunRail = hasRunsToShow && !isMobile;
 
   // Filter out runs already shown by the live widget to avoid duplication
   const timelineRuns = useMemo(() => {
@@ -493,12 +495,56 @@ export function IssueDetail() {
     },
   });
 
+  const retryRun = useMutation({
+    mutationFn: async (run: { runId: string; agentId: string }) => {
+      const payload: Record<string, unknown> = {};
+      if (issueId) payload.issueId = issueId;
+      const result = await agentsApi.wakeup(run.agentId, {
+        source: "on_demand",
+        triggerDetail: "manual",
+        reason: "retry_failed_run",
+        payload,
+      });
+      if (!("id" in result)) {
+        throw new Error("Retry was skipped because the agent is not currently invokable.");
+      }
+      return result;
+    },
+    onSuccess: () => {
+      if (issueId) {
+        queryClient.invalidateQueries({ queryKey: queryKeys.issues.liveRuns(issueId) });
+        queryClient.invalidateQueries({ queryKey: queryKeys.issues.activeRun(issueId) });
+        queryClient.invalidateQueries({ queryKey: queryKeys.issues.runs(issueId!) });
+      }
+    },
+  });
+
+  const markViewedMutation = useMutation({
+    mutationFn: (id: string) => issuesApi.markViewed(id),
+    onSuccess: () => {
+      if (selectedCompanyId) {
+        queryClient.invalidateQueries({ queryKey: queryKeys.issues.list(selectedCompanyId) });
+        queryClient.invalidateQueries({ queryKey: queryKeys.issues.listAssignedToMe(selectedCompanyId) });
+        queryClient.invalidateQueries({ queryKey: queryKeys.sidebarBadges(selectedCompanyId) });
+      }
+    },
+  });
+
   useEffect(() => {
     setBreadcrumbs([
       { label: "Issues", href: "/issues" },
       { label: issue?.title ?? issueId ?? "Issue" },
     ]);
   }, [setBreadcrumbs, issue, issueId]);
+
+  // Mark issue as viewed when detail page loads
+  const viewedRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (issue?.id && viewedRef.current !== issue.id) {
+      viewedRef.current = issue.id;
+      markViewedMutation.mutate(issue.id);
+    }
+  }, [issue?.id]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Redirect to identifier-based URL if navigated via UUID
   useEffect(() => {
@@ -746,7 +792,7 @@ export function IssueDetail() {
               }}
             />
           ) : null}
-          {hasLiveRuns && isMobile ? <IssueRunRail issueId={issueId!} companyId={issue.companyId} /> : null}
+          {hasRunsToShow && isMobile ? <IssueRunRail issueId={issueId!} companyId={issue.companyId} pinnedRun={pinnedRun} /> : null}
 
           <div className="space-y-3">
         <div className="flex items-center justify-between gap-2">
@@ -862,6 +908,25 @@ export function IssueDetail() {
             }}
             onAttachImage={async (file) => {
               await uploadAttachment.mutateAsync(file);
+            }}
+            onRetryRun={(run) => retryRun.mutate({ runId: run.runId, agentId: run.agentId })}
+            retryingRunId={retryRun.isPending ? (retryRun.variables?.runId ?? null) : null}
+            onRunClick={(runId, agentId) => {
+              const agent = agentMap.get(agentId);
+              const run = (linkedRuns ?? []).find((r) => r.runId === runId);
+              setPinnedRun({
+                id: runId,
+                status: run?.status ?? "completed",
+                invocationSource: run?.invocationSource ?? "heartbeat",
+                triggerDetail: null,
+                startedAt: run?.startedAt ?? null,
+                finishedAt: run?.finishedAt ?? null,
+                createdAt: run?.createdAt ?? new Date().toISOString(),
+                agentId,
+                agentName: agent?.name ?? agentId.slice(0, 8),
+                adapterType: agent?.adapterType ?? "claude_local",
+                issueId: issueId!,
+              });
             }}
           />
         </TabsContent>
@@ -1004,7 +1069,7 @@ export function IssueDetail() {
               />
             )}
             {showDesktopRunRail && (
-              <IssueRunRail issueId={issueId!} companyId={issue.companyId} />
+              <IssueRunRail issueId={issueId!} companyId={issue.companyId} pinnedRun={pinnedRun} />
             )}
           </div>
         ) : null}

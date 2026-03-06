@@ -130,6 +130,11 @@ export async function createApp(
   );
   app.use("/api", api);
 
+  // Return 404 for unmatched /api routes instead of falling through to SPA
+  app.all("/api/*path", (_req, res) => {
+    res.status(404).json({ error: "Not found" });
+  });
+
   const __dirname = path.dirname(fileURLToPath(import.meta.url));
   if (opts.uiMode === "static") {
     // Try published location first (server/ui-dist/), then monorepo dev location (../../ui/dist)
