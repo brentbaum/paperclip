@@ -1,4 +1,58 @@
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+const { readConfigFileMock, writeConfigFileMock } = vi.hoisted(() => ({
+  readConfigFileMock: vi.fn(() => ({
+    $meta: {
+      version: 1,
+      updatedAt: "2026-03-04T21:54:41.431Z",
+      source: "test",
+    },
+    database: {
+      mode: "embedded-postgres",
+      embeddedPostgresDataDir: "/tmp/paperclip-test-db",
+      embeddedPostgresPort: 54331,
+    },
+    logging: {
+      mode: "file",
+      logDir: "/tmp/paperclip-test-logs",
+    },
+    server: {
+      deploymentMode: "local_trusted",
+      exposure: "private",
+      host: "127.0.0.1",
+      port: 3100,
+      allowedHostnames: [],
+      serveUi: true,
+      tailscaleServe: false,
+    },
+    auth: {
+      baseUrlMode: "auto",
+    },
+    storage: {
+      provider: "local_disk",
+      localDisk: {
+        baseDir: "/tmp/paperclip-test-storage",
+      },
+    },
+    secrets: {
+      provider: "local_encrypted",
+      strictMode: false,
+      localEncrypted: {
+        keyFilePath: "/tmp/paperclip-test.key",
+      },
+    },
+    telegram: {
+      topicMapping: {},
+    },
+  })),
+  writeConfigFileMock: vi.fn(),
+}));
+
+vi.mock("../config-file.js", () => ({
+  readConfigFile: readConfigFileMock,
+  writeConfigFile: writeConfigFileMock,
+}));
+
 import { telegramService } from "../services/telegram.js";
 
 type FakeEmitInput = {
@@ -87,6 +141,11 @@ function baseDeps(overrides?: Partial<Parameters<typeof telegramService>[1]>) {
 }
 
 describe("telegramService", () => {
+  beforeEach(() => {
+    readConfigFileMock.mockClear();
+    writeConfigFileMock.mockClear();
+  });
+
   it("is a no-op when telegram config is missing", async () => {
     const createBot = vi.fn(async () => new FakeBot());
     const deps = baseDeps({
