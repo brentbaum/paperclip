@@ -17,6 +17,11 @@ import { AgentConfigForm } from "../components/AgentConfigForm";
 import { adapterLabels, roleLabels } from "../components/agent-config-primitives";
 import { getUIAdapter, buildTranscript } from "../adapters";
 import type { TranscriptEntry } from "../adapters";
+import {
+  RAIL_BG, RAIL_PANEL, RAIL_BORDER, RAIL_TEXT, RAIL_MUTED, TONE,
+  shouldRenderEntry, groupTranscript, extractFooterModel,
+  TranscriptBody,
+} from "../components/RunTranscript";
 import { StatusBadge } from "../components/StatusBadge";
 import { agentStatusDot, agentStatusDotDefault } from "../lib/status-colors";
 import { MarkdownBody } from "../components/MarkdownBody";
@@ -2157,6 +2162,21 @@ function LogViewer({ run, adapterType }: { run: HeartbeatRun; adapterType: strin
   const adapter = useMemo(() => getUIAdapter(adapterType), [adapterType]);
   const transcript = useMemo(() => buildTranscript(logLines, adapter.parseStdoutLine), [logLines, adapter]);
 
+  const visibleTranscript = useMemo(
+    () => transcript.filter((entry) => shouldRenderEntry(entry)).slice(-220),
+    [transcript],
+  );
+
+  const displayItems = useMemo(() => groupTranscript(visibleTranscript), [visibleTranscript]);
+
+  const modelName = useMemo(
+    () => extractFooterModel(transcript, adapterInvokePayload, adapterType),
+    [adapterInvokePayload, adapterType, transcript],
+  );
+  const workingDir = adapterInvokePayload && typeof adapterInvokePayload.cwd === "string"
+    ? adapterInvokePayload.cwd
+    : null;
+
   if (loading && logLoading) {
     return <p className="text-xs text-muted-foreground">Loading run logs...</p>;
   }
@@ -2179,74 +2199,9 @@ function LogViewer({ run, adapterType }: { run: HeartbeatRun; adapterType: strin
 
   return (
     <div className="space-y-3">
-      {adapterInvokePayload && (
-        <div className="rounded-lg border border-border bg-background/60 p-3 space-y-2">
-          <div className="text-xs font-medium text-muted-foreground">Invocation</div>
-          {typeof adapterInvokePayload.adapterType === "string" && (
-            <div className="text-xs"><span className="text-muted-foreground">Adapter: </span>{adapterInvokePayload.adapterType}</div>
-          )}
-          {typeof adapterInvokePayload.cwd === "string" && (
-            <div className="text-xs break-all"><span className="text-muted-foreground">Working dir: </span><span className="font-mono">{adapterInvokePayload.cwd}</span></div>
-          )}
-          {typeof adapterInvokePayload.command === "string" && (
-            <div className="text-xs break-all">
-              <span className="text-muted-foreground">Command: </span>
-              <span className="font-mono">
-                {[
-                  adapterInvokePayload.command,
-                  ...(Array.isArray(adapterInvokePayload.commandArgs)
-                    ? adapterInvokePayload.commandArgs.filter((v): v is string => typeof v === "string")
-                    : []),
-                ].join(" ")}
-              </span>
-            </div>
-          )}
-          {Array.isArray(adapterInvokePayload.commandNotes) && adapterInvokePayload.commandNotes.length > 0 && (
-            <div>
-              <div className="text-xs text-muted-foreground mb-1">Command notes</div>
-              <ul className="list-disc pl-5 space-y-1">
-                {adapterInvokePayload.commandNotes
-                  .filter((value): value is string => typeof value === "string" && value.trim().length > 0)
-                  .map((note, idx) => (
-                    <li key={`${idx}-${note}`} className="text-xs break-all font-mono">
-                      {note}
-                    </li>
-                  ))}
-              </ul>
-            </div>
-          )}
-          {adapterInvokePayload.prompt !== undefined && (
-            <div>
-              <div className="text-xs text-muted-foreground mb-1">Prompt</div>
-              <pre className="bg-neutral-100 dark:bg-neutral-950 rounded-md p-2 text-xs overflow-x-auto whitespace-pre-wrap">
-                {typeof adapterInvokePayload.prompt === "string"
-                  ? adapterInvokePayload.prompt
-                  : JSON.stringify(adapterInvokePayload.prompt, null, 2)}
-              </pre>
-            </div>
-          )}
-          {adapterInvokePayload.context !== undefined && (
-            <div>
-              <div className="text-xs text-muted-foreground mb-1">Context</div>
-              <pre className="bg-neutral-100 dark:bg-neutral-950 rounded-md p-2 text-xs overflow-x-auto whitespace-pre-wrap">
-                {JSON.stringify(adapterInvokePayload.context, null, 2)}
-              </pre>
-            </div>
-          )}
-          {adapterInvokePayload.env !== undefined && (
-            <div>
-              <div className="text-xs text-muted-foreground mb-1">Environment</div>
-              <pre className="bg-neutral-100 dark:bg-neutral-950 rounded-md p-2 text-xs overflow-x-auto whitespace-pre-wrap font-mono">
-                {formatEnvForDisplay(adapterInvokePayload.env)}
-              </pre>
-            </div>
-          )}
-        </div>
-      )}
-
       <div className="flex items-center justify-between">
         <span className="text-xs font-medium text-muted-foreground">
-          Transcript ({transcript.length})
+          Transcript ({visibleTranscript.length})
         </span>
         <div className="flex items-center gap-2">
           {isLive && !isFollowing && (
@@ -2275,125 +2230,48 @@ function LogViewer({ run, adapterType }: { run: HeartbeatRun; adapterType: strin
           )}
         </div>
       </div>
-      <div className="bg-neutral-100 dark:bg-neutral-950 rounded-lg p-3 font-mono text-xs space-y-0.5 overflow-x-hidden">
-        {transcript.length === 0 && !run.logRef && (
-          <div className="text-neutral-500">No persisted transcript for this run.</div>
-        )}
-        {transcript.map((entry, idx) => {
-          const time = new Date(entry.ts).toLocaleTimeString("en-US", { hour12: false });
-          const grid = "grid grid-cols-[auto_auto_1fr] gap-x-2 sm:gap-x-3 items-baseline";
-          const tsCell = "text-neutral-400 dark:text-neutral-600 select-none w-12 sm:w-16 text-[10px] sm:text-xs";
-          const lblCell = "w-14 sm:w-20 text-[10px] sm:text-xs";
-          const contentCell = "min-w-0 whitespace-pre-wrap break-words overflow-hidden";
-          const expandCell = "col-span-full md:col-start-3 md:col-span-1";
-
-          if (entry.kind === "assistant") {
-            return (
-              <div key={`${entry.ts}-assistant-${idx}`} className={cn(grid, "py-0.5")}>
-                <span className={tsCell}>{time}</span>
-                <span className={cn(lblCell, "text-green-700 dark:text-green-300")}>assistant</span>
-                <span className={cn(contentCell, "text-green-900 dark:text-green-100")}>{entry.text}</span>
-              </div>
-            );
-          }
-
-          if (entry.kind === "thinking") {
-            return (
-              <div key={`${entry.ts}-thinking-${idx}`} className={cn(grid, "py-0.5")}>
-                <span className={tsCell}>{time}</span>
-                <span className={cn(lblCell, "text-green-600/60 dark:text-green-300/60")}>thinking</span>
-                <span className={cn(contentCell, "text-green-800/60 dark:text-green-100/60 italic")}>{entry.text}</span>
-              </div>
-            );
-          }
-
-          if (entry.kind === "user") {
-            return (
-              <div key={`${entry.ts}-user-${idx}`} className={cn(grid, "py-0.5")}>
-                <span className={tsCell}>{time}</span>
-                <span className={cn(lblCell, "text-neutral-500 dark:text-neutral-400")}>user</span>
-                <span className={cn(contentCell, "text-neutral-700 dark:text-neutral-300")}>{entry.text}</span>
-              </div>
-            );
-          }
-
-          if (entry.kind === "tool_call") {
-            return (
-              <div key={`${entry.ts}-tool-${idx}`} className={cn(grid, "gap-y-1 py-0.5")}>
-                <span className={tsCell}>{time}</span>
-                <span className={cn(lblCell, "text-yellow-700 dark:text-yellow-300")}>tool_call</span>
-                <span className="text-yellow-900 dark:text-yellow-100 min-w-0">{entry.name}</span>
-                <pre className={cn(expandCell, "bg-neutral-200 dark:bg-neutral-900 rounded p-2 text-[11px] overflow-x-auto whitespace-pre-wrap text-neutral-800 dark:text-neutral-200")}>
-                  {JSON.stringify(entry.input, null, 2)}
-                </pre>
-              </div>
-            );
-          }
-
-          if (entry.kind === "tool_result") {
-            return (
-              <div key={`${entry.ts}-toolres-${idx}`} className={cn(grid, "gap-y-1 py-0.5")}>
-                <span className={tsCell}>{time}</span>
-                <span className={cn(lblCell, entry.isError ? "text-red-600 dark:text-red-300" : "text-purple-600 dark:text-purple-300")}>tool_result</span>
-                {entry.isError ? <span className="text-red-600 dark:text-red-400 min-w-0">error</span> : <span />}
-                <pre className={cn(expandCell, "bg-neutral-100 dark:bg-neutral-900 rounded p-2 text-[11px] overflow-x-auto whitespace-pre-wrap text-neutral-700 dark:text-neutral-300 max-h-60 overflow-y-auto")}>
-                  {(() => { try { return JSON.stringify(JSON.parse(entry.content), null, 2); } catch { return entry.content; } })()}
-                </pre>
-              </div>
-            );
-          }
-
-          if (entry.kind === "init") {
-            return (
-              <div key={`${entry.ts}-init-${idx}`} className={grid}>
-                <span className={tsCell}>{time}</span>
-                <span className={cn(lblCell, "text-blue-700 dark:text-blue-300")}>init</span>
-                <span className={cn(contentCell, "text-blue-900 dark:text-blue-100")}>model: {entry.model}{entry.sessionId ? `, session: ${entry.sessionId}` : ""}</span>
-              </div>
-            );
-          }
-
-          if (entry.kind === "result") {
-            return (
-              <div key={`${entry.ts}-result-${idx}`} className={cn(grid, "gap-y-1 py-0.5")}>
-                <span className={tsCell}>{time}</span>
-                <span className={cn(lblCell, "text-cyan-700 dark:text-cyan-300")}>result</span>
-                <span className={cn(contentCell, "text-cyan-900 dark:text-cyan-100")}>
-                  tokens in={formatTokens(entry.inputTokens)} out={formatTokens(entry.outputTokens)} cached={formatTokens(entry.cachedTokens)} cost=${entry.costUsd.toFixed(6)}
-                </span>
-                {(entry.subtype || entry.isError || entry.errors.length > 0) && (
-                  <div className={cn(expandCell, "text-red-600 dark:text-red-300 whitespace-pre-wrap break-words")}>
-                    subtype={entry.subtype || "unknown"} is_error={entry.isError ? "true" : "false"}
-                    {entry.errors.length > 0 ? ` errors=${entry.errors.join(" | ")}` : ""}
-                  </div>
-                )}
-                {entry.text && (
-                  <div className={cn(expandCell, "whitespace-pre-wrap break-words text-neutral-800 dark:text-neutral-100")}>{entry.text}</div>
-                )}
-              </div>
-            );
-          }
-
-          const rawText = entry.text;
-          const label =
-            entry.kind === "stderr" ? "stderr" :
-            entry.kind === "system" ? "system" :
-            "stdout";
-          const color =
-            entry.kind === "stderr" ? "text-red-600 dark:text-red-300" :
-            entry.kind === "system" ? "text-blue-600 dark:text-blue-300" :
-            "text-neutral-500";
-          return (
-            <div key={`${entry.ts}-raw-${idx}`} className={grid}>
-              <span className={tsCell}>{time}</span>
-              <span className={cn(lblCell, color)}>{label}</span>
-              <span className={cn(contentCell, color)}>{rawText}</span>
+      <div
+        className="rounded-xl border overflow-hidden"
+        style={{ borderColor: RAIL_BORDER }}
+      >
+        <div
+          className="px-3 py-1 font-mono overflow-x-hidden"
+          style={{
+            background: `linear-gradient(180deg, rgba(255,255,255,0.02), transparent 34%), ${RAIL_PANEL}`,
+            color: RAIL_TEXT,
+            scrollbarColor: `${TONE.warn} transparent`,
+          }}
+        >
+          {logLoading && visibleTranscript.length === 0 ? (
+            <div className="py-2 text-[12px]" style={{ color: RAIL_MUTED }}>
+              Streaming transcript...
             </div>
-          )
-        })}
-        {logError && <div className="text-red-600 dark:text-red-300">{logError}</div>}
-        <div ref={logEndRef} />
+          ) : null}
+
+          {!logLoading && visibleTranscript.length === 0 && !logError ? (
+            <div className="py-2 text-[12px]" style={{ color: RAIL_MUTED }}>
+              {run.logRef ? "No transcript entries." : "No persisted transcript for this run."}
+            </div>
+          ) : null}
+
+          <TranscriptBody displayItems={displayItems} />
+
+          {logError ? (
+            <div className="py-2 text-[12px]" style={{ color: TONE.error }}>
+              {logError}
+            </div>
+          ) : null}
+        </div>
+
+        <div
+          className="flex items-center justify-between gap-4 border-t px-3 py-2 text-[11px]"
+          style={{ borderColor: RAIL_BORDER, backgroundColor: RAIL_BG, color: RAIL_MUTED }}
+        >
+          <span className="shrink-0 truncate">model {modelName}</span>
+          {workingDir && <span className="truncate text-right">{workingDir}</span>}
+        </div>
       </div>
+      <div ref={logEndRef} />
 
       {(run.status === "failed" || run.status === "timed_out") && (
         <div className="rounded-lg border border-red-300 dark:border-red-500/30 bg-red-50 dark:bg-red-950/20 p-3 space-y-2">
