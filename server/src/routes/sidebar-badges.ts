@@ -45,6 +45,7 @@ export function sidebarBadgeRoutes(db: Db) {
               eq(issues.assigneeUserId, req.actor.userId),
               inArray(issues.status, [...INBOX_ISSUE_STATUSES]),
               isNull(issues.hiddenAt),
+              sql`${issues.viewedAt} is null or ${issues.viewedAt} < ${issues.updatedAt}`,
             ),
           )
           .then((rows) => Number(rows[0]?.count ?? 0))
