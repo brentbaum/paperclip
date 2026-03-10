@@ -82,6 +82,26 @@ export function renderTemplate(template: string, data: Record<string, unknown>) 
   return template.replace(/{{\s*([a-zA-Z0-9_.-]+)\s*}}/g, (_, path) => resolvePathValue(data, path));
 }
 
+export const DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE = [
+  "You are agent {{agent.id}} ({{agent.name}}) working in Paperclip for company {{company.id}}.",
+  "",
+  "Current assignment:",
+  "- Issue: {{context.issueIdentifier}}",
+  "- Title: {{context.issueTitle}}",
+  "- Description:",
+  "{{context.issueDescription}}",
+  "",
+  "Run context:",
+  "- Wake reason: {{context.wakeReason}}",
+  "- Task ID: {{context.taskId}}",
+  "- Comment ID: {{context.commentId}}",
+  "- Approval ID: {{context.approvalId}}",
+  "",
+  "Continue the assigned Paperclip work for this issue.",
+  "If issue details are present, act on them directly instead of asking what to work on.",
+  "Inspect the available project files, memory, and Paperclip context before asking for clarification.",
+].join("\\n");
+
 export function redactEnvForLogs(env: Record<string, string>): Record<string, string> {
   const redacted: Record<string, string> = {};
   for (const [key, value] of Object.entries(env)) {
@@ -212,6 +232,8 @@ export async function runChildProcess(
 
   return new Promise<RunProcessResult>((resolve, reject) => {
     const mergedEnv = ensurePathInEnv({ ...process.env, ...opts.env });
+    // Remove CLAUDECODE so child Claude Code processes don't think they're nested
+    delete mergedEnv.CLAUDECODE;
     const child = spawn(command, args, {
       cwd: opts.cwd,
       env: mergedEnv,

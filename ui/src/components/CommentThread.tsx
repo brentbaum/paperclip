@@ -1,14 +1,20 @@
-import { memo, useEffect, useMemo, useRef, useState, type ChangeEvent } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState, type ChangeEvent } from "react";
 import { Link, useLocation } from "react-router-dom";
-import type { IssueComment, Agent } from "@paperclipai/shared";
+import type { IssueComment, Agent, IssueExecutionMode, RemoteExecutionTarget } from "@paperclipai/shared";
 import { Button } from "@/components/ui/button";
 import { Paperclip, RotateCcw } from "lucide-react";
 import { Identity } from "./Identity";
 import { InlineEntitySelector, type InlineEntityOption } from "./InlineEntitySelector";
+import { IssueExecutionControls } from "./IssueExecutionControls";
 import { MarkdownBody } from "./MarkdownBody";
 import { MarkdownEditor, type MarkdownEditorRef, type MentionOption } from "./MarkdownEditor";
 import { StatusBadge } from "./StatusBadge";
 import { formatDateTime } from "../lib/utils";
+import {
+  readLastRemoteTargetId,
+  resolvePreferredRemoteTargetId,
+  writeLastRemoteTargetId,
+} from "../lib/remoteExecutionSelection";
 
 interface CommentWithRunMeta extends IssueComment {
   runId?: string | null;
@@ -23,15 +29,17 @@ interface LinkedRunItem {
   startedAt: Date | string | null;
 }
 
-interface CommentReassignment {
+interface CommentIssueUpdate {
   assigneeAgentId: string | null;
   assigneeUserId: string | null;
+  executionMode?: IssueExecutionMode;
+  executionTargetId?: string | null;
 }
 
 interface CommentThreadProps {
   comments: CommentWithRunMeta[];
   linkedRuns?: LinkedRunItem[];
-  onAdd: (body: string, reopen?: boolean, reassignment?: CommentReassignment) => Promise<void>;
+  onAdd: (body: string, reopen?: boolean, issueUpdate?: CommentIssueUpdate) => Promise<void>;
   issueStatus?: string;
   agentMap?: Map<string, Agent>;
   imageUploadHandler?: (file: File) => Promise<string>;
@@ -42,6 +50,13 @@ interface CommentThreadProps {
   enableReassign?: boolean;
   reassignOptions?: InlineEntityOption[];
   currentAssigneeValue?: string;
+  currentAssigneeAgentId?: string | null;
+  executionMode?: IssueExecutionMode;
+  executionTargetId?: string | null;
+  executionTargets?: RemoteExecutionTarget[];
+  remoteTargetScopeKey?: string | null;
+  remoteProjectRequirementLabel?: string;
+  remoteExecutionContextReady?: boolean;
   mentions?: MentionOption[];
   /** When set, run links call this instead of navigating to the agent run page. */
   onRunClick?: (runId: string, agentId: string) => void;
@@ -81,7 +96,7 @@ function clearDraft(draftKey: string) {
   }
 }
 
-function parseReassignment(target: string): CommentReassignment | null {
+function parseReassignment(target: string): CommentIssueUpdate | null {
   if (!target || target === "__none__") {
     return { assigneeAgentId: null, assigneeUserId: null };
   }
@@ -240,6 +255,13 @@ export function CommentThread({
   enableReassign = false,
   reassignOptions = [],
   currentAssigneeValue = "",
+  currentAssigneeAgentId = null,
+  executionMode: currentExecutionMode = "default",
+  executionTargetId: currentExecutionTargetId = null,
+  executionTargets = [],
+  remoteTargetScopeKey = null,
+  remoteProjectRequirementLabel = "Agent required for remote",
+  remoteExecutionContextReady = true,
   mentions: providedMentions,
   onRunClick,
   onRetryRun,
@@ -250,6 +272,8 @@ export function CommentThread({
   const [submitting, setSubmitting] = useState(false);
   const [attaching, setAttaching] = useState(false);
   const [reassignTarget, setReassignTarget] = useState(currentAssigneeValue);
+  const [executionMode, setExecutionMode] = useState<IssueExecutionMode>(currentExecutionMode);
+  const [executionTargetId, setExecutionTargetId] = useState(currentExecutionTargetId ?? "");
   const [highlightCommentId, setHighlightCommentId] = useState<string | null>(null);
   const editorRef = useRef<MarkdownEditorRef>(null);
   const attachInputRef = useRef<HTMLInputElement | null>(null);
@@ -314,6 +338,14 @@ export function CommentThread({
     setReassignTarget(currentAssigneeValue);
   }, [currentAssigneeValue]);
 
+  useEffect(() => {
+    setExecutionMode(currentExecutionMode);
+  }, [currentExecutionMode]);
+
+  useEffect(() => {
+    setExecutionTargetId(currentExecutionTargetId ?? "");
+  }, [currentExecutionTargetId]);
+
   // Scroll to comment when URL hash matches #comment-{id}
   useEffect(() => {
     const hash = location.hash;
@@ -332,19 +364,131 @@ export function CommentThread({
     }
   }, [location.hash, comments]);
 
+  const handleMentionSelect = useCallback(
+    (option: MentionOption) => {
+      if (!enableReassign || !option.id) return;
+      // Agent mentions use kind "agent" (or no kind, which defaults to agent)
+      if (option.kind === "project") return;
+      // Match against reassignOptions using the "agent:{id}" format
+      const targetValue = `agent:${option.id}`;
+      const match = reassignOptions.find((o) => o.id === targetValue);
+      if (match) {
+        setReassignTarget(targetValue);
+      }
+    },
+    [enableReassign, reassignOptions],
+  );
+
+  const selectedAssigneeAgentId = useMemo(() => {
+    if (reassignTarget.startsWith("agent:")) {
+      return reassignTarget.slice("agent:".length) || null;
+    }
+    if (reassignTarget.startsWith("user:")) return null;
+    return currentAssigneeAgentId;
+  }, [currentAssigneeAgentId, reassignTarget]);
+
+  const selectedAssigneeAdapterType =
+    (selectedAssigneeAgentId ? agentMap?.get(selectedAssigneeAgentId)?.adapterType : null) ?? null;
+  const availableExecutionTargets = useMemo(
+    () =>
+      executionTargets.filter((target) =>
+        selectedAssigneeAdapterType ? target.supportedAdapters.includes(selectedAssigneeAdapterType) : true,
+      ),
+    [executionTargets, selectedAssigneeAdapterType],
+  );
+  const canUseRemoteExecution = Boolean(selectedAssigneeAgentId && selectedAssigneeAdapterType);
+  const remoteRequirementLabel =
+    !selectedAssigneeAgentId || !selectedAssigneeAdapterType
+      ? "Agent required for remote"
+      : remoteProjectRequirementLabel;
+
+  useEffect(() => {
+    if (!remoteExecutionContextReady) return;
+    if (!canUseRemoteExecution && executionMode === "remote" && currentExecutionMode !== "remote") {
+      setExecutionMode("default");
+      setExecutionTargetId("");
+      return;
+    }
+    if (executionMode === "default" && executionTargetId) {
+      setExecutionTargetId("");
+      return;
+    }
+    if (
+      executionMode === "remote" &&
+      (!executionTargetId ||
+        !availableExecutionTargets.some((target) => target.id === executionTargetId))
+    ) {
+      const nextTargetId = resolvePreferredRemoteTargetId(
+        availableExecutionTargets,
+        readLastRemoteTargetId(remoteTargetScopeKey),
+      );
+      setExecutionTargetId(nextTargetId);
+      if (nextTargetId) writeLastRemoteTargetId(remoteTargetScopeKey, nextTargetId);
+    }
+  }, [
+    availableExecutionTargets,
+    canUseRemoteExecution,
+    currentExecutionMode,
+    executionMode,
+    executionTargetId,
+    remoteExecutionContextReady,
+    remoteTargetScopeKey,
+  ]);
+
+  function handleExecutionModeChange(mode: IssueExecutionMode) {
+    setExecutionMode(mode);
+    if (mode !== "remote") {
+      setExecutionTargetId("");
+      return;
+    }
+    const nextTargetId = resolvePreferredRemoteTargetId(
+      availableExecutionTargets,
+      readLastRemoteTargetId(remoteTargetScopeKey),
+    );
+    setExecutionTargetId(nextTargetId);
+    if (nextTargetId) writeLastRemoteTargetId(remoteTargetScopeKey, nextTargetId);
+  }
+
+  function handleExecutionTargetChange(targetId: string) {
+    setExecutionTargetId(targetId);
+    writeLastRemoteTargetId(remoteTargetScopeKey, targetId);
+  }
+
   async function handleSubmit() {
     const trimmed = body.trim();
     if (!trimmed) return;
     const hasReassignment = enableReassign && reassignTarget !== currentAssigneeValue;
     const reassignment = hasReassignment ? parseReassignment(reassignTarget) : null;
+    const issueUpdate: CommentIssueUpdate = reassignment ?? {
+      assigneeAgentId: currentAssigneeAgentId,
+      assigneeUserId: currentAssigneeValue.startsWith("user:")
+        ? currentAssigneeValue.slice("user:".length) || null
+        : null,
+    };
+
+    if (executionMode !== currentExecutionMode) {
+      issueUpdate.executionMode = executionMode;
+    }
+    if (executionMode === "remote") {
+      const nextTargetId = executionTargetId || null;
+      if (nextTargetId !== (currentExecutionTargetId ?? null)) {
+        issueUpdate.executionTargetId = nextTargetId;
+      }
+    } else if (currentExecutionTargetId) {
+      issueUpdate.executionTargetId = null;
+    }
+
+    const hasIssueUpdate =
+      Boolean(reassignment) ||
+      issueUpdate.executionMode !== undefined ||
+      issueUpdate.executionTargetId !== undefined;
 
     setSubmitting(true);
     try {
-      await onAdd(trimmed, isClosed && reopen ? true : undefined, reassignment ?? undefined);
+      await onAdd(trimmed, isClosed && reopen ? true : undefined, hasIssueUpdate ? issueUpdate : undefined);
       setBody("");
       if (draftKey) clearDraft(draftKey);
       setReopen(false);
-      setReassignTarget(currentAssigneeValue);
     } finally {
       setSubmitting(false);
     }
@@ -362,7 +506,10 @@ export function CommentThread({
     }
   }
 
-  const canSubmit = !submitting && !!body.trim();
+  const canSubmit =
+    !submitting &&
+    !!body.trim() &&
+    (executionMode !== "remote" || Boolean(executionTargetId));
 
   return (
     <div className="space-y-4">
@@ -380,10 +527,11 @@ export function CommentThread({
           placeholder="Leave a comment..."
           mentions={mentions}
           onSubmit={handleSubmit}
+          onMentionSelect={handleMentionSelect}
           imageUploadHandler={imageUploadHandler}
           contentClassName="min-h-[60px] text-sm"
         />
-        <div className="flex items-center justify-end gap-3">
+        <div className="flex items-center justify-end gap-2 flex-wrap">
           {onAttachImage && (
             <div className="mr-auto flex items-center gap-3">
               <input
@@ -427,6 +575,19 @@ export function CommentThread({
               className="text-xs h-8"
             />
           )}
+          <IssueExecutionControls
+            executionMode={executionMode}
+            executionTargetId={executionTargetId}
+            onExecutionModeChange={handleExecutionModeChange}
+            onExecutionTargetChange={handleExecutionTargetChange}
+            targets={availableExecutionTargets}
+            canUseRemote={canUseRemoteExecution}
+            size="sm"
+            triggerClassName="h-8 text-xs"
+            textClassName="text-xs"
+            showPrefix={false}
+            remoteRequirementLabel={remoteRequirementLabel}
+          />
           <Button size="sm" disabled={!canSubmit} onClick={handleSubmit}>
             {submitting ? "Posting..." : "Comment"}
           </Button>

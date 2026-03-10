@@ -158,6 +158,9 @@ importers:
       drizzle-orm:
         specifier: ^0.38.4
         version: 0.38.4(@electric-sql/pglite@0.3.15)(@types/react@19.2.14)(kysely@0.28.11)(pg@8.18.0)(postgres@3.4.8)(react@19.2.4)
+      embedded-postgres:
+        specifier: ^18.1.0-beta.16
+        version: 18.1.0-beta.16
       postgres:
         specifier: ^3.4.5
         version: 3.4.8
@@ -174,6 +177,15 @@ importers:
       vitest:
         specifier: ^3.0.5
         version: 3.2.4(@types/debug@4.1.12)(@types/node@25.3.5)(jiti@2.6.1)(lightningcss@1.30.2)(terser@5.46.0)(tsx@4.21.0)
+
+  packages/remote-worker:
+    devDependencies:
+      '@types/node':
+        specifier: ^25.3.3
+        version: 25.3.5
+      typescript:
+        specifier: ^5.7.3
+        version: 5.9.3
 
   packages/shared:
     dependencies:
@@ -9989,7 +10001,7 @@ snapshots:
 
   '@types/express-serve-static-core@5.1.1':
     dependencies:
-      '@types/node': 25.2.3
+      '@types/node': 25.3.5
       '@types/qs': 6.14.0
       '@types/range-parser': 1.2.7
       '@types/send': 1.2.1

@@ -52,6 +52,7 @@ export type { LiveEvent } from "./live.js";
 export type { DashboardSummary } from "./dashboard.js";
 export type { ActivityEvent } from "./activity.js";
 export type { SidebarBadges } from "./sidebar-badges.js";
+export type { RemoteExecutionTarget, RemoteExecutionLease } from "./remote-execution.js";
 export type {
   CompanyMembership,
   PrincipalPermissionGrant,

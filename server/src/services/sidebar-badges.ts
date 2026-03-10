@@ -1,10 +1,29 @@
-import { and, desc, eq, inArray, not, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, isNull, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { agents, approvals, heartbeatRuns } from "@paperclipai/db";
+import { approvals, heartbeatRuns } from "@paperclipai/db";
 import type { SidebarBadges } from "@paperclipai/shared";
 
 const ACTIONABLE_APPROVAL_STATUSES = ["pending", "revision_requested"];
 const FAILED_HEARTBEAT_STATUSES = ["failed", "timed_out"];
+
+export function countInboxStyleFailedRuns(
+  runs: Array<{ agentId: string; status: string; createdAt: Date | string }>,
+) {
+  const latestByAgent = new Map<string, string>();
+  const sorted = [...runs].sort(
+    (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime(),
+  );
+
+  for (const run of sorted) {
+    if (!latestByAgent.has(run.agentId)) {
+      latestByAgent.set(run.agentId, run.status);
+    }
+  }
+
+  return [...latestByAgent.values()].filter((status) =>
+    FAILED_HEARTBEAT_STATUSES.includes(status),
+  ).length;
+}
 
 export function sidebarBadgeService(db: Db) {
   return {
@@ -25,22 +44,26 @@ export function sidebarBadgeService(db: Db) {
 
       const latestRunByAgent = await db
         .selectDistinctOn([heartbeatRuns.agentId], {
+          agentId: heartbeatRuns.agentId,
           runStatus: heartbeatRuns.status,
+          createdAt: heartbeatRuns.createdAt,
         })
         .from(heartbeatRuns)
-        .innerJoin(agents, eq(heartbeatRuns.agentId, agents.id))
         .where(
           and(
             eq(heartbeatRuns.companyId, companyId),
-            eq(agents.companyId, companyId),
-            not(eq(agents.status, "terminated")),
+            isNull(heartbeatRuns.dismissedAt),
           ),
         )
         .orderBy(heartbeatRuns.agentId, desc(heartbeatRuns.createdAt));
 
-      const failedRuns = latestRunByAgent.filter((row) =>
-        FAILED_HEARTBEAT_STATUSES.includes(row.runStatus),
-      ).length;
+      const failedRuns = countInboxStyleFailedRuns(
+        latestRunByAgent.map((row) => ({
+          agentId: row.agentId,
+          status: row.runStatus,
+          createdAt: row.createdAt,
+        })),
+      );
 
       const joinRequests = extra?.joinRequests ?? 0;
       const assignedIssues = extra?.assignedIssues ?? 0;

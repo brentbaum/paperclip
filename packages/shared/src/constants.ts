@@ -98,6 +98,12 @@ export type IssueStatus = (typeof ISSUE_STATUSES)[number];
 export const ISSUE_PRIORITIES = ["critical", "high", "medium", "low"] as const;
 export type IssuePriority = (typeof ISSUE_PRIORITIES)[number];
 
+export const ISSUE_EXECUTION_MODES = ["default", "remote"] as const;
+export type IssueExecutionMode = (typeof ISSUE_EXECUTION_MODES)[number];
+
+export const REMOTE_EXECUTION_LEASE_STATUSES = ["active", "expired", "destroyed", "error"] as const;
+export type RemoteExecutionLeaseStatus = (typeof REMOTE_EXECUTION_LEASE_STATUSES)[number];
+
 export const GOAL_LEVELS = ["company", "team", "agent", "task"] as const;
 export type GoalLevel = (typeof GOAL_LEVELS)[number];
 

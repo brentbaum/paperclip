@@ -7,6 +7,7 @@ import { heartbeatsApi } from "../api/heartbeats";
 import { agentsApi } from "../api/agents";
 import { authApi } from "../api/auth";
 import { projectsApi } from "../api/projects";
+import { remoteExecutionApi } from "../api/remoteExecution";
 import { useCompany } from "../context/CompanyContext";
 import { useSidebar } from "../context/SidebarContext";
 import { useToast } from "../context/ToastContext";
@@ -51,9 +52,11 @@ import {
 import type { ActivityEvent } from "@paperclipai/shared";
 import type { Agent, IssueAttachment } from "@paperclipai/shared";
 
-type CommentReassignment = {
+type CommentIssueUpdate = {
   assigneeAgentId: string | null;
   assigneeUserId: string | null;
+  executionMode?: "default" | "remote";
+  executionTargetId?: string | null;
 };
 
 const ACTION_LABELS: Record<string, string> = {
@@ -254,6 +257,11 @@ export function IssueDetail() {
     queryFn: () => agentsApi.list(selectedCompanyId!),
     enabled: !!selectedCompanyId,
   });
+  const { data: remoteExecutionTargets } = useQuery({
+    queryKey: queryKeys.remoteExecution.targets(selectedCompanyId!),
+    queryFn: () => remoteExecutionApi.listTargets(selectedCompanyId!),
+    enabled: !!selectedCompanyId,
+  });
 
   const { data: session } = useQuery({
     queryKey: queryKeys.auth.session,
@@ -329,6 +337,11 @@ export function IssueDetail() {
     if (issue?.assigneeUserId) return `user:${issue.assigneeUserId}`;
     return "";
   }, [issue?.assigneeAgentId, issue?.assigneeUserId]);
+  const remoteExecutionContextReady =
+    !!issue &&
+    agents !== undefined &&
+    projects !== undefined &&
+    remoteExecutionTargets !== undefined;
 
   const commentsWithRunMeta = useMemo(() => {
     const runMetaByCommentId = new Map<string, { runId: string; runAgentId: string | null }>();
@@ -438,20 +451,22 @@ export function IssueDetail() {
     },
   });
 
-  const addCommentAndReassign = useMutation({
+  const addCommentAndUpdateIssue = useMutation({
     mutationFn: ({
       body,
       reopen,
-      reassignment,
+      issueUpdate,
     }: {
       body: string;
       reopen?: boolean;
-      reassignment: CommentReassignment;
+      issueUpdate: CommentIssueUpdate;
     }) =>
       issuesApi.update(issueId!, {
         comment: body,
-        assigneeAgentId: reassignment.assigneeAgentId,
-        assigneeUserId: reassignment.assigneeUserId,
+        assigneeAgentId: issueUpdate.assigneeAgentId,
+        assigneeUserId: issueUpdate.assigneeUserId,
+        ...(issueUpdate.executionMode ? { executionMode: issueUpdate.executionMode } : {}),
+        ...(issueUpdate.executionTargetId !== undefined ? { executionTargetId: issueUpdate.executionTargetId } : {}),
         ...(reopen ? { status: "todo" } : {}),
       }),
     onSuccess: (updated) => {
@@ -894,10 +909,16 @@ export function IssueDetail() {
             enableReassign
             reassignOptions={commentReassignOptions}
             currentAssigneeValue={currentAssigneeValue}
+            currentAssigneeAgentId={issue.assigneeAgentId}
+            executionMode={issue.executionMode}
+            executionTargetId={issue.executionTargetId}
+            executionTargets={remoteExecutionTargets ?? []}
+            remoteTargetScopeKey={selectedCompanyId ?? issue.companyId}
+            remoteExecutionContextReady={remoteExecutionContextReady}
             mentions={mentionOptions}
-            onAdd={async (body, reopen, reassignment) => {
-              if (reassignment) {
-                await addCommentAndReassign.mutateAsync({ body, reopen, reassignment });
+            onAdd={async (body, reopen, issueUpdate) => {
+              if (issueUpdate) {
+                await addCommentAndUpdateIssue.mutateAsync({ body, reopen, issueUpdate });
                 return;
               }
               await addComment.mutateAsync({ body, reopen });

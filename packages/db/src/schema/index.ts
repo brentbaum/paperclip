@@ -14,6 +14,8 @@ export { agentWakeupRequests } from "./agent_wakeup_requests.js";
 export { projects } from "./projects.js";
 export { projectWorkspaces } from "./project_workspaces.js";
 export { projectGoals } from "./project_goals.js";
+export { remoteExecutionTargets } from "./remote_execution_targets.js";
+export { remoteExecutionLeases } from "./remote_execution_leases.js";
 export { documents, documentRevisions, documentAgentStates } from "./documents.js";
 export { goals } from "./goals.js";
 export { issues } from "./issues.js";

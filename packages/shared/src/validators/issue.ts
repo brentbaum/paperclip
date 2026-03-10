@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { ISSUE_PRIORITIES, ISSUE_STATUSES } from "../constants.js";
+import { ISSUE_EXECUTION_MODES, ISSUE_PRIORITIES, ISSUE_STATUSES } from "../constants.js";
 
 export const issueAssigneeAdapterOverridesSchema = z
   .object({
@@ -8,7 +8,7 @@ export const issueAssigneeAdapterOverridesSchema = z
   })
   .strict();
 
-export const createIssueSchema = z.object({
+const issueBaseSchema = z.object({
   projectId: z.string().uuid().optional().nullable(),
   goalId: z.string().uuid().optional().nullable(),
   parentId: z.string().uuid().optional().nullable(),
@@ -16,6 +16,8 @@ export const createIssueSchema = z.object({
   description: z.string().optional().nullable(),
   status: z.enum(ISSUE_STATUSES).optional().default("backlog"),
   priority: z.enum(ISSUE_PRIORITIES).optional().default("medium"),
+  executionMode: z.enum(ISSUE_EXECUTION_MODES).optional().default("default"),
+  executionTargetId: z.string().uuid().optional().nullable(),
   assigneeAgentId: z.string().uuid().optional().nullable(),
   assigneeUserId: z.string().optional().nullable(),
   requestDepth: z.number().int().nonnegative().optional().default(0),
@@ -23,6 +25,25 @@ export const createIssueSchema = z.object({
   assigneeAdapterOverrides: issueAssigneeAdapterOverridesSchema.optional().nullable(),
   labelIds: z.array(z.string().uuid()).optional(),
 });
+
+export const createIssueSchema = issueBaseSchema
+  .superRefine((value, ctx) => {
+    if (value.executionMode !== "remote") return;
+    if (!value.assigneeAgentId) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["assigneeAgentId"],
+        message: "Remote execution requires an agent assignee",
+      });
+    }
+    if (!value.executionTargetId) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["executionTargetId"],
+        message: "Remote execution requires an execution target",
+      });
+    }
+  });
 
 export type CreateIssue = z.infer<typeof createIssueSchema>;
 
@@ -33,7 +54,7 @@ export const createIssueLabelSchema = z.object({
 
 export type CreateIssueLabel = z.infer<typeof createIssueLabelSchema>;
 
-export const updateIssueSchema = createIssueSchema.partial().extend({
+export const updateIssueSchema = issueBaseSchema.partial().extend({
   comment: z.string().min(1).optional(),
   hiddenAt: z.string().datetime().nullable().optional(),
 });

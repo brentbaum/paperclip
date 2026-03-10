@@ -26,6 +26,7 @@ import { createApp } from "./app.js";
 import { loadConfig } from "./config.js";
 import { logger } from "./middleware/logger.js";
 import { setupLiveEventsWebSocketServer } from "./realtime/live-events-ws.js";
+import { HEARTBEAT_ORPHAN_REAP_STALE_THRESHOLD_MS } from "./services/heartbeat.js";
 import { agentService, approvalService, companyService, heartbeatService, issueService, telegramService } from "./services/index.js";
 import { createStorageServiceFromConfig } from "./storage/index.js";
 import { printStartupBanner } from "./startup-banner.js";
@@ -478,6 +479,7 @@ const app = await createApp(db as any, {
   deploymentExposure: config.deploymentExposure,
   allowedHostnames: config.allowedHostnames,
   bindHost: config.host,
+  tailscaleServe: config.tailscaleServe,
   authReady,
   companyDeletionEnabled: config.companyDeletionEnabled,
   telegramService: telegram,
@@ -506,8 +508,7 @@ setupLiveEventsWebSocketServer(server, db as any, {
 });
 
 if (config.heartbeatSchedulerEnabled) {
-  // Reap orphaned runs at startup (no threshold -- runningProcesses is empty)
-  void heartbeat.reapOrphanedRuns().catch((err) => {
+  void heartbeat.reapOrphanedRuns({ staleThresholdMs: HEARTBEAT_ORPHAN_REAP_STALE_THRESHOLD_MS }).catch((err) => {
     logger.error({ err }, "startup reap of orphaned heartbeat runs failed");
   });
 
@@ -523,9 +524,8 @@ if (config.heartbeatSchedulerEnabled) {
         logger.error({ err }, "heartbeat timer tick failed");
       });
 
-    // Periodically reap orphaned runs (5-min staleness threshold)
     void heartbeat
-      .reapOrphanedRuns({ staleThresholdMs: 5 * 60 * 1000 })
+      .reapOrphanedRuns({ staleThresholdMs: HEARTBEAT_ORPHAN_REAP_STALE_THRESHOLD_MS })
       .catch((err) => {
         logger.error({ err }, "periodic reap of orphaned heartbeat runs failed");
       });

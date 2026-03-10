@@ -26,6 +26,7 @@ import { llmRoutes } from "./routes/llms.js";
 import { assetRoutes } from "./routes/assets.js";
 import { accessRoutes } from "./routes/access.js";
 import { telegramRoutes } from "./routes/telegram.js";
+import { remoteExecutionRoutes } from "./routes/remote-execution.js";
 import type { BetterAuthSessionResult } from "./auth/better-auth.js";
 import type { TelegramService } from "./services/telegram.js";
 
@@ -40,6 +41,7 @@ export async function createApp(
     deploymentExposure: DeploymentExposure;
     allowedHostnames: string[];
     bindHost: string;
+    tailscaleServe: boolean;
     authReady: boolean;
     companyDeletionEnabled: boolean;
     telegramService?: Pick<TelegramService, "sendToAgentTopic">;
@@ -120,6 +122,7 @@ export async function createApp(
   api.use(activityRoutes(db));
   api.use(dashboardRoutes(db));
   api.use(sidebarBadgeRoutes(db));
+  api.use(remoteExecutionRoutes(db));
   api.use(
     accessRoutes(db, {
       deploymentMode: opts.deploymentMode,
@@ -161,7 +164,9 @@ export async function createApp(
       appType: "spa",
       server: {
         middlewareMode: true,
-        allowedHosts: privateHostnameGateEnabled ? Array.from(privateHostnameAllowSet) : undefined,
+        allowedHosts: opts.tailscaleServe
+          ? true
+          : privateHostnameGateEnabled ? Array.from(privateHostnameAllowSet) : undefined,
       },
     });
 

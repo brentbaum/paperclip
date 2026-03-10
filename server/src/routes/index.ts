@@ -14,3 +14,4 @@ export { sidebarBadgeRoutes } from "./sidebar-badges.js";
 export { llmRoutes } from "./llms.js";
 export { accessRoutes } from "./access.js";
 export { telegramRoutes } from "./telegram.js";
+export { remoteExecutionRoutes } from "./remote-execution.js";

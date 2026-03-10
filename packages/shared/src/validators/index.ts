@@ -133,6 +133,17 @@ export {
 } from "./asset.js";
 
 export {
+  testRemoteExecutionTargetSchema,
+  createRemoteExecutionTargetSchema,
+  updateRemoteExecutionTargetSchema,
+  updateRemoteExecutionLeaseSchema,
+  type TestRemoteExecutionTarget,
+  type CreateRemoteExecutionTarget,
+  type UpdateRemoteExecutionTarget,
+  type UpdateRemoteExecutionLease,
+} from "./remote-execution.js";
+
+export {
   createCompanyInviteSchema,
   acceptInviteSchema,
   listJoinRequestsQuerySchema,

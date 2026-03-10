@@ -9,6 +9,7 @@ import {
   asNumber,
   asBoolean,
   asStringArray,
+  DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
   parseObject,
   parseJson,
   buildPaperclipEnv,
@@ -115,6 +116,8 @@ interface ClaudeRuntimeConfig {
   graceSec: number;
   extraArgs: string[];
 }
+
+type ProcessRunner = typeof runChildProcess;
 
 function buildLoginResult(input: {
   proc: RunProcessResult;
@@ -293,6 +296,17 @@ export async function runClaudeLogin(input: {
   authToken?: string;
   onLog?: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
 }) {
+  return runClaudeLoginWithProcessRunner(input, runChildProcess);
+}
+
+export async function runClaudeLoginWithProcessRunner(input: {
+  runId: string;
+  agent: AdapterExecutionContext["agent"];
+  config: Record<string, unknown>;
+  context?: Record<string, unknown>;
+  authToken?: string;
+  onLog?: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
+}, processRunner: ProcessRunner) {
   const onLog = input.onLog ?? (async () => {});
   const runtime = await buildClaudeRuntimeConfig({
     runId: input.runId,
@@ -302,7 +316,7 @@ export async function runClaudeLogin(input: {
     authToken: input.authToken,
   });
 
-  const proc = await runChildProcess(input.runId, runtime.command, ["login"], {
+  const proc = await processRunner(input.runId, runtime.command, ["login"], {
     cwd: runtime.cwd,
     env: runtime.env,
     timeoutSec: runtime.timeoutSec,
@@ -322,12 +336,15 @@ export async function runClaudeLogin(input: {
   });
 }
 
-export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
+export async function executeWithProcessRunner(
+  ctx: AdapterExecutionContext,
+  processRunner: ProcessRunner,
+): Promise<AdapterExecutionResult> {
   const { runId, agent, runtime, config, context, onLog, onMeta, authToken } = ctx;
 
   const promptTemplate = asString(
     config.promptTemplate,
-    "You are agent {{agent.id}} ({{agent.name}}). Continue your Paperclip work.",
+    DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
   );
   const model = asString(config.model, "");
   const effort = asString(config.effort, "");
@@ -447,7 +464,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       });
     }
 
-    const proc = await runChildProcess(runId, command, args, {
+    const proc = await processRunner(runId, command, args, {
       cwd,
       env,
       stdin: promptWithWakeContext,
@@ -580,4 +597,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   } finally {
     fs.rm(skillsDir, { recursive: true, force: true }).catch(() => {});
   }
+}
+
+export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
+  return executeWithProcessRunner(ctx, runChildProcess);
 }

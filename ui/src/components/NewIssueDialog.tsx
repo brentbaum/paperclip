@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef, useCallback, useMemo, type ChangeEvent } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import type { IssueExecutionMode } from "@paperclipai/shared";
 import { useDialog } from "../context/DialogContext";
 import { useCompany } from "../context/CompanyContext";
 import { useToast } from "../context/ToastContext";
@@ -8,7 +9,13 @@ import { projectsApi } from "../api/projects";
 import { agentsApi } from "../api/agents";
 import { authApi } from "../api/auth";
 import { assetsApi } from "../api/assets";
+import { remoteExecutionApi } from "../api/remoteExecution";
 import { queryKeys } from "../lib/queryKeys";
+import {
+  readLastRemoteTargetId,
+  resolvePreferredRemoteTargetId,
+  writeLastRemoteTargetId,
+} from "../lib/remoteExecutionSelection";
 import { useProjectOrder } from "../hooks/useProjectOrder";
 import {
   Dialog,
@@ -40,6 +47,7 @@ import { issueStatusText, issueStatusTextDefault, priorityColor, priorityColorDe
 import { MarkdownEditor, type MarkdownEditorRef, type MentionOption } from "./MarkdownEditor";
 import { AgentIcon } from "./AgentIconPicker";
 import { InlineEntitySelector, type InlineEntityOption } from "./InlineEntitySelector";
+import { IssueExecutionControls } from "./IssueExecutionControls";
 
 const DRAFT_KEY = "paperclip:issue-draft";
 const LAST_ASSIGNEE_KEY = "paperclip:last-assignee";
@@ -62,6 +70,8 @@ interface IssueDraft {
   priority: string;
   assigneeId: string;
   projectId: string;
+  executionMode: IssueExecutionMode;
+  executionTargetId: string;
   assigneeModelOverride: string;
   assigneeThinkingEffort: string;
   assigneeChrome: boolean;
@@ -175,6 +185,8 @@ export function NewIssueDialog() {
   const [priority, setPriority] = useState("");
   const [assigneeId, setAssigneeId] = useState("");
   const [projectId, setProjectId] = useState("");
+  const [executionMode, setExecutionMode] = useState<IssueExecutionMode>("default");
+  const [executionTargetId, setExecutionTargetId] = useState("");
   const [assigneeOptionsOpen, setAssigneeOptionsOpen] = useState(false);
   const [assigneeModelOverride, setAssigneeModelOverride] = useState("");
   const [assigneeThinkingEffort, setAssigneeThinkingEffort] = useState("");
@@ -212,6 +224,16 @@ export function NewIssueDialog() {
     queryKey: queryKeys.auth.session,
     queryFn: () => authApi.getSession(),
   });
+  const { data: remoteExecutionTargets } = useQuery({
+    queryKey: queryKeys.remoteExecution.targets(effectiveCompanyId!),
+    queryFn: () => remoteExecutionApi.listTargets(effectiveCompanyId!),
+    enabled: !!effectiveCompanyId && newIssueOpen,
+  });
+  const remoteExecutionContextReady =
+    !newIssueOpen ||
+    (agents !== undefined &&
+      projects !== undefined &&
+      remoteExecutionTargets !== undefined);
   const currentUserId = session?.user?.id ?? session?.session?.userId ?? null;
   const { orderedProjects } = useProjectOrder({
     projects: projects ?? [],
@@ -220,6 +242,16 @@ export function NewIssueDialog() {
   });
 
   const assigneeAdapterType = (agents ?? []).find((agent) => agent.id === assigneeId)?.adapterType ?? null;
+  const currentProject = orderedProjects.find((project) => project.id === projectId);
+  const availableExecutionTargets = useMemo(
+    () =>
+      (remoteExecutionTargets ?? []).filter((target) =>
+        assigneeAdapterType ? target.supportedAdapters.includes(assigneeAdapterType) : true,
+      ),
+    [remoteExecutionTargets, assigneeAdapterType],
+  );
+  const canUseRemoteExecution = Boolean(assigneeId && assigneeAdapterType);
+  const remoteRequirementLabel = "Remote requires an agent assignee";
   const supportsAssigneeOverrides = Boolean(
     assigneeAdapterType && ISSUE_OVERRIDE_ADAPTER_TYPES.has(assigneeAdapterType),
   );
@@ -301,6 +333,8 @@ export function NewIssueDialog() {
       priority,
       assigneeId,
       projectId,
+      executionMode,
+      executionTargetId,
       assigneeModelOverride,
       assigneeThinkingEffort,
       assigneeChrome,
@@ -313,6 +347,8 @@ export function NewIssueDialog() {
     priority,
     assigneeId,
     projectId,
+    executionMode,
+    executionTargetId,
     assigneeModelOverride,
     assigneeThinkingEffort,
     assigneeChrome,
@@ -334,6 +370,8 @@ export function NewIssueDialog() {
       setPriority(draft.priority);
       setAssigneeId(newIssueDefaults.assigneeAgentId ?? draft.assigneeId);
       setProjectId(newIssueDefaults.projectId ?? draft.projectId);
+      setExecutionMode(draft.executionMode ?? "default");
+      setExecutionTargetId(draft.executionTargetId ?? "");
       setAssigneeModelOverride(draft.assigneeModelOverride ?? "");
       setAssigneeThinkingEffort(draft.assigneeThinkingEffort ?? "");
       setAssigneeChrome(draft.assigneeChrome ?? false);
@@ -343,12 +381,46 @@ export function NewIssueDialog() {
       setPriority(newIssueDefaults.priority ?? "");
       setProjectId(newIssueDefaults.projectId ?? "");
       setAssigneeId(newIssueDefaults.assigneeAgentId ?? localStorage.getItem(LAST_ASSIGNEE_KEY) ?? "");
+      setExecutionMode("default");
+      setExecutionTargetId("");
       setAssigneeModelOverride("");
       setAssigneeThinkingEffort("");
       setAssigneeChrome(false);
       setAssigneeUseProjectWorkspace(true);
     }
   }, [newIssueOpen, newIssueDefaults]);
+
+  useEffect(() => {
+    if (!remoteExecutionContextReady) return;
+    if (!canUseRemoteExecution && executionMode === "remote") {
+      setExecutionMode("default");
+      setExecutionTargetId("");
+      return;
+    }
+    if (executionMode === "default" && executionTargetId) {
+      setExecutionTargetId("");
+      return;
+    }
+    if (
+      executionMode === "remote" &&
+      (!executionTargetId ||
+        !availableExecutionTargets.some((target) => target.id === executionTargetId))
+    ) {
+      const nextTargetId = resolvePreferredRemoteTargetId(
+        availableExecutionTargets,
+        readLastRemoteTargetId(effectiveCompanyId),
+      );
+      setExecutionTargetId(nextTargetId);
+      if (nextTargetId) writeLastRemoteTargetId(effectiveCompanyId, nextTargetId);
+    }
+  }, [
+    availableExecutionTargets,
+    canUseRemoteExecution,
+    effectiveCompanyId,
+    executionMode,
+    executionTargetId,
+    remoteExecutionContextReady,
+  ]);
 
   useEffect(() => {
     if (!supportsAssigneeOverrides) {
@@ -385,6 +457,8 @@ export function NewIssueDialog() {
     setPriority("");
     setAssigneeId("");
     setProjectId("");
+    setExecutionMode("default");
+    setExecutionTargetId("");
     setAssigneeOptionsOpen(false);
     setAssigneeModelOverride("");
     setAssigneeThinkingEffort("");
@@ -400,6 +474,8 @@ export function NewIssueDialog() {
     setDialogCompanyId(companyId);
     setAssigneeId("");
     setProjectId("");
+    setExecutionMode("default");
+    setExecutionTargetId("");
     setAssigneeModelOverride("");
     setAssigneeThinkingEffort("");
     setAssigneeChrome(false);
@@ -414,6 +490,7 @@ export function NewIssueDialog() {
 
   function handleSubmit() {
     if (!effectiveCompanyId || !title.trim()) return;
+    if (executionMode === "remote" && !executionTargetId) return;
     const assigneeAdapterOverrides = buildAssigneeAdapterOverrides({
       adapterType: assigneeAdapterType,
       modelOverride: assigneeModelOverride,
@@ -427,6 +504,8 @@ export function NewIssueDialog() {
       description: description.trim() || undefined,
       status,
       priority: priority || "medium",
+      executionMode,
+      ...(executionMode === "remote" ? { executionTargetId } : {}),
       ...(assigneeId ? { assigneeAgentId: assigneeId } : {}),
       ...(projectId ? { projectId } : {}),
       ...(assigneeAdapterOverrides ? { assigneeAdapterOverrides } : {}),
@@ -459,7 +538,10 @@ export function NewIssueDialog() {
   const currentStatus = statuses.find((s) => s.value === status) ?? statuses[1]!;
   const currentPriority = priorities.find((p) => p.value === priority);
   const currentAssignee = (agents ?? []).find((a) => a.id === assigneeId);
-  const currentProject = orderedProjects.find((project) => project.id === projectId);
+  const canCreateIssue =
+    !!title.trim() &&
+    !createIssue.isPending &&
+    (executionMode !== "remote" || Boolean(executionTargetId));
   const assigneeOptionsTitle =
     assigneeAdapterType === "claude_local"
       ? "Claude options"
@@ -503,6 +585,25 @@ export function NewIssueDialog() {
       })),
     [assigneeAdapterModels],
   );
+
+  function handleExecutionModeChange(mode: IssueExecutionMode) {
+    setExecutionMode(mode);
+    if (mode !== "remote") {
+      setExecutionTargetId("");
+      return;
+    }
+    const nextTargetId = resolvePreferredRemoteTargetId(
+      availableExecutionTargets,
+      readLastRemoteTargetId(effectiveCompanyId),
+    );
+    setExecutionTargetId(nextTargetId);
+    if (nextTargetId) writeLastRemoteTargetId(effectiveCompanyId, nextTargetId);
+  }
+
+  function handleExecutionTargetChange(targetId: string) {
+    setExecutionTargetId(targetId);
+    writeLastRemoteTargetId(effectiveCompanyId, targetId);
+  }
 
   return (
     <Dialog
@@ -628,8 +729,8 @@ export function NewIssueDialog() {
         </div>
 
         <div className="px-4 pb-2 shrink-0">
-          <div className="overflow-x-auto">
-            <div className="inline-flex min-w-max items-center gap-2 text-sm text-muted-foreground">
+          <div className="space-y-2">
+            <div className="flex min-w-0 items-center gap-2 text-sm text-muted-foreground flex-wrap">
               <span>For</span>
               <InlineEntitySelector
                 ref={assigneeSelectorRef}
@@ -664,7 +765,20 @@ export function NewIssueDialog() {
                   );
                 }}
               />
-              <span>in</span>
+              <IssueExecutionControls
+                executionMode={executionMode}
+                executionTargetId={executionTargetId}
+                onExecutionModeChange={handleExecutionModeChange}
+                onExecutionTargetChange={handleExecutionTargetChange}
+                targets={availableExecutionTargets}
+                canUseRemote={canUseRemoteExecution}
+                triggerClassName="h-8"
+                textClassName="text-sm"
+                remoteRequirementLabel={remoteRequirementLabel}
+              />
+            </div>
+            <div className="flex min-w-0 items-center gap-2 text-sm text-muted-foreground">
+              <span>In</span>
               <InlineEntitySelector
                 ref={projectSelectorRef}
                 value={projectId}
@@ -677,6 +791,7 @@ export function NewIssueDialog() {
                 onConfirm={() => {
                   descriptionEditorRef.current?.focus();
                 }}
+                className="min-w-0 flex-1 justify-start"
                 renderTriggerValue={(option) =>
                   option && currentProject ? (
                     <>
@@ -923,7 +1038,7 @@ export function NewIssueDialog() {
           </Button>
           <Button
             size="sm"
-            disabled={!title.trim() || createIssue.isPending}
+            disabled={!canCreateIssue}
             onClick={handleSubmit}
           >
             {createIssue.isPending ? "Creating..." : "Create Issue"}

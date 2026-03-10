@@ -8,6 +8,7 @@ import {
   asNumber,
   asBoolean,
   asStringArray,
+  DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
   parseObject,
   buildPaperclipEnv,
   redactEnvForLogs,
@@ -136,12 +137,17 @@ async function ensureCodexSkillsInjected(onLog: AdapterExecutionContext["onLog"]
   }
 }
 
-export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
+type ProcessRunner = typeof runChildProcess;
+
+export async function executeWithProcessRunner(
+  ctx: AdapterExecutionContext,
+  processRunner: ProcessRunner,
+): Promise<AdapterExecutionResult> {
   const { runId, agent, runtime, config, context, onLog, onMeta, authToken } = ctx;
 
   const promptTemplate = asString(
     config.promptTemplate,
-    "You are agent {{agent.id}} ({{agent.name}}). Continue your Paperclip work.",
+    DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
   );
   const command = asString(config.command, "codex");
   const model = asString(config.model, "");
@@ -368,7 +374,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       });
     }
 
-    const proc = await runChildProcess(runId, command, args, {
+    const proc = await processRunner(runId, command, args, {
       cwd,
       env,
       stdin: prompt,
@@ -467,4 +473,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   }
 
   return toResult(initial);
+}
+
+export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
+  return executeWithProcessRunner(ctx, runChildProcess);
 }

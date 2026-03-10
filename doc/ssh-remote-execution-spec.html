@@ -1,0 +1,688 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Paperclip Remote Execution Spec</title>
+    <style>
+      :root {
+        --bg: #f3eee4;
+        --paper: rgba(255, 250, 241, 0.86);
+        --paper-strong: #fffaf1;
+        --ink: #1d1a17;
+        --muted: #5a534d;
+        --line: rgba(29, 26, 23, 0.12);
+        --accent: #9a3412;
+        --accent-soft: rgba(154, 52, 18, 0.12);
+        --accent-2: #1f6f5f;
+        --accent-2-soft: rgba(31, 111, 95, 0.12);
+        --shadow: 0 24px 80px rgba(55, 39, 22, 0.12);
+        --radius-xl: 28px;
+        --radius-lg: 20px;
+        --radius-md: 14px;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      html {
+        scroll-behavior: smooth;
+      }
+
+      body {
+        margin: 0;
+        color: var(--ink);
+        background:
+          radial-gradient(circle at top left, rgba(191, 114, 81, 0.18), transparent 28%),
+          radial-gradient(circle at 85% 12%, rgba(31, 111, 95, 0.14), transparent 22%),
+          linear-gradient(180deg, #efe7d9 0%, #f6f1e8 48%, #eee6d8 100%);
+        font-family: "Avenir Next", "Segoe UI", "Helvetica Neue", sans-serif;
+        line-height: 1.5;
+      }
+
+      body::before {
+        content: "";
+        position: fixed;
+        inset: 0;
+        pointer-events: none;
+        background-image:
+          linear-gradient(rgba(255, 255, 255, 0.05) 1px, transparent 1px),
+          linear-gradient(90deg, rgba(255, 255, 255, 0.05) 1px, transparent 1px);
+        background-size: 24px 24px;
+        mask-image: linear-gradient(180deg, rgba(0, 0, 0, 0.5), transparent 90%);
+      }
+
+      a {
+        color: inherit;
+      }
+
+      .page {
+        width: min(1200px, calc(100vw - 32px));
+        margin: 24px auto 72px;
+      }
+
+      .hero {
+        position: relative;
+        overflow: hidden;
+        padding: 44px;
+        border: 1px solid var(--line);
+        border-radius: var(--radius-xl);
+        background: linear-gradient(145deg, rgba(255, 250, 241, 0.94), rgba(250, 241, 227, 0.86));
+        box-shadow: var(--shadow);
+      }
+
+      .hero::after {
+        content: "";
+        position: absolute;
+        right: -40px;
+        top: -56px;
+        width: 260px;
+        height: 260px;
+        border-radius: 50%;
+        background:
+          radial-gradient(circle, rgba(154, 52, 18, 0.18) 0%, rgba(154, 52, 18, 0.04) 42%, transparent 72%);
+        filter: blur(4px);
+      }
+
+      .eyebrow,
+      .pill {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        padding: 8px 12px;
+        border-radius: 999px;
+        border: 1px solid rgba(29, 26, 23, 0.08);
+        background: rgba(255, 255, 255, 0.62);
+        font-size: 12px;
+        font-weight: 700;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+      }
+
+      .hero h1,
+      h2,
+      h3 {
+        font-family: "Iowan Old Style", "Palatino Linotype", "Book Antiqua", Palatino, serif;
+        font-weight: 600;
+        letter-spacing: -0.03em;
+        margin: 0;
+      }
+
+      .hero h1 {
+        max-width: 10ch;
+        margin-top: 18px;
+        font-size: clamp(3rem, 8vw, 5.6rem);
+        line-height: 0.95;
+      }
+
+      .hero p {
+        max-width: 58ch;
+        margin: 18px 0 0;
+        color: var(--muted);
+        font-size: 1.05rem;
+      }
+
+      .hero-grid {
+        display: grid;
+        grid-template-columns: 1.3fr 0.9fr;
+        gap: 28px;
+        align-items: end;
+      }
+
+      .hero-aside {
+        display: grid;
+        gap: 12px;
+      }
+
+      .hero-aside .card {
+        backdrop-filter: blur(10px);
+      }
+
+      .section {
+        margin-top: 22px;
+        padding: 28px;
+        border: 1px solid var(--line);
+        border-radius: var(--radius-xl);
+        background: var(--paper);
+        box-shadow: var(--shadow);
+      }
+
+      .section-head {
+        display: flex;
+        gap: 16px;
+        align-items: end;
+        justify-content: space-between;
+        margin-bottom: 22px;
+      }
+
+      .section-head p {
+        max-width: 58ch;
+        margin: 10px 0 0;
+        color: var(--muted);
+      }
+
+      .kicker {
+        margin-bottom: 8px;
+        color: var(--accent);
+        font-size: 0.82rem;
+        font-weight: 700;
+        letter-spacing: 0.18em;
+        text-transform: uppercase;
+      }
+
+      .section h2 {
+        font-size: clamp(2rem, 4vw, 3rem);
+      }
+
+      .cards-3,
+      .cards-2,
+      .flow,
+      .matrix {
+        display: grid;
+        gap: 16px;
+      }
+
+      .cards-3 {
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+      }
+
+      .cards-2 {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+
+      .card {
+        position: relative;
+        padding: 18px 18px 16px;
+        border: 1px solid var(--line);
+        border-radius: var(--radius-lg);
+        background: rgba(255, 255, 255, 0.68);
+      }
+
+      .card h3 {
+        font-size: 1.3rem;
+      }
+
+      .card p,
+      .card li {
+        color: var(--muted);
+      }
+
+      .card ul {
+        margin: 12px 0 0;
+        padding-left: 18px;
+      }
+
+      .metric {
+        display: block;
+        margin-top: 18px;
+        color: var(--accent);
+        font-size: 2.2rem;
+        font-weight: 700;
+        line-height: 1;
+      }
+
+      .flow {
+        grid-template-columns: repeat(5, minmax(0, 1fr));
+      }
+
+      .flow .card {
+        min-height: 210px;
+        padding-top: 50px;
+      }
+
+      .flow .step {
+        position: absolute;
+        left: 16px;
+        top: 14px;
+        width: 32px;
+        height: 32px;
+        display: grid;
+        place-items: center;
+        border-radius: 50%;
+        background: var(--ink);
+        color: #fff;
+        font-weight: 700;
+      }
+
+      .arrow {
+        position: absolute;
+        top: 28px;
+        right: -10px;
+        width: 20px;
+        height: 2px;
+        background: var(--accent);
+      }
+
+      .arrow::after {
+        content: "";
+        position: absolute;
+        right: 0;
+        top: -4px;
+        border-top: 5px solid transparent;
+        border-bottom: 5px solid transparent;
+        border-left: 8px solid var(--accent);
+      }
+
+      .flow .card:last-child .arrow {
+        display: none;
+      }
+
+      .diagram {
+        display: grid;
+        grid-template-columns: 1.2fr 0.7fr 1.2fr;
+        gap: 16px;
+        align-items: center;
+      }
+
+      .stack {
+        display: grid;
+        gap: 12px;
+      }
+
+      .stack .node,
+      .bridge {
+        padding: 18px;
+        border-radius: var(--radius-lg);
+        border: 1px solid var(--line);
+      }
+
+      .stack .node {
+        background: rgba(255, 255, 255, 0.76);
+      }
+
+      .stack .node strong,
+      .bridge strong {
+        display: block;
+        margin-bottom: 4px;
+      }
+
+      .bridge {
+        background: linear-gradient(180deg, var(--accent-soft), rgba(255, 255, 255, 0.76));
+        text-align: center;
+      }
+
+      .bridge .pill {
+        margin-bottom: 10px;
+      }
+
+      .matrix {
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+      }
+
+      .matrix .card:nth-child(1) {
+        background: linear-gradient(180deg, rgba(31, 111, 95, 0.12), rgba(255, 255, 255, 0.72));
+      }
+
+      .matrix .card:nth-child(2) {
+        background: linear-gradient(180deg, rgba(154, 52, 18, 0.12), rgba(255, 255, 255, 0.72));
+      }
+
+      .matrix .card:nth-child(3) {
+        background: linear-gradient(180deg, rgba(29, 26, 23, 0.09), rgba(255, 255, 255, 0.72));
+      }
+
+      .ledger {
+        display: grid;
+        grid-template-columns: 1.05fr 0.95fr;
+        gap: 16px;
+      }
+
+      .ledger-list {
+        display: grid;
+        gap: 12px;
+      }
+
+      .ledger-item {
+        display: grid;
+        grid-template-columns: 132px 1fr;
+        gap: 14px;
+        padding: 14px 0;
+        border-top: 1px solid var(--line);
+      }
+
+      .ledger-item:first-child {
+        border-top: 0;
+        padding-top: 0;
+      }
+
+      .ledger-label {
+        color: var(--accent);
+        font-size: 0.76rem;
+        font-weight: 700;
+        letter-spacing: 0.16em;
+        text-transform: uppercase;
+      }
+
+      .code {
+        margin: 0;
+        padding: 16px;
+        overflow: auto;
+        border-radius: var(--radius-lg);
+        background: #171411;
+        color: #f6ead5;
+        font-family: "SFMono-Regular", "Menlo", "Consolas", monospace;
+        font-size: 0.88rem;
+        line-height: 1.55;
+      }
+
+      .footer {
+        margin-top: 24px;
+        text-align: center;
+        color: var(--muted);
+        font-size: 0.92rem;
+      }
+
+      @media (max-width: 1024px) {
+        .hero-grid,
+        .diagram,
+        .ledger,
+        .cards-3,
+        .cards-2,
+        .matrix,
+        .flow {
+          grid-template-columns: 1fr;
+        }
+
+        .flow .card {
+          min-height: 0;
+        }
+
+        .arrow {
+          display: none;
+        }
+      }
+
+      @media (max-width: 640px) {
+        .page {
+          width: min(100vw - 20px, 1200px);
+        }
+
+        .hero,
+        .section {
+          padding: 20px;
+        }
+
+        .hero h1 {
+          font-size: 2.8rem;
+        }
+
+        .ledger-item {
+          grid-template-columns: 1fr;
+          gap: 8px;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main class="page">
+      <section class="hero">
+        <div class="hero-grid">
+          <div>
+            <div class="eyebrow">Paperclip Spec Shift</div>
+            <h1>Run remotely is a venue, not an agent.</h1>
+            <p>
+              Existing agents keep their identity and adapter type. A board-level
+              <strong>Run remotely</strong> choice creates a persistent remote lease for the issue,
+              reuses the same remote branch and session area across resumes, and ends in a PR.
+            </p>
+          </div>
+          <div class="hero-aside">
+            <article class="card">
+              <div class="pill">New default</div>
+              <h3>Per-issue remote lease</h3>
+              <p>
+                One issue gets one remote home: repo, branch, adapter-home, portable memory bundle,
+                and PR metadata.
+              </p>
+              <span class="metric">1 issue → 1 lease</span>
+            </article>
+            <article class="card">
+              <div class="pill">Replacement</div>
+              <h3>Old SSH adapter removed</h3>
+              <p>
+                Remote execution moves to issue policy plus remote targets. It is no longer configured as its own agent adapter type.
+              </p>
+            </article>
+          </div>
+        </div>
+      </section>
+
+      <section class="section">
+        <div class="section-head">
+          <div>
+            <div class="kicker">Core Model</div>
+            <h2>What changes in the product model</h2>
+            <p>
+              The board assigns work to the same agent as before, but now chooses the execution venue at the issue layer.
+            </p>
+          </div>
+        </div>
+        <div class="cards-3">
+          <article class="card">
+            <h3>Identity stays put</h3>
+            <p>
+              Budgeting, activity, org chart, and capabilities remain attached to the same employee record.
+            </p>
+          </article>
+          <article class="card">
+            <h3>Venue becomes explicit</h3>
+            <p>
+              Add <code>executionMode: default | remote</code> on the issue instead of swapping adapter types.
+            </p>
+          </article>
+          <article class="card">
+            <h3>State persists by issue</h3>
+            <p>
+              Follow-up comments and resumes come back to the same remote lease until completion, reset, or TTL cleanup.
+            </p>
+          </article>
+        </div>
+      </section>
+
+      <section class="section">
+        <div class="section-head">
+          <div>
+            <div class="kicker">Lifecycle</div>
+            <h2>How a remote issue actually moves</h2>
+            <p>
+              The important change is persistence. The first run provisions a lease; later runs reuse it.
+            </p>
+          </div>
+        </div>
+        <div class="flow">
+          <article class="card">
+            <span class="step">1</span>
+            <div class="arrow"></div>
+            <h3>Assign issue</h3>
+            <p>The board picks an existing agent and toggles <strong>Run remotely</strong>.</p>
+          </article>
+          <article class="card">
+            <span class="step">2</span>
+            <div class="arrow"></div>
+            <h3>Create lease</h3>
+            <p>Paperclip resolves a target host and creates or reuses a remote lease for the issue.</p>
+          </article>
+          <article class="card">
+            <span class="step">3</span>
+            <div class="arrow"></div>
+            <h3>Materialize state</h3>
+            <p>The repo is cloned or reused, the issue branch is checked out, and a portable agent bundle is synced.</p>
+          </article>
+          <article class="card">
+            <span class="step">4</span>
+            <div class="arrow"></div>
+            <h3>Run adapter</h3>
+            <p>The normal Claude, Codex, Cursor, or OpenCode adapter runs on the remote host and streams transcript events back.</p>
+          </article>
+          <article class="card">
+            <span class="step">5</span>
+            <h3>Push and PR</h3>
+            <p>The remote worker pushes the stable issue branch, creates or updates the PR, and keeps the lease alive.</p>
+          </article>
+        </div>
+      </section>
+
+      <section class="section">
+        <div class="section-head">
+          <div>
+            <div class="kicker">Architecture</div>
+            <h2>Where the remote layer fits</h2>
+            <p>
+              The remote worker becomes a hosting layer for existing adapters rather than a special-purpose SSH adapter identity.
+            </p>
+          </div>
+        </div>
+        <div class="diagram">
+          <div class="stack">
+            <div class="node">
+              <strong>Paperclip server</strong>
+              Heartbeat service resolves issue policy, adapter type, and workspace source.
+            </div>
+            <div class="node">
+              <strong>Execution orchestrator</strong>
+              Chooses local vs remote and attaches the correct session namespace.
+            </div>
+          </div>
+          <div class="bridge">
+            <div class="pill">Remote venue</div>
+            <strong>SSH remote runtime</strong>
+            Creates leases, syncs portable state, and owns branch + PR lifecycle.
+          </div>
+          <div class="stack">
+            <div class="node">
+              <strong>Remote issue workspace</strong>
+              <code>repo/</code>, <code>adapter-home/</code>, <code>bundle/</code>, <code>metadata.json</code>
+            </div>
+            <div class="node">
+              <strong>Normal adapter runtime</strong>
+              Codex, Claude, Cursor, or OpenCode running remotely with stable session storage.
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="section">
+        <div class="section-head">
+          <div>
+            <div class="kicker">State Strategy</div>
+            <h2>Copy less, model more</h2>
+            <p>
+              The design avoids shipping the entire local machine state. Only intentional, portable state crosses the boundary.
+            </p>
+          </div>
+        </div>
+        <div class="ledger">
+          <article class="card">
+            <h3>Portable bundle</h3>
+            <div class="ledger-list">
+              <div class="ledger-item">
+                <div class="ledger-label">Include</div>
+                <div>Instructions files, selected memory files, task/session metadata, skills payloads, run auth.</div>
+              </div>
+              <div class="ledger-item">
+                <div class="ledger-label">Exclude</div>
+                <div>Whole home directories, arbitrary caches, machine-specific paths, vendor login state by default.</div>
+              </div>
+              <div class="ledger-item">
+                <div class="ledger-label">Reason</div>
+                <div>Smaller transfers, fewer secrets, more deterministic resumes, clearer local-vs-remote behavior.</div>
+              </div>
+            </div>
+          </article>
+          <article class="card">
+            <h3>Lease shape</h3>
+            <pre class="code">~/paperclip-remote/
+  leases/
+    {companyId}/
+      {issueId}/
+        repo/
+        adapter-home/
+        bundle/
+        metadata.json</pre>
+          </article>
+        </div>
+      </section>
+
+      <section class="section">
+        <div class="section-head">
+          <div>
+            <div class="kicker">Decision Matrix</div>
+            <h2>Why this is the preferred structure</h2>
+            <p>
+              It is the cleanest fit for Paperclip’s control-plane model and avoids conflating employee identity with runtime placement.
+            </p>
+          </div>
+        </div>
+        <div class="matrix">
+          <article class="card">
+            <div class="pill" style="background: var(--accent-2-soft);">Recommended</div>
+            <h3>Existing agents + remote leases</h3>
+            <ul>
+              <li>Correct mental model</li>
+              <li>Persistent per-issue continuity</li>
+              <li>Clean local vs remote separation</li>
+              <li>Natural path to host pools later</li>
+            </ul>
+          </article>
+          <article class="card">
+            <div class="pill">Rejected</div>
+            <h3>Dedicated remote adapter type</h3>
+            <ul>
+              <li>Smaller code delta at first</li>
+              <li>But remote becomes part of agent identity</li>
+              <li>Confusing when issues switch venue</li>
+              <li>Duplicates employees unnecessarily</li>
+            </ul>
+          </article>
+          <article class="card">
+            <div class="pill">Rejected default</div>
+            <h3>Copy full working directory</h3>
+            <ul>
+              <li>Looks simple at first</li>
+              <li>Copies too much state and too many secrets</li>
+              <li>Fragile across absolute paths and auth stores</li>
+              <li>Hard to explain and debug</li>
+            </ul>
+          </article>
+        </div>
+      </section>
+
+      <section class="section">
+        <div class="section-head">
+          <div>
+            <div class="kicker">Delivery</div>
+            <h2>Implementation sequence</h2>
+            <p>
+              The spec now has a clear order: model the issue policy first, then persistence, then remote execution details.
+            </p>
+          </div>
+        </div>
+        <div class="cards-2">
+          <article class="card">
+            <h3>Phase 1</h3>
+            <ul>
+              <li>Add issue-level <code>executionMode = remote</code></li>
+              <li>Add remote execution targets</li>
+              <li>Add remote lease records</li>
+              <li>Separate session namespaces by venue</li>
+            </ul>
+          </article>
+          <article class="card">
+            <h3>Phase 2</h3>
+            <ul>
+              <li>Run existing adapters remotely</li>
+              <li>Sync portable state bundles</li>
+              <li>Manage stable remote branches</li>
+              <li>Create or update PRs and surface metadata</li>
+            </ul>
+          </article>
+        </div>
+      </section>
+
+      <p class="footer">
+        Spec source: <code>doc/ssh-remote-execution-spec.md</code>
+      </p>
+    </main>
+  </body>
+</html>

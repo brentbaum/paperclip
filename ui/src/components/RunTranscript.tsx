@@ -46,9 +46,15 @@ function isNoiseSystemLine(text: string) {
   );
 }
 
+function isNoiseUserLine(text: string) {
+  const t = text.trim();
+  return t === "Tool loaded." || t.startsWith("Base directory for this skill:");
+}
+
 export function shouldRenderEntry(entry: TranscriptEntry) {
   if (entry.kind === "init") return false;
   if (entry.kind === "system") return !isNoiseSystemLine(entry.text.trim());
+  if (entry.kind === "user") return !isNoiseUserLine(entry.text);
   // Filter raw JSON that leaked through as stdout
   if (entry.kind === "stdout" && entry.text.trim().startsWith("{")) return false;
   // Filter paperclip infrastructure messages

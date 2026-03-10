@@ -1,5 +1,8 @@
 import fs from "node:fs/promises";
+import { execFile } from "node:child_process";
+import os from "node:os";
 import path from "node:path";
+import { promisify } from "node:util";
 import { and, asc, desc, eq, gt, inArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
@@ -12,6 +15,8 @@ import {
   costEvents,
   issues,
   projectWorkspaces,
+  remoteExecutionLeases,
+  remoteExecutionTargets,
 } from "@paperclipai/db";
 import { conflict, notFound } from "../errors.js";
 import { logger } from "../middleware/logger.js";
@@ -23,14 +28,44 @@ import { createLocalAgentJwt } from "../agent-auth-jwt.js";
 import { parseObject, asBoolean, asNumber, appendWithCap, MAX_EXCERPT_BYTES } from "../adapters/utils.js";
 import { secretService } from "./secrets.js";
 import { documentService } from "./documents.js";
-import { resolveDefaultAgentWorkspaceDir } from "../home-paths.js";
+import { resolveDefaultAgentWorkspaceDir, resolveHomeAwarePath } from "../home-paths.js";
+import { remoteExecutionService } from "./remote-execution.js";
+import {
+  buildRemoteBranchName,
+  buildRemoteRoot,
+  executeRemoteRun,
+  planRemoteRuntimePathSync,
+  runRemoteProcess,
+  uploadLocalPathAsRemoteArchive,
+} from "./remote-execution-runner.js";
+import { executeWithProcessRunner as executeCodexWithProcessRunner } from "@paperclipai/adapter-codex-local/server";
+import { executeWithProcessRunner as executeClaudeWithProcessRunner } from "@paperclipai/adapter-claude-local/server";
 
 const MAX_LIVE_LOG_CHUNK_BYTES = 8 * 1024;
 const HEARTBEAT_MAX_CONCURRENT_RUNS_DEFAULT = 10;
 const HEARTBEAT_MAX_CONCURRENT_RUNS_MAX = 10;
+export const HEARTBEAT_ORPHAN_REAP_STALE_THRESHOLD_MS = 5 * 60 * 1000;
 const DEFERRED_WAKE_CONTEXT_KEY = "_paperclipWakeContext";
 const startLocksByAgent = new Map<string, Promise<void>>();
 const REPO_ONLY_CWD_SENTINEL = "/__paperclip_repo_only__";
+const execFileAsync = promisify(execFile);
+const REMOTE_AGENT_FILE_MAX_BYTES = 512 * 1024;
+const REMOTE_AGENT_CONTEXT_SKIP_DIRS = new Set([
+  ".git",
+  ".jj",
+  ".worktrees",
+  "node_modules",
+  "build",
+  "dist",
+  ".next",
+  "coverage",
+  "test-results",
+  "playwright-report",
+  "tmp",
+  "logs",
+  ".logs",
+]);
+const REMOTE_AGENT_CONTEXT_ROOT_DIR = "agents";
 
 function appendExcerpt(prev: string, chunk: string) {
   return appendWithCap(prev, chunk, MAX_EXCERPT_BYTES);
@@ -40,6 +75,25 @@ function normalizeMaxConcurrentRuns(value: unknown) {
   const parsed = Math.floor(asNumber(value, HEARTBEAT_MAX_CONCURRENT_RUNS_DEFAULT));
   if (!Number.isFinite(parsed)) return HEARTBEAT_MAX_CONCURRENT_RUNS_DEFAULT;
   return Math.max(HEARTBEAT_MAX_CONCURRENT_RUNS_DEFAULT, Math.min(HEARTBEAT_MAX_CONCURRENT_RUNS_MAX, parsed));
+}
+
+function normalizeOrphanReapStaleThresholdMs(value: number | undefined) {
+  if (!Number.isFinite(value)) return HEARTBEAT_ORPHAN_REAP_STALE_THRESHOLD_MS;
+  return Math.max(0, Math.floor(value!));
+}
+
+export function shouldReapRunAsOrphan(
+  run: Pick<typeof heartbeatRuns.$inferSelect, "updatedAt">,
+  now: Date,
+  staleThresholdMs: number,
+) {
+  const refTime = run.updatedAt ? new Date(run.updatedAt).getTime() : 0;
+  return now.getTime() - refTime >= staleThresholdMs;
+}
+
+function readRemoteSetupScript(metadata: Record<string, unknown> | null | undefined) {
+  const script = readNonEmptyString(metadata?.setupScript);
+  return script?.trim() || null;
 }
 
 async function withAgentStartLock<T>(agentId: string, fn: () => Promise<T>) {
@@ -97,6 +151,192 @@ function readNonEmptyString(value: unknown): string | null {
 
 function readFiniteNumber(value: unknown): number | null {
   return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+async function runGit(args: string[], cwd?: string) {
+  try {
+    const { stdout } = await execFileAsync("git", args, {
+      cwd,
+      encoding: "utf-8",
+    });
+    return readNonEmptyString(stdout?.trim());
+  } catch {
+    return null;
+  }
+}
+
+export async function inferRepoFromWorkingDirectory(cwd: string) {
+  const repoRoot = await runGit(["rev-parse", "--show-toplevel"], cwd);
+  if (!repoRoot) return null;
+
+  const remotesRaw = await runGit(["remote"], repoRoot);
+  const remotes =
+    remotesRaw?.split(/\r?\n/).map((line) => line.trim()).filter(Boolean) ?? [];
+  const remoteName = remotes.includes("origin")
+    ? "origin"
+    : remotes.length === 1
+      ? remotes[0]!
+      : null;
+  const repoUrl = remoteName
+    ? await runGit(["remote", "get-url", remoteName], repoRoot)
+    : null;
+  const repoRef =
+    (await runGit(["symbolic-ref", "--quiet", "--short", "HEAD"], repoRoot)) ??
+    (await runGit(["rev-parse", "HEAD"], repoRoot));
+
+  return {
+    repoRoot,
+    repoUrl,
+    repoRef,
+  };
+}
+
+export async function resolveGitIdentityForRemoteCommit(input: {
+  repoRoot: string | null;
+  sourceCwd: string | null;
+  resolvedWorkspace: Pick<ResolvedWorkspaceForRun, "cwd" | "workspaceHints">;
+  previousSessionParams: Record<string, unknown> | null;
+  runtimeSessionParams: Record<string, unknown> | null;
+  agentAdapterConfig: Record<string, unknown> | null;
+}) {
+  const configuredAgentCwdRaw = readNonEmptyString(input.agentAdapterConfig?.cwd);
+  const configuredAgentCwd = configuredAgentCwdRaw
+    ? resolveHomeAwarePath(configuredAgentCwdRaw)
+    : null;
+  const candidateCwds = [
+    input.repoRoot,
+    input.sourceCwd,
+    ...input.resolvedWorkspace.workspaceHints.map((workspace) => readNonEmptyString(workspace.cwd)),
+    readNonEmptyString(input.runtimeSessionParams?.cwd),
+    readNonEmptyString(input.previousSessionParams?.cwd),
+    readNonEmptyString(input.resolvedWorkspace.cwd),
+    configuredAgentCwd,
+  ]
+    .filter((value): value is string => Boolean(value && value !== REPO_ONLY_CWD_SENTINEL))
+    .filter((value, index, values) => values.indexOf(value) === index);
+
+  for (const candidateCwd of candidateCwds) {
+    const name = await runGit(["config", "--local", "--get", "user.name"], candidateCwd);
+    const email = await runGit(["config", "--local", "--get", "user.email"], candidateCwd);
+    if (name && email) {
+      return { name, email, source: "repo" as const, sourceCwd: candidateCwd };
+    }
+  }
+
+  const globalName = await runGit(["config", "--global", "--get", "user.name"]);
+  const globalEmail = await runGit(["config", "--global", "--get", "user.email"]);
+  if (globalName && globalEmail) {
+    return { name: globalName, email: globalEmail, source: "global" as const, sourceCwd: null };
+  }
+
+  return null;
+}
+
+export async function resolveRemoteRepoForExecution(input: {
+  resolvedWorkspace: Pick<ResolvedWorkspaceForRun, "cwd" | "repoUrl" | "repoRef" | "workspaceHints">;
+  previousSessionParams: Record<string, unknown> | null;
+  runtimeSessionParams: Record<string, unknown> | null;
+  agentAdapterConfig: Record<string, unknown> | null;
+}) {
+  const fallbackRepoUrl = input.resolvedWorkspace.repoUrl;
+  const fallbackRepoRef = input.resolvedWorkspace.repoRef;
+
+  const configuredAgentCwdRaw = readNonEmptyString(input.agentAdapterConfig?.cwd);
+  const configuredAgentCwd = configuredAgentCwdRaw
+    ? resolveHomeAwarePath(configuredAgentCwdRaw)
+    : null;
+  const candidateCwds = [
+    ...input.resolvedWorkspace.workspaceHints.map((workspace) => readNonEmptyString(workspace.cwd)),
+    readNonEmptyString(input.runtimeSessionParams?.cwd),
+    readNonEmptyString(input.previousSessionParams?.cwd),
+    readNonEmptyString(input.resolvedWorkspace.cwd),
+    configuredAgentCwd,
+  ]
+    .filter((value): value is string => Boolean(value && value !== REPO_ONLY_CWD_SENTINEL))
+    .filter((value, index, values) => values.indexOf(value) === index);
+
+  for (const candidateCwd of candidateCwds) {
+    const inferredRepo = await inferRepoFromWorkingDirectory(candidateCwd);
+    if (!inferredRepo) continue;
+    return {
+      repoUrl: fallbackRepoUrl ?? inferredRepo?.repoUrl ?? null,
+      repoRef: fallbackRepoRef ?? inferredRepo?.repoRef ?? input.resolvedWorkspace.repoRef,
+      repoRoot: inferredRepo.repoRoot ?? null,
+      sourceCwd: candidateCwd,
+    };
+  }
+
+  return {
+    repoUrl: fallbackRepoUrl ?? null,
+    repoRef: fallbackRepoRef ?? input.resolvedWorkspace.repoRef,
+    repoRoot: null as string | null,
+    sourceCwd: null as string | null,
+  };
+}
+
+export async function collectRemoteAgentContextFiles(input: {
+  repoRoot: string | null;
+  agentAdapterConfig: Record<string, unknown> | null;
+}) {
+  const configuredAgentCwdRaw = readNonEmptyString(input.agentAdapterConfig?.cwd);
+  const configuredAgentCwd = configuredAgentCwdRaw
+    ? resolveHomeAwarePath(configuredAgentCwdRaw)
+    : null;
+  const baseRoot = input.repoRoot ?? configuredAgentCwd;
+  if (!baseRoot) return null;
+
+  const candidateRoots = [
+    path.join(baseRoot, REMOTE_AGENT_CONTEXT_ROOT_DIR),
+    configuredAgentCwd ? path.join(configuredAgentCwd, REMOTE_AGENT_CONTEXT_ROOT_DIR) : null,
+  ]
+    .filter((value): value is string => Boolean(value))
+    .filter((value, index, values) => values.indexOf(value) === index);
+
+  const files = new Set<string>();
+
+  const walk = async (dir: string) => {
+    const entries = await fs.readdir(dir, { withFileTypes: true }).catch(() => []);
+    for (const entry of entries) {
+      const nextPath = path.join(dir, entry.name);
+      if (entry.isSymbolicLink()) continue;
+      if (entry.isDirectory()) {
+        if (REMOTE_AGENT_CONTEXT_SKIP_DIRS.has(entry.name)) continue;
+        await walk(nextPath);
+        continue;
+      }
+      if (!entry.isFile()) continue;
+      const stat = await fs.stat(nextPath).catch(() => null);
+      if (!stat?.isFile() || stat.size > REMOTE_AGENT_FILE_MAX_BYTES) continue;
+      files.add(nextPath);
+    }
+  };
+
+  for (const candidateRoot of candidateRoots) {
+    const stat = await fs.stat(candidateRoot).catch(() => null);
+    if (!stat?.isDirectory()) continue;
+    await walk(candidateRoot);
+  }
+
+  const relativeFiles = [...files]
+    .filter((filePath) => {
+      const relative = path.relative(baseRoot, filePath);
+      return relative.length > 0 && !relative.startsWith("..") && !path.isAbsolute(relative);
+    })
+    .sort((left, right) => left.localeCompare(right));
+  if (relativeFiles.length === 0) return null;
+
+  const stagingDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-remote-agent-files-"));
+  for (const filePath of relativeFiles) {
+    const relative = path.relative(baseRoot, filePath);
+    const targetPath = path.join(stagingDir, relative);
+    await fs.mkdir(path.dirname(targetPath), { recursive: true });
+    await fs.copyFile(filePath, targetPath);
+  }
+
+  return {
+    stagingDir,
+    fileCount: relativeFiles.length,
+  };
 }
 
 export function resolveRuntimeSessionParamsForWorkspace(input: {
@@ -438,10 +678,26 @@ function resolveNextSessionState(input: {
   };
 }
 
+function mergeWorkspaceRepoIntoSessionParams(
+  params: Record<string, unknown> | null,
+  resolvedWorkspace: ResolvedWorkspaceForRun,
+) {
+  if (!params) return null;
+  const next = { ...params };
+  if (resolvedWorkspace.repoUrl && !readNonEmptyString(next.repoUrl)) {
+    next.repoUrl = resolvedWorkspace.repoUrl;
+  }
+  if (resolvedWorkspace.repoRef && !readNonEmptyString(next.repoRef)) {
+    next.repoRef = resolvedWorkspace.repoRef;
+  }
+  return next;
+}
+
 export function heartbeatService(db: Db) {
   const runLogStore = getRunLogStore();
   const secretsSvc = secretService(db);
   const documentsSvc = documentService(db);
+  const remoteExecSvc = remoteExecutionService(db);
 
   async function getAgent(agentId: string) {
     return db
@@ -531,6 +787,10 @@ export function heartbeatService(db: Db) {
     const resolvedProjectId = issueProjectId ?? contextProjectId;
     const useProjectWorkspace = opts?.useProjectWorkspace !== false;
     const workspaceProjectId = useProjectWorkspace ? resolvedProjectId : null;
+    const configuredAgentCwdRaw = readNonEmptyString(parseObject(agent.adapterConfig).cwd);
+    const configuredAgentCwd = configuredAgentCwdRaw
+      ? resolveHomeAwarePath(configuredAgentCwdRaw)
+      : null;
 
     const projectWorkspaceRows = workspaceProjectId
       ? await db
@@ -624,6 +884,31 @@ export function heartbeatService(db: Db) {
           repoRef: readNonEmptyString(previousSessionParams?.repoRef),
           workspaceHints,
           warnings: [],
+        };
+      }
+    }
+
+    if (configuredAgentCwd) {
+      const configuredCwdExists = await fs
+        .stat(configuredAgentCwd)
+        .then((stats) => stats.isDirectory())
+        .catch(() => false);
+      if (configuredCwdExists) {
+        const inferredRepo = await inferRepoFromWorkingDirectory(configuredAgentCwd);
+        return {
+          cwd: resolveDefaultAgentWorkspaceDir(agent.id),
+          source: "agent_home" as const,
+          projectId: resolvedProjectId,
+          workspaceId: null,
+          repoUrl: inferredRepo?.repoUrl ?? null,
+          repoRef: inferredRepo?.repoRef ?? null,
+          workspaceHints,
+          warnings:
+            inferredRepo?.repoUrl
+              ? [
+                  `Inferred repo "${inferredRepo.repoUrl}" from configured agent cwd "${configuredAgentCwd}".`,
+                ]
+              : [],
         };
       }
     }
@@ -931,7 +1216,7 @@ export function heartbeatService(db: Db) {
   }
 
   async function reapOrphanedRuns(opts?: { staleThresholdMs?: number }) {
-    const staleThresholdMs = opts?.staleThresholdMs ?? 0;
+    const staleThresholdMs = normalizeOrphanReapStaleThresholdMs(opts?.staleThresholdMs);
     const now = new Date();
 
     // Find all runs in "queued" or "running" state
@@ -961,16 +1246,12 @@ export function heartbeatService(db: Db) {
         continue;
       }
 
-      // Apply staleness threshold to avoid false positives
-      if (staleThresholdMs > 0) {
-        const refTime = run.updatedAt ? new Date(run.updatedAt).getTime() : 0;
-        if (now.getTime() - refTime < staleThresholdMs) {
-          logger.debug(
-            { runId: run.id, status: run.status, ageMs, staleThresholdMs },
-            "reapOrphanedRuns: skipping (below staleness threshold)",
-          );
-          continue;
-        }
+      if (!shouldReapRunAsOrphan(run, now, staleThresholdMs)) {
+        logger.debug(
+          { runId: run.id, status: run.status, ageMs, staleThresholdMs },
+          "reapOrphanedRuns: skipping (below staleness threshold)",
+        );
+        continue;
       }
 
       logger.warn(
@@ -1147,13 +1428,28 @@ export function heartbeatService(db: Db) {
     const issueAssigneeConfig = issueId
       ? await db
           .select({
+            id: issues.id,
+            companyId: issues.companyId,
             assigneeAgentId: issues.assigneeAgentId,
             assigneeAdapterOverrides: issues.assigneeAdapterOverrides,
+            title: issues.title,
+            description: issues.description,
+            identifier: issues.identifier,
+            status: issues.status,
+            executionMode: issues.executionMode,
+            executionTargetId: issues.executionTargetId,
           })
           .from(issues)
           .where(and(eq(issues.id, issueId), eq(issues.companyId, agent.companyId)))
           .then((rows) => rows[0] ?? null)
       : null;
+    // Enrich context with issue details so adapters/prompts can reference them
+    if (issueAssigneeConfig) {
+      context.issueTitle = issueAssigneeConfig.title;
+      context.issueDescription = issueAssigneeConfig.description;
+      context.issueIdentifier = issueAssigneeConfig.identifier;
+      context.issueStatus = issueAssigneeConfig.status;
+    }
     const issueAssigneeOverrides =
       issueAssigneeConfig && issueAssigneeConfig.assigneeAgentId === agent.id
         ? parseIssueAssigneeAdapterOverrides(
@@ -1238,6 +1534,30 @@ export function heartbeatService(db: Db) {
     let handle: RunLogHandle | null = null;
     let stdoutExcerpt = "";
     let stderrExcerpt = "";
+    let remoteLeaseForRun: typeof remoteExecutionLeases.$inferSelect | null = null;
+    let remoteTargetForRun: {
+      host: string;
+      user: string;
+      workerPath: string;
+      metadata: Record<string, unknown> | null;
+    } | null = null;
+    let remoteRepoForRun: {
+      repoUrl: string;
+      baseRef: string;
+      worktreeName: string;
+      branchName: string;
+      commitMessage: string;
+    } | null = null;
+    let remoteGitIdentityForRun: {
+      name: string;
+      email: string;
+    } | null = null;
+    let runtimeForExecution = runtimeForAdapter;
+    let nextSessionStateBase = {
+      previousParams: previousSessionParams,
+      previousDisplayId: runtimeForAdapter.sessionDisplayId,
+      previousLegacySessionId: runtimeForAdapter.sessionId,
+    };
 
     try {
       const startedAt = run.startedAt ?? new Date();
@@ -1362,26 +1682,335 @@ export function heartbeatService(db: Db) {
         );
       }
       context.paperclipTools = { ...((context.paperclipTools as Record<string, unknown> | undefined) ?? {}), telegram: { sendEndpoint: "/api/agent-tools/telegram/send", defaultAgentId: agent.id, supportsStatusFlags: true } };
-      const adapterResult = await adapter.execute({
-        runId: run.id,
-        agent,
-        runtime: runtimeForAdapter,
-        config: resolvedConfig,
-        context,
-        onLog,
-        onMeta: onAdapterMeta,
-        authToken: authToken ?? undefined,
-      });
+      const shouldRunRemote =
+        issueAssigneeConfig?.executionMode === "remote" &&
+        issueAssigneeConfig.executionTargetId &&
+        issueAssigneeConfig.assigneeAgentId === agent.id;
+
+      let adapterResult: AdapterExecutionResult;
+      if (shouldRunRemote) {
+        const executionTargetId = issueAssigneeConfig.executionTargetId;
+        if (!executionTargetId) {
+          throw new Error("Remote execution target is required");
+        }
+        const target = await db
+          .select()
+          .from(remoteExecutionTargets)
+          .where(
+            and(
+              eq(remoteExecutionTargets.id, executionTargetId),
+              eq(remoteExecutionTargets.companyId, agent.companyId),
+            ),
+          )
+          .then((rows) => rows[0] ?? null);
+        if (!target || target.archivedAt) {
+          throw new Error("Remote execution target is missing or archived");
+        }
+        const remoteRepoResolution = await resolveRemoteRepoForExecution({
+          resolvedWorkspace,
+          previousSessionParams,
+          runtimeSessionParams,
+          agentAdapterConfig: parseObject(agent.adapterConfig),
+        });
+        if (runtimeSessionParams && remoteRepoResolution.repoUrl && !readNonEmptyString(runtimeSessionParams.repoUrl)) {
+          runtimeSessionParams.repoUrl = remoteRepoResolution.repoUrl;
+        }
+        if (runtimeSessionParams && remoteRepoResolution.repoRef && !readNonEmptyString(runtimeSessionParams.repoRef)) {
+          runtimeSessionParams.repoRef = remoteRepoResolution.repoRef;
+        }
+        if (remoteRepoResolution.sourceCwd) {
+          await onLog(
+            "stderr",
+            `[paperclip] Inferred repo "${remoteRepoResolution.repoUrl}" from "${remoteRepoResolution.sourceCwd}" for remote execution.\n`,
+          );
+        }
+        const repoUrl = remoteRepoResolution.repoUrl;
+        if (!repoUrl) {
+          throw new Error("Remote execution requires a project workspace repo URL");
+        }
+        remoteGitIdentityForRun = await resolveGitIdentityForRemoteCommit({
+          repoRoot: remoteRepoResolution.repoRoot,
+          sourceCwd: remoteRepoResolution.sourceCwd,
+          resolvedWorkspace,
+          previousSessionParams,
+          runtimeSessionParams,
+          agentAdapterConfig: parseObject(agent.adapterConfig),
+        });
+        if (remoteGitIdentityForRun) {
+          await onLog(
+            "stderr",
+            `[paperclip] Using git identity "${remoteGitIdentityForRun.name} <${remoteGitIdentityForRun.email}>" for remote commits.\n`,
+          );
+        }
+        const baseRef = remoteRepoResolution.repoRef ?? resolvedWorkspace.repoRef ?? "main";
+        const branchName = buildRemoteBranchName({
+          issueIdentifier: issueAssigneeConfig.identifier ?? issueAssigneeConfig.id,
+          issueId: issueAssigneeConfig.id,
+          agentName: agent.name,
+        });
+        const remoteRoot = buildRemoteRoot({
+          companyId: agent.companyId,
+          issueId: issueAssigneeConfig.id,
+        });
+        remoteLeaseForRun = await remoteExecSvc.ensureActiveLease({
+          companyId: agent.companyId,
+          issueId: issueAssigneeConfig.id,
+          agentId: agent.id,
+          adapterType: agent.adapterType,
+          executionTargetId: target.id,
+          remoteRoot,
+          repoUrl,
+          baseRef,
+          branchName,
+        });
+        if (!remoteLeaseForRun) {
+          throw new Error("Failed to create remote execution lease");
+        }
+        const remoteLease = remoteLeaseForRun;
+
+        const leaseSessionParams = normalizeSessionParams(
+          sessionCodec.deserialize(remoteLease.sessionState ?? null),
+        );
+        runtimeForExecution = {
+          ...runtimeForAdapter,
+          sessionId:
+            readNonEmptyString(leaseSessionParams?.sessionId) ??
+            runtimeForAdapter.sessionId,
+          sessionParams: leaseSessionParams,
+          sessionDisplayId:
+            truncateDisplayId(
+              sessionCodec.getDisplayId
+                ? sessionCodec.getDisplayId(leaseSessionParams)
+                : readNonEmptyString(leaseSessionParams?.sessionId),
+            ) ?? runtimeForAdapter.sessionDisplayId,
+        };
+        nextSessionStateBase = {
+          previousParams: leaseSessionParams,
+          previousDisplayId: runtimeForExecution.sessionDisplayId,
+          previousLegacySessionId: runtimeForExecution.sessionId,
+        };
+        const remoteTarget = {
+          host: target.host,
+          user: target.user,
+          workerPath: target.workerPath,
+          metadata:
+            typeof target.metadata === "object" && target.metadata !== null
+              ? (target.metadata as Record<string, unknown>)
+              : null,
+        };
+        remoteTargetForRun = remoteTarget;
+        remoteRepoForRun = {
+          repoUrl: remoteLease.repoUrl,
+          baseRef: remoteLease.baseRef,
+          worktreeName: remoteLease.id,
+          branchName: remoteLease.branchName,
+          commitMessage: `paperclip: update ${issueAssigneeConfig.identifier ?? issueAssigneeConfig.id}`,
+        };
+        const remoteRepo = remoteRepoForRun;
+        let agentContextArchiveUploaded = false;
+        let remoteSetupEnsured = false;
+        const uploadedRuntimePaths = new Map<string, string>();
+
+        const remoteProcessRunner = async (
+          remoteRunId: string,
+          command: string,
+          args: string[],
+          opts: {
+            cwd: string;
+            env: Record<string, string>;
+            timeoutSec: number;
+            graceSec: number;
+            onLog: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
+            onLogError?: (err: unknown, runId: string, message: string) => void;
+            stdin?: string;
+          },
+        ) => {
+          try {
+            if (!remoteSetupEnsured) {
+              const setupScript = readRemoteSetupScript(remoteTarget.metadata);
+              if (setupScript) {
+                await onLog("stderr", "[paperclip] Running remote setup script for this lease.\n");
+                const setupWrapper =
+                  "set -eu\n" +
+                  "git_dir=\"$(git rev-parse --git-dir)\"\n" +
+                  "marker=\"$git_dir/paperclip-remote-setup-complete\"\n" +
+                  "if [ ! -f \"$marker\" ]; then\n" +
+                  setupScript
+                    .split(/\r?\n/)
+                    .map((line) => `  ${line}`)
+                    .join("\n") +
+                  "\n" +
+                  "  mkdir -p \"$(dirname \"$marker\")\"\n" +
+                  "  touch \"$marker\"\n" +
+                  "fi\n";
+                const setupProc = await runRemoteProcess({
+                  runId: `${remoteRunId}-setup`,
+                  target: remoteTarget,
+                  command: "bash",
+                  args: ["-lc", setupWrapper],
+                  cwd: undefined,
+                  repoUrl: remoteRepo.repoUrl,
+                  repoRef: remoteRepo.baseRef,
+                  worktreeName: remoteRepo.worktreeName,
+                  env: opts.env,
+                  timeoutSec: Math.max(opts.timeoutSec, 300),
+                  graceSec: opts.graceSec,
+                  onLog: opts.onLog,
+                  onMeta: onAdapterMeta,
+                });
+                if (setupProc.timedOut) {
+                  throw new Error("Remote setup script timed out");
+                }
+                if ((setupProc.exitCode ?? 0) !== 0) {
+                  const setupErrLine =
+                    setupProc.stderr
+                      .split(/\r?\n/)
+                      .map((line) => line.trim())
+                      .find(Boolean) ?? "";
+                  throw new Error(setupErrLine || `Remote setup script failed with code ${setupProc.exitCode ?? -1}`);
+                }
+              }
+              remoteSetupEnsured = true;
+            }
+
+            const runtimePathPlan = await planRemoteRuntimePathSync({
+              args,
+              remoteRoot: remoteLease.remoteRoot,
+            });
+            const materializations = [...runtimePathPlan.syncs.map((sync) => sync.materialization)];
+            for (const sync of runtimePathPlan.syncs) {
+              if (uploadedRuntimePaths.has(sync.localPath)) continue;
+              await uploadLocalPathAsRemoteArchive({
+                target: remoteTarget,
+                localPath: sync.localPath,
+                remoteArchivePath: sync.remoteArchivePath,
+                dereferenceSymlinks: sync.dereferenceSymlinks,
+                onLog: opts.onLog,
+              });
+              uploadedRuntimePaths.set(sync.localPath, sync.remoteArchivePath);
+            }
+
+            if (!agentContextArchiveUploaded) {
+              const agentContextFiles = await collectRemoteAgentContextFiles({
+                repoRoot: remoteRepoResolution.repoRoot,
+                agentAdapterConfig: parseObject(agent.adapterConfig),
+              });
+              if (agentContextFiles) {
+                try {
+                  await uploadLocalPathAsRemoteArchive({
+                    target: remoteTarget,
+                    localPath: agentContextFiles.stagingDir,
+                    remoteArchivePath: `${remoteLease.remoteRoot}/archives/agent-files.tar.gz`,
+                    onLog: opts.onLog,
+                  });
+                  materializations.push({
+                    archivePath: `${remoteLease.remoteRoot}/archives/agent-files.tar.gz`,
+                    targetKind: "worktree",
+                  });
+                  await onLog(
+                    "stderr",
+                    `[paperclip] Synced ${agentContextFiles.fileCount} agent file(s) into the remote worktree.\n`,
+                  );
+                } finally {
+                  await fs.rm(agentContextFiles.stagingDir, { recursive: true, force: true });
+                }
+              }
+              agentContextArchiveUploaded = true;
+            }
+
+            return await runRemoteProcess({
+              runId: remoteRunId,
+              target: remoteTarget,
+              command,
+              args: runtimePathPlan.args,
+              cwd: undefined,
+              repoUrl: remoteRepo.repoUrl,
+              repoRef: remoteRepo.baseRef,
+              worktreeName: remoteRepo.worktreeName,
+              materializations,
+              env: opts.env,
+              stdin: opts.stdin,
+              timeoutSec: opts.timeoutSec,
+              graceSec: opts.graceSec,
+              onLog: opts.onLog,
+              onMeta: onAdapterMeta,
+            });
+          } catch (err) {
+            opts.onLogError?.(err, remoteRunId, "remote process runner failed");
+            throw err;
+          }
+        };
+
+        if (agent.adapterType === "codex_local") {
+          adapterResult = await executeCodexWithProcessRunner(
+            {
+              runId: run.id,
+              agent,
+              runtime: runtimeForExecution,
+              config: resolvedConfig,
+              context,
+              onLog,
+              onMeta: onAdapterMeta,
+              authToken: authToken ?? undefined,
+            },
+            remoteProcessRunner,
+          );
+        } else if (agent.adapterType === "claude_local") {
+          adapterResult = await executeClaudeWithProcessRunner(
+            {
+              runId: run.id,
+              agent,
+              runtime: runtimeForExecution,
+              config: resolvedConfig,
+              context,
+              onLog,
+              onMeta: onAdapterMeta,
+              authToken: authToken ?? undefined,
+            },
+            remoteProcessRunner,
+          );
+        } else {
+          const remote = await executeRemoteRun({
+            runId: run.id,
+            adapterType: agent.adapterType,
+            target: remoteTarget,
+            agent,
+            config: resolvedConfig,
+            runtime: {
+              sessionId: runtimeForExecution.sessionId,
+              sessionParams: runtimeForExecution.sessionParams,
+            },
+            onLog,
+            onMeta: onAdapterMeta,
+          });
+          adapterResult = remote.adapterResult;
+        }
+      } else {
+        adapterResult = await adapter.execute({
+          runId: run.id,
+          agent,
+          runtime: runtimeForExecution,
+          config: resolvedConfig,
+          context,
+          onLog,
+          onMeta: onAdapterMeta,
+          authToken: authToken ?? undefined,
+        });
+      }
       if (changedDocuments.length > 0) {
         await documentsSvc.markDeliveredToAgent(agent.id, changedDocuments);
       }
       const nextSessionState = resolveNextSessionState({
         codec: sessionCodec,
         adapterResult,
-        previousParams: previousSessionParams,
-        previousDisplayId: runtimeForAdapter.sessionDisplayId,
-        previousLegacySessionId: runtimeForAdapter.sessionId,
+        previousParams: nextSessionStateBase.previousParams,
+        previousDisplayId: nextSessionStateBase.previousDisplayId,
+        previousLegacySessionId: nextSessionStateBase.previousLegacySessionId,
       });
+      nextSessionState.params = mergeWorkspaceRepoIntoSessionParams(
+        nextSessionState.params,
+        resolvedWorkspace,
+      );
 
       let outcome: "succeeded" | "failed" | "cancelled" | "timed_out";
       const latestRun = await getRun(run.id);
@@ -1393,6 +2022,85 @@ export function heartbeatService(db: Db) {
         outcome = "succeeded";
       } else {
         outcome = "failed";
+      }
+
+      let remotePushError: string | null = null;
+      let remotePushSha: string | null = null;
+      if (
+        outcome === "succeeded" &&
+        remoteLeaseForRun &&
+        remoteTargetForRun &&
+        remoteRepoForRun
+      ) {
+        const pushScript =
+          "set -eu\n" +
+          "if [ -n \"$(git status --porcelain)\" ]; then\n" +
+          "  git add -A\n" +
+          "  if ! git diff --cached --quiet; then\n" +
+          "    if [ -n \"${PAPERCLIP_GIT_NAME:-}\" ] && [ -n \"${PAPERCLIP_GIT_EMAIL:-}\" ]; then\n" +
+          "      GIT_AUTHOR_NAME=\"$PAPERCLIP_GIT_NAME\" GIT_AUTHOR_EMAIL=\"$PAPERCLIP_GIT_EMAIL\" GIT_COMMITTER_NAME=\"$PAPERCLIP_GIT_NAME\" GIT_COMMITTER_EMAIL=\"$PAPERCLIP_GIT_EMAIL\" git commit -m \"$PAPERCLIP_COMMIT_MSG\"\n" +
+          "    else\n" +
+          "      git commit -m \"$PAPERCLIP_COMMIT_MSG\"\n" +
+          "    fi\n" +
+          "  fi\n" +
+          "fi\n" +
+          "sha=\"$(git rev-parse HEAD)\"\n" +
+          "git push -u origin \"HEAD:refs/heads/$PAPERCLIP_BRANCH\"\n" +
+          "printf '__PAPERCLIP_SHA__%s\\n' \"$sha\"\n";
+        const pushProc = await runRemoteProcess({
+          runId: `${run.id}-push`,
+          target: remoteTargetForRun,
+          command: "bash",
+          args: ["-lc", pushScript],
+          cwd: undefined,
+          repoUrl: remoteRepoForRun.repoUrl,
+          repoRef: remoteRepoForRun.baseRef,
+          worktreeName: remoteRepoForRun.worktreeName,
+          env: {
+            PAPERCLIP_BRANCH: remoteRepoForRun.branchName,
+            PAPERCLIP_COMMIT_MSG: remoteRepoForRun.commitMessage,
+            ...(remoteGitIdentityForRun
+              ? {
+                  PAPERCLIP_GIT_NAME: remoteGitIdentityForRun.name,
+                  PAPERCLIP_GIT_EMAIL: remoteGitIdentityForRun.email,
+                }
+              : {}),
+          },
+          timeoutSec: 120,
+          graceSec: 20,
+          onLog,
+          onMeta: onAdapterMeta,
+        });
+
+        const marker = pushProc.stdout
+          .split(/\r?\n/)
+          .map((line) => line.trim())
+          .find((line) => line.startsWith("__PAPERCLIP_SHA__"));
+        remotePushSha = marker ? marker.replace("__PAPERCLIP_SHA__", "").trim() : null;
+
+        if (pushProc.timedOut) {
+          remotePushError = "Remote branch push timed out";
+        } else if ((pushProc.exitCode ?? 0) !== 0) {
+          const pushErrLine =
+            pushProc.stderr
+              .split(/\r?\n/)
+              .map((line) => line.trim())
+              .find(Boolean) ?? "";
+          remotePushError = pushErrLine || `Remote branch push failed with code ${pushProc.exitCode ?? -1}`;
+        }
+
+        if (!remotePushError && remotePushSha) {
+          await remoteExecSvc.updateLeaseForRun(remoteLeaseForRun.id, {
+            lastPushedCommitSha: remotePushSha,
+            status: "active",
+          });
+        } else if (remotePushError) {
+          outcome = "failed";
+          await remoteExecSvc.updateLeaseForRun(remoteLeaseForRun.id, {
+            status: "error",
+          });
+          await onLog("stderr", `[paperclip] ${remotePushError}\n`);
+        }
       }
 
       let logSummary: { bytes: number; sha256?: string; compressed: boolean } | null = null;
@@ -1423,19 +2131,30 @@ export function heartbeatService(db: Db) {
         error:
           outcome === "succeeded"
             ? null
-            : adapterResult.errorMessage ?? (outcome === "timed_out" ? "Timed out" : "Adapter failed"),
+            : remotePushError ??
+              adapterResult.errorMessage ??
+              (outcome === "timed_out" ? "Timed out" : "Adapter failed"),
         errorCode:
           outcome === "timed_out"
             ? "timeout"
             : outcome === "cancelled"
               ? "cancelled"
               : outcome === "failed"
-                ? (adapterResult.errorCode ?? "adapter_failed")
+                ? (remotePushError ? "remote_push_failed" : (adapterResult.errorCode ?? "adapter_failed"))
                 : null,
         exitCode: adapterResult.exitCode,
         signal: adapterResult.signal,
         usageJson,
-        resultJson: adapterResult.resultJson ?? null,
+        resultJson: {
+          ...(adapterResult.resultJson ?? {}),
+          ...(remoteLeaseForRun
+            ? {
+                remoteLeaseId: remoteLeaseForRun.id,
+                remoteBranchName: remoteRepoForRun?.branchName ?? remoteLeaseForRun.branchName,
+                remoteLastPushedCommitSha: remotePushSha,
+              }
+            : {}),
+        },
         sessionIdAfter: nextSessionState.displayId ?? nextSessionState.legacySessionId,
         stdoutExcerpt,
         stderrExcerpt,
@@ -1468,7 +2187,13 @@ export function heartbeatService(db: Db) {
         await updateRuntimeState(agent, finalizedRun, adapterResult, {
           legacySessionId: nextSessionState.legacySessionId,
         });
-        if (taskKey) {
+        if (remoteLeaseForRun) {
+          await remoteExecSvc.updateLeaseForRun(remoteLeaseForRun.id, {
+            sessionState: nextSessionState.params,
+            lastRunId: finalizedRun.id,
+            ...(remotePushSha ? { lastPushedCommitSha: remotePushSha } : {}),
+          });
+        } else if (taskKey) {
           if (adapterResult.clearSession || (!nextSessionState.params && !nextSessionState.displayId)) {
             await clearTaskSessions(agent.companyId, agent.id, {
               taskKey,
@@ -1532,10 +2257,15 @@ export function heartbeatService(db: Db) {
           timedOut: false,
           errorMessage: message,
         }, {
-          legacySessionId: runtimeForAdapter.sessionId,
+          legacySessionId: runtimeForExecution.sessionId,
         });
 
-        if (taskKey && (previousSessionParams || previousSessionDisplayId || taskSession)) {
+        if (remoteLeaseForRun) {
+          await remoteExecSvc.updateLeaseForRun(remoteLeaseForRun.id, {
+            sessionState: nextSessionStateBase.previousParams,
+            lastRunId: failedRun.id,
+          });
+        } else if (taskKey && (previousSessionParams || previousSessionDisplayId || taskSession)) {
           await upsertTaskSession({
             companyId: agent.companyId,
             agentId: agent.id,

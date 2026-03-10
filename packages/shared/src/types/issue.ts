@@ -1,4 +1,4 @@
-import type { IssuePriority, IssueStatus } from "../constants.js";
+import type { IssueExecutionMode, IssuePriority, IssueStatus } from "../constants.js";
 import type { Goal } from "./goal.js";
 import type { Project, ProjectWorkspace } from "./project.js";
 
@@ -66,6 +66,8 @@ export interface Issue {
   executionRunId: string | null;
   executionAgentNameKey: string | null;
   executionLockedAt: Date | null;
+  executionMode: IssueExecutionMode;
+  executionTargetId: string | null;
   createdByAgentId: string | null;
   createdByUserId: string | null;
   issueNumber: number | null;

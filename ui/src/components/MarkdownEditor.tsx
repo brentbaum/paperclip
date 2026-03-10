@@ -55,6 +55,8 @@ interface MarkdownEditorProps {
   mentions?: MentionOption[];
   /** Called on Cmd/Ctrl+Enter */
   onSubmit?: () => void;
+  /** Called when a mention is selected from the autocomplete dropdown */
+  onMentionSelect?: (option: MentionOption) => void;
 }
 
 export interface MarkdownEditorRef {
@@ -200,6 +202,7 @@ export const MarkdownEditor = forwardRef<MarkdownEditorRef, MarkdownEditorProps>
   bordered = true,
   mentions,
   onSubmit,
+  onMentionSelect,
 }: MarkdownEditorProps, forwardedRef) {
   const containerRef = useRef<HTMLDivElement>(null);
   const ref = useRef<MDXEditorMethods>(null);
@@ -389,8 +392,10 @@ export const MarkdownEditor = forwardRef<MarkdownEditorRef, MarkdownEditorProps>
 
       mentionStateRef.current = null;
       setMentionState(null);
+
+      onMentionSelect?.(option);
     },
-    [decorateProjectMentions, onChange],
+    [decorateProjectMentions, onChange, onMentionSelect],
   );
 
   function hasFilePayload(evt: DragEvent<HTMLDivElement>) {

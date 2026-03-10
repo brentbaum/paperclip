@@ -12,6 +12,7 @@ import {
   issueComments,
   issues,
   labels,
+  remoteExecutionTargets,
   projectWorkspaces,
   projects,
 } from "@paperclipai/db";
@@ -200,6 +201,25 @@ export function issueService(db: Db) {
       .then((rows) => rows[0] ?? null);
     if (!membership) {
       throw notFound("Assignee user not found");
+    }
+  }
+
+  async function assertExecutionTargetForCompany(companyId: string, targetId: string) {
+    const target = await db
+      .select({ id: remoteExecutionTargets.id, archivedAt: remoteExecutionTargets.archivedAt })
+      .from(remoteExecutionTargets)
+      .where(
+        and(
+          eq(remoteExecutionTargets.id, targetId),
+          eq(remoteExecutionTargets.companyId, companyId),
+        ),
+      )
+      .then((rows) => rows[0] ?? null);
+    if (!target) {
+      throw unprocessable("Remote execution target not found for this company");
+    }
+    if (target.archivedAt) {
+      throw unprocessable("Remote execution target is archived");
     }
   }
 
@@ -395,6 +415,17 @@ export function issueService(db: Db) {
       if (data.status === "in_progress" && !data.assigneeAgentId && !data.assigneeUserId) {
         throw unprocessable("in_progress issues require an assignee");
       }
+      if (data.executionMode === "remote") {
+        if (!data.assigneeAgentId) {
+          throw unprocessable("remote execution requires an agent assignee");
+        }
+        if (!data.executionTargetId) {
+          throw unprocessable("remote execution requires an execution target");
+        }
+      }
+      if (data.executionTargetId) {
+        await assertExecutionTargetForCompany(companyId, data.executionTargetId);
+      }
       return db.transaction(async (tx) => {
         const [company] = await tx
           .update(companies)
@@ -448,6 +479,11 @@ export function issueService(db: Db) {
         issueData.assigneeAgentId !== undefined ? issueData.assigneeAgentId : existing.assigneeAgentId;
       const nextAssigneeUserId =
         issueData.assigneeUserId !== undefined ? issueData.assigneeUserId : existing.assigneeUserId;
+      const nextExecutionMode = issueData.executionMode ?? existing.executionMode;
+      const nextExecutionTargetId =
+        issueData.executionTargetId !== undefined
+          ? issueData.executionTargetId
+          : existing.executionTargetId;
 
       if (nextAssigneeAgentId && nextAssigneeUserId) {
         throw unprocessable("Issue can only have one assignee");
@@ -460,6 +496,20 @@ export function issueService(db: Db) {
       }
       if (issueData.assigneeUserId) {
         await assertAssignableUser(existing.companyId, issueData.assigneeUserId);
+      }
+      if (nextExecutionMode === "remote") {
+        if (!nextAssigneeAgentId) {
+          throw unprocessable("remote execution requires an agent assignee");
+        }
+        if (!nextExecutionTargetId) {
+          throw unprocessable("remote execution requires an execution target");
+        }
+      }
+      if (nextExecutionTargetId) {
+        await assertExecutionTargetForCompany(existing.companyId, nextExecutionTargetId);
+      }
+      if (nextExecutionMode === "default" && issueData.executionTargetId === undefined) {
+        patch.executionTargetId = null;
       }
 
       applyStatusSideEffects(issueData.status, patch);

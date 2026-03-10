@@ -62,6 +62,14 @@ import {
   Settings,
 } from "lucide-react";
 import { Input } from "@/components/ui/input";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import { AgentIcon, AgentIconPicker } from "../components/AgentIconPicker";
 import { isUuidLike, type Agent, type HeartbeatRun, type HeartbeatRunEvent, type AgentRuntimeState } from "@paperclipai/shared";
 import { agentRouteRef } from "../lib/utils";
@@ -256,6 +264,7 @@ export function AgentDetail() {
   const navigate = useNavigate();
   const [actionError, setActionError] = useState<string | null>(null);
   const [moreOpen, setMoreOpen] = useState(false);
+  const [terminateDialogOpen, setTerminateDialogOpen] = useState(false);
   const activeView = urlRunId ? "runs" as AgentDetailView : parseAgentDetailView(urlTab ?? null);
   const [selectedFilePath, setSelectedFilePath] = useState<string | null>(null);
   const [configDirty, setConfigDirty] = useState(false);
@@ -393,6 +402,12 @@ export function AgentDetail() {
       setActionError(err instanceof Error ? err.message : "Action failed");
     },
   });
+
+  useEffect(() => {
+    if (!agentAction.isPending) return;
+    if (agentAction.variables !== "terminate") return;
+    setTerminateDialogOpen(false);
+  }, [agentAction.isPending, agentAction.variables]);
 
   const updateIcon = useMutation({
     mutationFn: (icon: string) => agentsApi.update(agentLookupRef, { icon }, resolvedCompanyId ?? undefined),
@@ -633,7 +648,7 @@ export function AgentDetail() {
               <button
                 className="flex items-center gap-2 w-full px-2 py-1.5 text-xs rounded hover:bg-accent/50 text-destructive"
                 onClick={() => {
-                  agentAction.mutate("terminate");
+                  setTerminateDialogOpen(true);
                   setMoreOpen(false);
                 }}
               >
@@ -646,6 +661,33 @@ export function AgentDetail() {
       </div>
 
       {actionError && <p className="text-sm text-destructive">{actionError}</p>}
+      <Dialog open={terminateDialogOpen} onOpenChange={setTerminateDialogOpen}>
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>Terminate agent?</DialogTitle>
+            <DialogDescription>
+              This will stop future work for {agent.name} and mark the agent as terminated.
+              Existing files stay on disk, but the agent will disappear from normal assignment flows.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button
+              variant="outline"
+              onClick={() => setTerminateDialogOpen(false)}
+              disabled={agentAction.isPending}
+            >
+              Cancel
+            </Button>
+            <Button
+              variant="destructive"
+              onClick={() => agentAction.mutate("terminate")}
+              disabled={agentAction.isPending}
+            >
+              {agentAction.isPending && agentAction.variables === "terminate" ? "Terminating..." : "Terminate agent"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
       {isPendingApproval && (
         <p className="text-sm text-amber-500">
           This agent is pending board approval and cannot be invoked yet.
