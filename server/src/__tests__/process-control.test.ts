@@ -52,6 +52,21 @@ describe("processControlRoutes", () => {
     expect(requestRestart).not.toHaveBeenCalled();
   });
 
+  it("accepts restart requests from authenticated agents", async () => {
+    const requestRestart = vi.fn();
+    const app = createApp(
+      { type: "agent", agentId: "agent-1", companyId: "company-1", source: "agent_key" },
+      { isRestartEnabled: () => true, requestRestart },
+    );
+
+    const res = await request(app).post("/api/control/restart");
+    expect(res.status).toBe(202);
+    expect(res.body).toEqual({ status: "accepted", action: "restart" });
+
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(requestRestart).toHaveBeenCalledWith("api:agent:agent-1");
+  });
+
   it("requires instance admin board access", async () => {
     const requestRestart = vi.fn();
     const app = createApp(
@@ -62,6 +77,19 @@ describe("processControlRoutes", () => {
     const res = await request(app).post("/api/control/restart");
     expect(res.status).toBe(403);
     expect(res.body).toEqual({ error: "Instance admin access required" });
+    expect(requestRestart).not.toHaveBeenCalled();
+  });
+
+  it("rejects unauthenticated restart requests", async () => {
+    const requestRestart = vi.fn();
+    const app = createApp(
+      { type: "none", source: "none" },
+      { isRestartEnabled: () => true, requestRestart },
+    );
+
+    const res = await request(app).post("/api/control/restart");
+    expect(res.status).toBe(401);
+    expect(res.body).toEqual({ error: "Unauthorized" });
     expect(requestRestart).not.toHaveBeenCalled();
   });
 });

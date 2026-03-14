@@ -46,7 +46,7 @@ pnpm dev:live
 
 This keeps the previous watch-based workflow: `tsx watch` on the server plus Vite dev middleware for the UI.
 
-The default `pnpm dev` flow now enables a supervisor-backed self-restart path. An instance admin can request a rebuild + relaunch with:
+The default `pnpm dev` flow now enables a supervisor-backed self-restart path. An instance admin or an authenticated agent can request a rebuild + relaunch with:
 
 ```sh
 curl -X POST http://localhost:3100/api/control/restart
