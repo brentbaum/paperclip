@@ -27,6 +27,7 @@ import { assetRoutes } from "./routes/assets.js";
 import { accessRoutes } from "./routes/access.js";
 import { telegramRoutes } from "./routes/telegram.js";
 import { remoteExecutionRoutes } from "./routes/remote-execution.js";
+import { processControlRoutes } from "./routes/process-control.js";
 import type { BetterAuthSessionResult } from "./auth/better-auth.js";
 import type { TelegramService } from "./services/telegram.js";
 
@@ -123,6 +124,7 @@ export async function createApp(
   api.use(dashboardRoutes(db));
   api.use(sidebarBadgeRoutes(db));
   api.use(remoteExecutionRoutes(db));
+  api.use(processControlRoutes());
   api.use(
     accessRoutes(db, {
       deploymentMode: opts.deploymentMode,

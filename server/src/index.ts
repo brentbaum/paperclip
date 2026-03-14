@@ -31,6 +31,7 @@ import { agentService, approvalService, companyService, heartbeatService, issueS
 import { createStorageServiceFromConfig } from "./storage/index.js";
 import { printStartupBanner } from "./startup-banner.js";
 import { getBoardClaimWarningUrl, initializeBoardClaimChallenge } from "./board-claim.js";
+import { getSelfRestartExitCode, registerSelfRestartHandler } from "./process-control.js";
 
 type BetterAuthSessionUser = {
   id: string;
@@ -645,6 +646,30 @@ server.listen(listenPort, config.host, () => {
   }
 });
 
+async function closeHttpServer(timeoutMs = 2000) {
+  if (!server.listening) return;
+
+  await new Promise<void>((resolve) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      logger.warn({ timeoutMs }, "Timed out waiting for HTTP server to close cleanly");
+      resolve();
+    }, timeoutMs);
+
+    server.close((err) => {
+      clearTimeout(timer);
+      if (settled) return;
+      settled = true;
+      if (err) {
+        logger.error({ err }, "Failed to close HTTP server cleanly");
+      }
+      resolve();
+    });
+  });
+}
+
 function shutdownTailscaleServe() {
   if (config.tailscaleServe) {
     try {
@@ -664,51 +689,46 @@ async function stopTelegramService() {
   }
 }
 
-if (embeddedPostgres && embeddedPostgresStartedByThisProcess) {
-  const shutdown = async (signal: "SIGINT" | "SIGTERM") => {
+let shutdownPromise: Promise<void> | null = null;
+
+async function shutdown(opts: {
+  signal?: "SIGINT" | "SIGTERM";
+  reason: string;
+  exitCode: number;
+}) {
+  if (shutdownPromise) return shutdownPromise;
+
+  shutdownPromise = (async () => {
+    logger.info({ signal: opts.signal, reason: opts.reason, exitCode: opts.exitCode }, "Shutting down");
+    await closeHttpServer();
     await stopTelegramService();
     shutdownTailscaleServe();
-    logger.info({ signal }, "Stopping embedded PostgreSQL");
-    try {
-      await embeddedPostgres?.stop();
-    } catch (err) {
-      logger.error({ err }, "Failed to stop embedded PostgreSQL cleanly");
-    } finally {
-      process.exit(0);
+
+    if (embeddedPostgres && embeddedPostgresStartedByThisProcess) {
+      logger.info({ reason: opts.reason }, "Stopping embedded PostgreSQL");
+      try {
+        await embeddedPostgres.stop();
+      } catch (err) {
+        logger.error({ err }, "Failed to stop embedded PostgreSQL cleanly");
+      }
     }
-  };
 
-  process.once("SIGINT", () => {
-    void shutdown("SIGINT");
-  });
-  process.once("SIGTERM", () => {
-    void shutdown("SIGTERM");
-  });
-} else if (config.tailscaleServe) {
-  const shutdown = async (signal: "SIGINT" | "SIGTERM") => {
-    await stopTelegramService();
-    shutdownTailscaleServe();
-    logger.info({ signal }, "Shutting down");
-    process.exit(0);
-  };
+    process.exit(opts.exitCode);
+  })();
 
-  process.once("SIGINT", () => {
-    void shutdown("SIGINT");
-  });
-  process.once("SIGTERM", () => {
-    void shutdown("SIGTERM");
-  });
-} else {
-  const shutdown = async (signal: "SIGINT" | "SIGTERM") => {
-    await stopTelegramService();
-    logger.info({ signal }, "Shutting down");
-    process.exit(0);
-  };
-
-  process.once("SIGINT", () => {
-    void shutdown("SIGINT");
-  });
-  process.once("SIGTERM", () => {
-    void shutdown("SIGTERM");
-  });
+  return shutdownPromise;
 }
+
+registerSelfRestartHandler((reason) => {
+  void shutdown({
+    reason,
+    exitCode: getSelfRestartExitCode(),
+  });
+});
+
+process.once("SIGINT", () => {
+  void shutdown({ signal: "SIGINT", reason: "signal", exitCode: 0 });
+});
+process.once("SIGTERM", () => {
+  void shutdown({ signal: "SIGTERM", reason: "signal", exitCode: 0 });
+});

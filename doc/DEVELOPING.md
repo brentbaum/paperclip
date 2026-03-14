@@ -27,8 +27,8 @@ pnpm dev
 This starts:
 
 - API server: `http://localhost:3100`
-- UI: served by the API server in dev middleware mode (same origin as API)
-- server changes auto-reload by default
+- UI: served by the API server from the built frontend bundle (same origin as API)
+- the parent runner rebuilds and relaunches the server when `POST /api/control/restart` is requested
 
 Tailscale/private-auth dev mode:
 
@@ -36,7 +36,23 @@ Tailscale/private-auth dev mode:
 pnpm dev --tailscale-auth
 ```
 
-This runs dev as `authenticated/private` and binds the server to `0.0.0.0` for private-network access.
+This runs the built-mode supervisor as `authenticated/private` and binds the server to `0.0.0.0` for private-network access.
+
+Live reload mode:
+
+```sh
+pnpm dev:live
+```
+
+This keeps the previous watch-based workflow: `tsx watch` on the server plus Vite dev middleware for the UI.
+
+The default `pnpm dev` flow now enables a supervisor-backed self-restart path. An instance admin can request a rebuild + relaunch with:
+
+```sh
+curl -X POST http://localhost:3100/api/control/restart
+```
+
+The server exits with a restart code, then the parent runner rebuilds and starts it again.
 
 Allow additional private hostnames (for example custom Tailscale hostnames):
 

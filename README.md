@@ -186,7 +186,7 @@ pnpm install
 pnpm dev
 ```
 
-This starts the API server at `http://localhost:3100`. An embedded PostgreSQL database is created automatically — no setup required.
+This builds the workspace, starts the API server at `http://localhost:3100`, and creates an embedded PostgreSQL database automatically — no setup required. Use `pnpm dev:live` if you want the old watch-based workflow.
 
 > **Requirements:** Node.js 20+, pnpm 9.15+
 
@@ -218,7 +218,8 @@ By default, agents run on scheduled heartbeats and event-based triggers (task as
 ## Development
 
 ```bash
-pnpm dev              # Full dev (API + UI)
+pnpm dev              # Built supervisor mode (API + built UI)
+pnpm dev:live         # Live watch mode (API + Vite middleware)
 pnpm dev:server       # Server only
 pnpm build            # Build all
 pnpm typecheck        # Type checking

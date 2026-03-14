@@ -40,8 +40,8 @@ pnpm dev
 This starts:
 
 - API: `http://localhost:3100`
-- UI: `http://localhost:3100` (served by API server in dev middleware mode)
-- server changes auto-reload by default
+- UI: `http://localhost:3100` (served by API server from the built frontend bundle)
+- `pnpm dev:live` is available when you specifically want auto-reload/dev middleware
 
 Quick checks:
 

@@ -27,6 +27,7 @@
     "build": "tsc",
     "clean": "rm -rf dist",
     "start": "node dist/index.js",
+    "start:built": "tsx dist/index.js",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
