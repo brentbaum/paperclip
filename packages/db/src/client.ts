@@ -2,12 +2,17 @@ import { createHash } from "node:crypto";
 import { drizzle as drizzlePg } from "drizzle-orm/postgres-js";
 import { migrate as migratePg } from "drizzle-orm/postgres-js/migrator";
 import { readFile, readdir } from "node:fs/promises";
+import { fileURLToPath } from "node:url";
 import postgres from "postgres";
 import * as schema from "./schema/index.js";
 
-const MIGRATIONS_FOLDER = new URL("./migrations", import.meta.url).pathname;
+const MIGRATIONS_FOLDER = fileURLToPath(new URL("./migrations", import.meta.url));
 const DRIZZLE_MIGRATIONS_TABLE = "__drizzle_migrations";
-const MIGRATIONS_JOURNAL_JSON = new URL("./migrations/meta/_journal.json", import.meta.url).pathname;
+const MIGRATIONS_JOURNAL_JSON = fileURLToPath(new URL("./migrations/meta/_journal.json", import.meta.url));
+
+function createUtilitySql(url: string) {
+  return postgres(url, { max: 1, onnotice: () => {} });
+}
 
 function isSafeIdentifier(value: string): boolean {
   return /^[A-Za-z_][A-Za-z0-9_]*$/.test(value);
@@ -222,7 +227,7 @@ async function applyPendingMigrationsManually(
     journalEntries.map((entry) => [entry.fileName, normalizeFolderMillis(entry.folderMillis)]),
   );
 
-  const sql = postgres(url, { max: 1 });
+  const sql = createUtilitySql(url);
   try {
     const { migrationTableSchema, columnNames } = await ensureMigrationJournalTable(sql);
     const qualifiedTable = `${quoteIdentifier(migrationTableSchema)}.${quoteIdentifier(DRIZZLE_MIGRATIONS_TABLE)}`;
@@ -241,8 +246,6 @@ async function applyPendingMigrationsManually(
 
       await runInTransaction(sql, async () => {
         for (const statement of splitMigrationStatements(migrationContent)) {
-          const alreadyApplied = await migrationStatementAlreadyApplied(sql, statement);
-          if (alreadyApplied) continue;
           await sql.unsafe(statement);
         }
 
@@ -473,7 +476,7 @@ export async function reconcilePendingMigrationHistory(
     return { repairedMigrations: [], remainingMigrations: [] };
   }
 
-  const sql = postgres(url, { max: 1 });
+  const sql = createUtilitySql(url);
   const repairedMigrations: string[] = [];
 
   try {
@@ -580,7 +583,7 @@ async function discoverMigrationTableSchema(sql: ReturnType<typeof postgres>): P
 }
 
 export async function inspectMigrations(url: string): Promise<MigrationState> {
-  const sql = postgres(url, { max: 1 });
+  const sql = createUtilitySql(url);
 
   try {
     const availableMigrations = await listMigrationFiles();
@@ -643,14 +646,11 @@ export async function applyPendingMigrations(url: string): Promise<void> {
   const initialState = await inspectMigrations(url);
   if (initialState.status === "upToDate") return;
 
-  const sql = postgres(url, { max: 1 });
-  let migrateError: unknown = null;
+  const sql = createUtilitySql(url);
 
   try {
     const db = drizzlePg(sql);
     await migratePg(db, { migrationsFolder: MIGRATIONS_FOLDER });
-  } catch (error) {
-    migrateError = error;
   } finally {
     await sql.end();
   }
@@ -662,10 +662,6 @@ export async function applyPendingMigrations(url: string): Promise<void> {
   if (repair.repairedMigrations.length > 0) {
     state = await inspectMigrations(url);
     if (state.status === "upToDate") return;
-  }
-
-  if (migrateError && (state.status !== "needsMigrations" || state.reason !== "pending-migrations")) {
-    throw migrateError;
   }
 
   if (state.status !== "needsMigrations" || state.reason !== "pending-migrations") {
@@ -688,7 +684,7 @@ export type MigrationBootstrapResult =
   | { migrated: false; reason: "not-empty-no-migration-journal"; tableCount: number };
 
 export async function migratePostgresIfEmpty(url: string): Promise<MigrationBootstrapResult> {
-  const sql = postgres(url, { max: 1 });
+  const sql = createUtilitySql(url);
 
   try {
     const migrationTableSchema = await discoverMigrationTableSchema(sql);
@@ -711,8 +707,7 @@ export async function migratePostgresIfEmpty(url: string): Promise<MigrationBoot
     }
 
     const db = drizzlePg(sql);
-    const migrationsFolder = new URL("./migrations", import.meta.url).pathname;
-    await migratePg(db, { migrationsFolder });
+    await migratePg(db, { migrationsFolder: MIGRATIONS_FOLDER });
 
     return { migrated: true, reason: "migrated-empty-db", tableCount: 0 };
   } finally {
@@ -728,14 +723,14 @@ export async function ensurePostgresDatabase(
     throw new Error(`Unsafe database name: ${databaseName}`);
   }
 
-  const sql = postgres(url, { max: 1 });
+  const sql = createUtilitySql(url);
   try {
     const existing = await sql<{ one: number }[]>`
       select 1 as one from pg_database where datname = ${databaseName} limit 1
     `;
     if (existing.length > 0) return "exists";
 
-    await sql.unsafe(`create database "${databaseName}"`);
+    await sql.unsafe(`create database "${databaseName}" encoding 'UTF8' lc_collate 'C' lc_ctype 'C' template template0`);
     return "created";
   } finally {
     await sql.end();

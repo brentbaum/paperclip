@@ -2,13 +2,14 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import type { AdapterExecutionContext, AdapterExecutionResult } from "@paperclipai/adapter-utils";
+import { inferOpenAiCompatibleBiller, type AdapterExecutionContext, type AdapterExecutionResult } from "@paperclipai/adapter-utils";
 import {
   asString,
   asNumber,
   asStringArray,
   parseObject,
   buildPaperclipEnv,
+  joinPromptSections,
   redactEnvForLogs,
   ensureAbsoluteDirectory,
   ensureCommandResolvable,
@@ -16,8 +17,8 @@ import {
   renderTemplate,
   runChildProcess,
 } from "@paperclipai/adapter-utils/server-utils";
-import { DEFAULT_OPENCODE_LOCAL_MODEL } from "../index.js";
-import { parseOpenCodeJsonl, isOpenCodeUnknownSessionError } from "./parse.js";
+import { isOpenCodeUnknownSessionError, parseOpenCodeJsonl } from "./parse.js";
+import { ensureOpenCodeModelConfiguredAndAvailable } from "./models.js";
 
 const __moduleDir = path.dirname(fileURLToPath(import.meta.url));
 const PAPERCLIP_SKILLS_CANDIDATES = [
@@ -34,81 +35,15 @@ function firstNonEmptyLine(text: string): string {
   );
 }
 
-function getEffectiveEnvValue(envOverrides: Record<string, string>, key: string): string {
-  if (Object.prototype.hasOwnProperty.call(envOverrides, key)) {
-    const raw = envOverrides[key];
-    return typeof raw === "string" ? raw : "";
-  }
-  const raw = process.env[key];
-  return typeof raw === "string" ? raw : "";
-}
-
-function hasEffectiveEnvValue(envOverrides: Record<string, string>, key: string): boolean {
-  return getEffectiveEnvValue(envOverrides, key).trim().length > 0;
-}
-
-function resolveOpenCodeBillingType(env: Record<string, string>): "api" | "subscription" {
-  return hasEffectiveEnvValue(env, "OPENAI_API_KEY") ? "api" : "subscription";
-}
-
-function resolveProviderFromModel(model: string): string | null {
+function parseModelProvider(model: string | null): string | null {
+  if (!model) return null;
   const trimmed = model.trim();
-  if (!trimmed) return null;
-  const slash = trimmed.indexOf("/");
-  if (slash <= 0) return null;
-  return trimmed.slice(0, slash).toLowerCase();
+  if (!trimmed.includes("/")) return null;
+  return trimmed.slice(0, trimmed.indexOf("/")).trim() || null;
 }
 
-function isProviderModelNotFoundFailure(stdout: string, stderr: string): boolean {
-  const haystack = `${stdout}\n${stderr}`;
-  return /ProviderModelNotFoundError|provider model not found/i.test(haystack);
-}
-
-type ProviderModelNotFoundDetails = {
-  providerId: string | null;
-  modelId: string | null;
-  suggestions: string[];
-};
-
-function parseProviderModelNotFoundDetails(
-  stdout: string,
-  stderr: string,
-): ProviderModelNotFoundDetails | null {
-  if (!isProviderModelNotFoundFailure(stdout, stderr)) return null;
-  const haystack = `${stdout}\n${stderr}`;
-
-  const providerMatch = haystack.match(/providerID:\s*"([^"]+)"/i);
-  const modelMatch = haystack.match(/modelID:\s*"([^"]+)"/i);
-  const suggestionsMatch = haystack.match(/suggestions:\s*\[([^\]]*)\]/i);
-  const suggestions = suggestionsMatch
-    ? Array.from(
-        suggestionsMatch[1].matchAll(/"([^"]+)"/g),
-        (match) => match[1].trim(),
-      ).filter((value) => value.length > 0)
-    : [];
-
-  return {
-    providerId: providerMatch?.[1]?.trim().toLowerCase() || null,
-    modelId: modelMatch?.[1]?.trim() || null,
-    suggestions,
-  };
-}
-
-function formatModelNotFoundError(
-  model: string,
-  providerFromModel: string | null,
-  details: ProviderModelNotFoundDetails | null,
-): string {
-  const provider = details?.providerId || providerFromModel || "unknown";
-  const missingModel = details?.modelId || model;
-  const suggestions = details?.suggestions ?? [];
-  const suggestionText =
-    suggestions.length > 0 ? ` Suggested models: ${suggestions.map((value) => `\`${value}\``).join(", ")}.` : "";
-  return (
-    `OpenCode model \`${missingModel}\` is unavailable for provider \`${provider}\`.` +
-    ` Run \`opencode models ${provider}\` and set adapterConfig.model to a supported value.` +
-    suggestionText
-  );
+function resolveOpenCodeBiller(env: Record<string, string>, provider: string | null): string {
+  return inferOpenAiCompatibleBiller(env, null) ?? provider ?? "unknown";
 }
 
 function claudeSkillsHome(): string {
@@ -160,8 +95,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     "You are agent {{agent.id}} ({{agent.name}}). Continue your Paperclip work.",
   );
   const command = asString(config.command, "opencode");
-  const model = asString(config.model, DEFAULT_OPENCODE_LOCAL_MODEL);
-  const variant = asString(config.variant, asString(config.effort, ""));
+  const model = asString(config.model, "").trim();
+  const variant = asString(config.variant, "").trim();
 
   const workspaceContext = parseObject(context.paperclipWorkspace);
   const workspaceCwd = asString(workspaceContext.cwd, "");
@@ -169,6 +104,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const workspaceId = asString(workspaceContext.workspaceId, "");
   const workspaceRepoUrl = asString(workspaceContext.repoUrl, "");
   const workspaceRepoRef = asString(workspaceContext.repoRef, "");
+  const agentHome = asString(workspaceContext.agentHome, "");
   const workspaceHints = Array.isArray(context.paperclipWorkspaces)
     ? context.paperclipWorkspaces.filter(
         (value): value is Record<string, unknown> => typeof value === "object" && value !== null,
@@ -209,51 +145,39 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const linkedIssueIds = Array.isArray(context.issueIds)
     ? context.issueIds.filter((value): value is string => typeof value === "string" && value.trim().length > 0)
     : [];
-  if (wakeTaskId) {
-    env.PAPERCLIP_TASK_ID = wakeTaskId;
-  }
-  if (wakeReason) {
-    env.PAPERCLIP_WAKE_REASON = wakeReason;
-  }
-  if (wakeCommentId) {
-    env.PAPERCLIP_WAKE_COMMENT_ID = wakeCommentId;
-  }
-  if (approvalId) {
-    env.PAPERCLIP_APPROVAL_ID = approvalId;
-  }
-  if (approvalStatus) {
-    env.PAPERCLIP_APPROVAL_STATUS = approvalStatus;
-  }
-  if (linkedIssueIds.length > 0) {
-    env.PAPERCLIP_LINKED_ISSUE_IDS = linkedIssueIds.join(",");
-  }
-  if (effectiveWorkspaceCwd) {
-    env.PAPERCLIP_WORKSPACE_CWD = effectiveWorkspaceCwd;
-  }
-  if (workspaceSource) {
-    env.PAPERCLIP_WORKSPACE_SOURCE = workspaceSource;
-  }
-  if (workspaceId) {
-    env.PAPERCLIP_WORKSPACE_ID = workspaceId;
-  }
-  if (workspaceRepoUrl) {
-    env.PAPERCLIP_WORKSPACE_REPO_URL = workspaceRepoUrl;
-  }
-  if (workspaceRepoRef) {
-    env.PAPERCLIP_WORKSPACE_REPO_REF = workspaceRepoRef;
-  }
-  if (workspaceHints.length > 0) {
-    env.PAPERCLIP_WORKSPACES_JSON = JSON.stringify(workspaceHints);
-  }
-  for (const [k, v] of Object.entries(envConfig)) {
-    if (typeof v === "string") env[k] = v;
+  if (wakeTaskId) env.PAPERCLIP_TASK_ID = wakeTaskId;
+  if (wakeReason) env.PAPERCLIP_WAKE_REASON = wakeReason;
+  if (wakeCommentId) env.PAPERCLIP_WAKE_COMMENT_ID = wakeCommentId;
+  if (approvalId) env.PAPERCLIP_APPROVAL_ID = approvalId;
+  if (approvalStatus) env.PAPERCLIP_APPROVAL_STATUS = approvalStatus;
+  if (linkedIssueIds.length > 0) env.PAPERCLIP_LINKED_ISSUE_IDS = linkedIssueIds.join(",");
+  if (effectiveWorkspaceCwd) env.PAPERCLIP_WORKSPACE_CWD = effectiveWorkspaceCwd;
+  if (workspaceSource) env.PAPERCLIP_WORKSPACE_SOURCE = workspaceSource;
+  if (workspaceId) env.PAPERCLIP_WORKSPACE_ID = workspaceId;
+  if (workspaceRepoUrl) env.PAPERCLIP_WORKSPACE_REPO_URL = workspaceRepoUrl;
+  if (workspaceRepoRef) env.PAPERCLIP_WORKSPACE_REPO_REF = workspaceRepoRef;
+  if (agentHome) env.AGENT_HOME = agentHome;
+  if (workspaceHints.length > 0) env.PAPERCLIP_WORKSPACES_JSON = JSON.stringify(workspaceHints);
+
+  for (const [key, value] of Object.entries(envConfig)) {
+    if (typeof value === "string") env[key] = value;
   }
   if (!hasExplicitApiKey && authToken) {
     env.PAPERCLIP_API_KEY = authToken;
   }
-  const billingType = resolveOpenCodeBillingType(env);
-  const runtimeEnv = ensurePathInEnv({ ...process.env, ...env });
+  const runtimeEnv = Object.fromEntries(
+    Object.entries(ensurePathInEnv({ ...process.env, ...env })).filter(
+      (entry): entry is [string, string] => typeof entry[1] === "string",
+    ),
+  );
   await ensureCommandResolvable(command, cwd, runtimeEnv);
+
+  await ensureOpenCodeModelConfiguredAndAvailable({
+    model,
+    command,
+    cwd,
+    env: runtimeEnv,
+  });
 
   const timeoutSec = asNumber(config.timeoutSec, 0);
   const graceSec = asNumber(config.graceSec, 20);
@@ -278,41 +202,46 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   }
 
   const instructionsFilePath = asString(config.instructionsFilePath, "").trim();
-  const instructionsDir = instructionsFilePath ? `${path.dirname(instructionsFilePath)}/` : "";
+  const resolvedInstructionsFilePath = instructionsFilePath
+    ? path.resolve(cwd, instructionsFilePath)
+    : "";
+  const instructionsDir = resolvedInstructionsFilePath ? `${path.dirname(resolvedInstructionsFilePath)}/` : "";
   let instructionsPrefix = "";
-  if (instructionsFilePath) {
+  if (resolvedInstructionsFilePath) {
     try {
-      const instructionsContents = await fs.readFile(instructionsFilePath, "utf8");
+      const instructionsContents = await fs.readFile(resolvedInstructionsFilePath, "utf8");
       instructionsPrefix =
         `${instructionsContents}\n\n` +
-        `The above agent instructions were loaded from ${instructionsFilePath}. ` +
+        `The above agent instructions were loaded from ${resolvedInstructionsFilePath}. ` +
         `Resolve any relative file references from ${instructionsDir}.\n\n`;
       await onLog(
         "stderr",
-        `[paperclip] Loaded agent instructions file: ${instructionsFilePath}\n`,
+        `[paperclip] Loaded agent instructions file: ${resolvedInstructionsFilePath}\n`,
       );
     } catch (err) {
       const reason = err instanceof Error ? err.message : String(err);
       await onLog(
         "stderr",
-        `[paperclip] Warning: could not read agent instructions file "${instructionsFilePath}": ${reason}\n`,
+        `[paperclip] Warning: could not read agent instructions file "${resolvedInstructionsFilePath}": ${reason}\n`,
       );
     }
   }
+
   const commandNotes = (() => {
-    if (!instructionsFilePath) return [] as string[];
+    if (!resolvedInstructionsFilePath) return [] as string[];
     if (instructionsPrefix.length > 0) {
       return [
-        `Loaded agent instructions from ${instructionsFilePath}`,
-        `Prepended instructions + path directive to prompt (relative references from ${instructionsDir}).`,
+        `Loaded agent instructions from ${resolvedInstructionsFilePath}`,
+        `Prepended instructions + path directive to stdin prompt (relative references from ${instructionsDir}).`,
       ];
     }
     return [
-      `Configured instructionsFilePath ${instructionsFilePath}, but file could not be read; continuing without injected instructions.`,
+      `Configured instructionsFilePath ${resolvedInstructionsFilePath}, but file could not be read; continuing without injected instructions.`,
     ];
   })();
 
-  const renderedPrompt = renderTemplate(promptTemplate, {
+  const bootstrapPromptTemplate = asString(config.bootstrapPromptTemplate, "");
+  const templateData = {
     agentId: agent.id,
     companyId: agent.companyId,
     runId,
@@ -320,8 +249,26 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     agent,
     run: { id: runId, source: "on_demand" },
     context,
-  });
-  const prompt = `${instructionsPrefix}${renderedPrompt}`;
+  };
+  const renderedPrompt = renderTemplate(promptTemplate, templateData);
+  const renderedBootstrapPrompt =
+    !sessionId && bootstrapPromptTemplate.trim().length > 0
+      ? renderTemplate(bootstrapPromptTemplate, templateData).trim()
+      : "";
+  const sessionHandoffNote = asString(context.paperclipSessionHandoffMarkdown, "").trim();
+  const prompt = joinPromptSections([
+    instructionsPrefix,
+    renderedBootstrapPrompt,
+    sessionHandoffNote,
+    renderedPrompt,
+  ]);
+  const promptMetrics = {
+    promptChars: prompt.length,
+    instructionsChars: instructionsPrefix.length,
+    bootstrapPromptChars: renderedBootstrapPrompt.length,
+    sessionHandoffChars: sessionHandoffNote.length,
+    heartbeatPromptChars: renderedPrompt.length,
+  };
 
   const buildArgs = (resumeSessionId: string | null) => {
     const args = ["run", "--format", "json"];
@@ -329,7 +276,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     if (model) args.push("--model", model);
     if (variant) args.push("--variant", variant);
     if (extraArgs.length > 0) args.push(...extraArgs);
-    args.push(prompt);
     return args;
   };
 
@@ -341,41 +287,33 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         command,
         cwd,
         commandNotes,
-        commandArgs: args.map((value, idx) => {
-          if (idx === args.length - 1) return `<prompt ${prompt.length} chars>`;
-          return value;
-        }),
+        commandArgs: [...args, `<stdin prompt ${prompt.length} chars>`],
         env: redactEnvForLogs(env),
         prompt,
+        promptMetrics,
         context,
       });
     }
 
     const proc = await runChildProcess(runId, command, args, {
       cwd,
-      env,
+      env: runtimeEnv,
+      stdin: prompt,
       timeoutSec,
       graceSec,
       onLog,
     });
-
     return {
       proc,
+      rawStderr: proc.stderr,
       parsed: parseOpenCodeJsonl(proc.stdout),
     };
   };
 
-  const providerFromModel = resolveProviderFromModel(model);
-
   const toResult = (
     attempt: {
-      proc: {
-        exitCode: number | null;
-        signal: string | null;
-        timedOut: boolean;
-        stdout: string;
-        stderr: string;
-      };
+      proc: { exitCode: number | null; signal: string | null; timedOut: boolean; stdout: string; stderr: string };
+      rawStderr: string;
       parsed: ReturnType<typeof parseOpenCodeJsonl>;
     },
     clearSessionOnMissingSession = false,
@@ -390,7 +328,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       };
     }
 
-    const resolvedSessionId = attempt.parsed.sessionId ?? runtimeSessionId ?? runtime.sessionId ?? null;
+    const resolvedSessionId =
+      attempt.parsed.sessionId ??
+      (clearSessionOnMissingSession ? null : runtimeSessionId ?? runtime.sessionId ?? null);
     const resolvedSessionParams = resolvedSessionId
       ? ({
           sessionId: resolvedSessionId,
@@ -400,50 +340,55 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           ...(workspaceRepoRef ? { repoRef: workspaceRepoRef } : {}),
         } as Record<string, unknown>)
       : null;
+
     const parsedError = typeof attempt.parsed.errorMessage === "string" ? attempt.parsed.errorMessage.trim() : "";
     const stderrLine = firstNonEmptyLine(attempt.proc.stderr);
-    const modelNotFound = parseProviderModelNotFoundDetails(attempt.proc.stdout, attempt.proc.stderr);
-    const fallbackErrorMessage = modelNotFound
-      ? formatModelNotFoundError(model, providerFromModel, modelNotFound)
-      : parsedError ||
-        stderrLine ||
-        `OpenCode exited with code ${attempt.proc.exitCode ?? -1}`;
+    const rawExitCode = attempt.proc.exitCode;
+    const synthesizedExitCode = parsedError && (rawExitCode ?? 0) === 0 ? 1 : rawExitCode;
+    const fallbackErrorMessage =
+      parsedError ||
+      stderrLine ||
+      `OpenCode exited with code ${synthesizedExitCode ?? -1}`;
+    const modelId = model || null;
 
     return {
-      exitCode: attempt.proc.exitCode,
+      exitCode: synthesizedExitCode,
       signal: attempt.proc.signal,
       timedOut: false,
-      errorMessage:
-        (attempt.proc.exitCode ?? 0) === 0
-          ? null
-          : fallbackErrorMessage,
-      usage: attempt.parsed.usage,
+      errorMessage: (synthesizedExitCode ?? 0) === 0 ? null : fallbackErrorMessage,
+      usage: {
+        inputTokens: attempt.parsed.usage.inputTokens,
+        outputTokens: attempt.parsed.usage.outputTokens,
+        cachedInputTokens: attempt.parsed.usage.cachedInputTokens,
+      },
       sessionId: resolvedSessionId,
       sessionParams: resolvedSessionParams,
       sessionDisplayId: resolvedSessionId,
-      provider: providerFromModel,
-      model,
-      billingType,
+      provider: parseModelProvider(modelId),
+      biller: resolveOpenCodeBiller(runtimeEnv, parseModelProvider(modelId)),
+      model: modelId,
+      billingType: "unknown",
       costUsd: attempt.parsed.costUsd,
       resultJson: {
         stdout: attempt.proc.stdout,
         stderr: attempt.proc.stderr,
       },
       summary: attempt.parsed.summary,
-      clearSession: Boolean(clearSessionOnMissingSession && !resolvedSessionId),
+      clearSession: Boolean(clearSessionOnMissingSession && !attempt.parsed.sessionId),
     };
   };
 
   const initial = await runAttempt(sessionId);
+  const initialFailed =
+    !initial.proc.timedOut && ((initial.proc.exitCode ?? 0) !== 0 || Boolean(initial.parsed.errorMessage));
   if (
     sessionId &&
-    !initial.proc.timedOut &&
-    (initial.proc.exitCode ?? 0) !== 0 &&
-    isOpenCodeUnknownSessionError(initial.proc.stdout, initial.proc.stderr)
+    initialFailed &&
+    isOpenCodeUnknownSessionError(initial.proc.stdout, initial.rawStderr)
   ) {
     await onLog(
       "stderr",
-      `[paperclip] OpenCode resume session "${sessionId}" is unavailable; retrying with a fresh session.\n`,
+      `[paperclip] OpenCode session "${sessionId}" is unavailable; retrying with a fresh session.\n`,
     );
     const retry = await runAttempt(null);
     return toResult(retry, true);

@@ -186,7 +186,7 @@ pnpm install
 pnpm dev
 ```
 
-This builds the workspace, starts the API server at `http://localhost:3100`, and creates an embedded PostgreSQL database automatically — no setup required. Use `pnpm dev:live` if you want the old watch-based workflow.
+This starts the API server at `http://localhost:3100`. An embedded PostgreSQL database is created automatically — no setup required.
 
 > **Requirements:** Node.js 20+, pnpm 9.15+
 
@@ -218,8 +218,8 @@ By default, agents run on scheduled heartbeats and event-based triggers (task as
 ## Development
 
 ```bash
-pnpm dev              # Built supervisor mode (API + built UI)
-pnpm dev:live         # Live watch mode (API + Vite middleware)
+pnpm dev              # Full dev (API + UI, watch mode)
+pnpm dev:once         # Full dev without file watching
 pnpm dev:server       # Server only
 pnpm build            # Build all
 pnpm typecheck        # Type checking
@@ -239,7 +239,7 @@ See [doc/DEVELOPING.md](doc/DEVELOPING.md) for the full development guide.
 - ⚪ ClipMart - buy and sell entire agent companies
 - ⚪ Easy agent configurations / easier to understand
 - ⚪ Better support for harness engineering
-- ⚪ Plugin system (e.g. if you want to add a knowledgebase, custom tracing, queues, etc)
+- 🟢 Plugin system (e.g. if you want to add a knowledgebase, custom tracing, queues, etc)
 - ⚪ Better docs
 
 <br/>
@@ -247,8 +247,6 @@ See [doc/DEVELOPING.md](doc/DEVELOPING.md) for the full development guide.
 ## Contributing
 
 We welcome contributions. See the [contributing guide](CONTRIBUTING.md) for details.
-
-<!-- TODO: add CONTRIBUTING.md -->
 
 <br/>
 

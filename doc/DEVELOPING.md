@@ -15,6 +15,14 @@ Current implementation status:
 - Node.js 20+
 - pnpm 9+
 
+## Dependency Lockfile Policy
+
+GitHub Actions owns `pnpm-lock.yaml`.
+
+- Do not commit `pnpm-lock.yaml` in pull requests.
+- Pull request CI validates dependency resolution when manifests change.
+- Pushes to `master` regenerate `pnpm-lock.yaml` with `pnpm install --lockfile-only --no-frozen-lockfile`, commit it back if needed, and then run verification with `--frozen-lockfile`.
+
 ## Start Dev
 
 From repo root:
@@ -29,6 +37,8 @@ This starts:
 - API server: `http://localhost:3100`
 - UI: served by the API server from the built frontend bundle (same origin as API)
 - the parent runner rebuilds and relaunches the server when `POST /api/control/restart` is requested
+
+`pnpm dev` runs the server in watch mode and restarts on changes from workspace packages (including adapter packages). Use `pnpm dev:once` to run without file watching.
 
 Tailscale/private-auth dev mode:
 
@@ -96,6 +106,10 @@ docker compose -f docker-compose.quickstart.yml up --build
 
 See `doc/DOCKER.md` for API key wiring (`OPENAI_API_KEY` / `ANTHROPIC_API_KEY`) and persistence details.
 
+## Docker For Untrusted PR Review
+
+For a separate review-oriented container that keeps `codex`/`claude` login state in Docker volumes and checks out PRs into an isolated scratch workspace, see `doc/UNTRUSTED-PR-REVIEW.md`.
+
 ## Database in Dev (Auto-Handled)
 
 For local development, leave `DATABASE_URL` unset.
@@ -130,6 +144,119 @@ When a local agent run has no resolved project/session workspace, Paperclip fall
 - `~/.paperclip/instances/default/workspaces/<agent-id>`
 
 This path honors `PAPERCLIP_HOME` and `PAPERCLIP_INSTANCE_ID` in non-default setups.
+
+## Worktree-local Instances
+
+When developing from multiple git worktrees, do not point two Paperclip servers at the same embedded PostgreSQL data directory.
+
+Instead, create a repo-local Paperclip config plus an isolated instance for the worktree:
+
+```sh
+paperclipai worktree init
+# or create the git worktree and initialize it in one step:
+pnpm paperclipai worktree:make paperclip-pr-432
+```
+
+This command:
+
+- writes repo-local files at `.paperclip/config.json` and `.paperclip/.env`
+- creates an isolated instance under `~/.paperclip-worktrees/instances/<worktree-id>/`
+- when run inside a linked git worktree, mirrors the effective git hooks into that worktree's private git dir
+- picks a free app port and embedded PostgreSQL port
+- by default seeds the isolated DB in `minimal` mode from the current effective Paperclip instance/config (repo-local worktree config when present, otherwise the default instance) via a logical SQL snapshot
+
+Seed modes:
+
+- `minimal` keeps core app state like companies, projects, issues, comments, approvals, and auth state, preserves schema for all tables, but omits row data from heavy operational history such as heartbeat runs, wake requests, activity logs, runtime services, and agent session state
+- `full` makes a full logical clone of the source instance
+- `--no-seed` creates an empty isolated instance
+
+After `worktree init`, both the server and the CLI auto-load the repo-local `.paperclip/.env` when run inside that worktree, so normal commands like `pnpm dev`, `paperclipai doctor`, and `paperclipai db:backup` stay scoped to the worktree instance.
+
+That repo-local env also sets:
+
+- `PAPERCLIP_IN_WORKTREE=true`
+- `PAPERCLIP_WORKTREE_NAME=<worktree-name>`
+- `PAPERCLIP_WORKTREE_COLOR=<hex-color>`
+
+The server/UI use those values for worktree-specific branding such as the top banner and dynamically colored favicon.
+
+Print shell exports explicitly when needed:
+
+```sh
+paperclipai worktree env
+# or:
+eval "$(paperclipai worktree env)"
+```
+
+### Worktree CLI Reference
+
+**`pnpm paperclipai worktree init [options]`** — Create repo-local config/env and an isolated instance for the current worktree.
+
+| Option | Description |
+|---|---|
+| `--name <name>` | Display name used to derive the instance id |
+| `--instance <id>` | Explicit isolated instance id |
+| `--home <path>` | Home root for worktree instances (default: `~/.paperclip-worktrees`) |
+| `--from-config <path>` | Source config.json to seed from |
+| `--from-data-dir <path>` | Source PAPERCLIP_HOME used when deriving the source config |
+| `--from-instance <id>` | Source instance id (default: `default`) |
+| `--server-port <port>` | Preferred server port |
+| `--db-port <port>` | Preferred embedded Postgres port |
+| `--seed-mode <mode>` | Seed profile: `minimal` or `full` (default: `minimal`) |
+| `--no-seed` | Skip database seeding from the source instance |
+| `--force` | Replace existing repo-local config and isolated instance data |
+
+Examples:
+
+```sh
+paperclipai worktree init --no-seed
+paperclipai worktree init --seed-mode full
+paperclipai worktree init --from-instance default
+paperclipai worktree init --from-data-dir ~/.paperclip
+paperclipai worktree init --force
+```
+
+**`pnpm paperclipai worktree:make <name> [options]`** — Create `~/NAME` as a git worktree, then initialize an isolated Paperclip instance inside it. This combines `git worktree add` with `worktree init` in a single step.
+
+| Option | Description |
+|---|---|
+| `--start-point <ref>` | Remote ref to base the new branch on (e.g. `origin/main`) |
+| `--instance <id>` | Explicit isolated instance id |
+| `--home <path>` | Home root for worktree instances (default: `~/.paperclip-worktrees`) |
+| `--from-config <path>` | Source config.json to seed from |
+| `--from-data-dir <path>` | Source PAPERCLIP_HOME used when deriving the source config |
+| `--from-instance <id>` | Source instance id (default: `default`) |
+| `--server-port <port>` | Preferred server port |
+| `--db-port <port>` | Preferred embedded Postgres port |
+| `--seed-mode <mode>` | Seed profile: `minimal` or `full` (default: `minimal`) |
+| `--no-seed` | Skip database seeding from the source instance |
+| `--force` | Replace existing repo-local config and isolated instance data |
+
+Examples:
+
+```sh
+pnpm paperclipai worktree:make paperclip-pr-432
+pnpm paperclipai worktree:make my-feature --start-point origin/main
+pnpm paperclipai worktree:make experiment --no-seed
+```
+
+**`pnpm paperclipai worktree env [options]`** — Print shell exports for the current worktree-local Paperclip instance.
+
+| Option | Description |
+|---|---|
+| `-c, --config <path>` | Path to config file |
+| `--json` | Print JSON instead of shell exports |
+
+Examples:
+
+```sh
+pnpm paperclipai worktree env
+pnpm paperclipai worktree env --json
+eval "$(pnpm paperclipai worktree env)"
+```
+
+For project execution worktrees, Paperclip can also run a project-defined provision command after it creates or reuses an isolated git worktree. Configure this on the project's execution workspace policy (`workspaceStrategy.provisionCommand`). The command runs inside the derived worktree and receives `PAPERCLIP_WORKSPACE_*`, `PAPERCLIP_PROJECT_ID`, `PAPERCLIP_AGENT_ID`, and `PAPERCLIP_ISSUE_*` environment variables so each repo can bootstrap itself however it wants.
 
 ## Quick Health Checks
 
@@ -263,7 +390,7 @@ Agent-oriented invite onboarding now exposes machine-readable API docs:
 
 - `GET /api/invites/:token` returns invite summary plus onboarding and skills index links.
 - `GET /api/invites/:token/onboarding` returns onboarding manifest details (registration endpoint, claim endpoint template, skill install hints).
-- `GET /api/invites/:token/onboarding.txt` returns a plain-text onboarding doc intended for both human operators and agents (llm.txt-style handoff).
+- `GET /api/invites/:token/onboarding.txt` returns a plain-text onboarding doc intended for both human operators and agents (llm.txt-style handoff), including optional inviter message and suggested network host candidates.
 - `GET /api/skills/index` lists available skill documents.
 - `GET /api/skills/paperclip` returns the Paperclip heartbeat skill markdown.
 
@@ -304,5 +431,20 @@ This script lives at `scripts/smoke/openclaw-docker-ui.sh` and automates clone/b
 
 Pairing behavior for this smoke script:
 
-- default `OPENCLAW_DISABLE_DEVICE_AUTH=1` (no Control UI pairing prompt for local smoke)
+- default `OPENCLAW_DISABLE_DEVICE_AUTH=1` (no Control UI pairing prompt for local smoke; no extra pairing env vars required)
 - set `OPENCLAW_DISABLE_DEVICE_AUTH=0` to require standard device pairing
+
+Model behavior for this smoke script:
+
+- defaults to OpenAI models (`openai/gpt-5.2` + OpenAI fallback) so it does not require Anthropic auth by default
+
+State behavior for this smoke script:
+
+- defaults to isolated config dir `~/.openclaw-paperclip-smoke`
+- resets smoke agent state each run by default (`OPENCLAW_RESET_STATE=1`) to avoid stale provider/auth drift
+
+Networking behavior for this smoke script:
+
+- auto-detects and prints a Paperclip host URL reachable from inside OpenClaw Docker
+- default container-side host alias is `host.docker.internal` (override with `PAPERCLIP_HOST_FROM_CONTAINER` / `PAPERCLIP_HOST_PORT`)
+- if Paperclip rejects container hostnames in authenticated/private mode, allow `host.docker.internal` via `pnpm paperclipai allowed-hostname host.docker.internal` and restart Paperclip

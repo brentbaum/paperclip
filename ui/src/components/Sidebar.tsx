@@ -14,19 +14,16 @@ import { SidebarProjects } from "./SidebarProjects";
 import { SidebarAgents } from "./SidebarAgents";
 import { useDialog } from "../context/DialogContext";
 import { useCompany } from "../context/CompanyContext";
-import { sidebarBadgesApi } from "../api/sidebarBadges";
 import { heartbeatsApi } from "../api/heartbeats";
 import { queryKeys } from "../lib/queryKeys";
+import { useInboxBadge } from "../hooks/useInboxBadge";
 import { Button } from "@/components/ui/button";
+import { PluginSlotOutlet } from "@/plugins/slots";
 
 export function Sidebar() {
   const { openNewIssue } = useDialog();
   const { selectedCompanyId, selectedCompany } = useCompany();
-  const { data: sidebarBadges } = useQuery({
-    queryKey: queryKeys.sidebarBadges(selectedCompanyId!),
-    queryFn: () => sidebarBadgesApi.get(selectedCompanyId!),
-    enabled: !!selectedCompanyId,
-  });
+  const inboxBadge = useInboxBadge(selectedCompanyId);
   const { data: liveRuns } = useQuery({
     queryKey: queryKeys.liveRuns(selectedCompanyId!),
     queryFn: () => heartbeatsApi.liveRunsForCompany(selectedCompanyId!),
@@ -38,6 +35,11 @@ export function Sidebar() {
   function openSearch() {
     document.dispatchEvent(new KeyboardEvent("keydown", { key: "k", metaKey: true }));
   }
+
+  const pluginContext = {
+    companyId: selectedCompanyId,
+    companyPrefix: selectedCompany?.issuePrefix ?? null,
+  };
 
   return (
     <aside className="w-60 h-full min-h-0 border-r border-border bg-background flex flex-col">
@@ -62,7 +64,7 @@ export function Sidebar() {
         </Button>
       </div>
 
-      <nav className="flex-1 min-h-0 overflow-y-auto scrollbar-none flex flex-col gap-4 px-3 py-2">
+      <nav className="flex-1 min-h-0 overflow-y-auto scrollbar-auto-hide flex flex-col gap-4 px-3 py-2">
         <div className="flex flex-col gap-0.5">
           {/* New Issue button aligned with nav items */}
           <button
@@ -77,9 +79,16 @@ export function Sidebar() {
             to="/inbox"
             label="Inbox"
             icon={Inbox}
-            badge={sidebarBadges?.inbox}
-            badgeTone={sidebarBadges?.failedRuns ? "danger" : "default"}
-            alert={(sidebarBadges?.failedRuns ?? 0) > 0}
+            badge={inboxBadge.inbox}
+            badgeTone={inboxBadge.failedRuns > 0 ? "danger" : "default"}
+            alert={inboxBadge.failedRuns > 0}
+          />
+          <PluginSlotOutlet
+            slotTypes={["sidebar"]}
+            context={pluginContext}
+            className="flex flex-col gap-0.5"
+            itemClassName="text-[13px] font-medium"
+            missingBehavior="placeholder"
           />
         </div>
 
@@ -95,6 +104,14 @@ export function Sidebar() {
         <SidebarSection label="Company">
           <SidebarNavItem to="/company/settings/general" label="Settings" icon={Settings} />
         </SidebarSection>
+
+        <PluginSlotOutlet
+          slotTypes={["sidebarPanel"]}
+          context={pluginContext}
+          className="flex flex-col gap-3"
+          itemClassName="rounded-lg border border-border p-3"
+          missingBehavior="placeholder"
+        />
       </nav>
     </aside>
   );

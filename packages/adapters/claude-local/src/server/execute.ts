@@ -9,10 +9,10 @@ import {
   asNumber,
   asBoolean,
   asStringArray,
-  DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
   parseObject,
   parseJson,
   buildPaperclipEnv,
+  joinPromptSections,
   redactEnvForLogs,
   ensureAbsoluteDirectory,
   ensureCommandResolvable,
@@ -65,38 +65,6 @@ async function buildSkillsDir(): Promise<string> {
   return tmp;
 }
 
-function buildTelegramWakePrompt(context: Record<string, unknown>, agentId: string) {
-  const wakeReason = asString(context.wakeReason, "").trim();
-  const telegramContext = parseObject(context.paperclipTelegram);
-  const tools = parseObject(context.paperclipTools);
-  const telegramTool = parseObject(tools.telegram);
-  const messageText = asString(telegramContext.messageText, "").trim();
-  if (wakeReason !== "telegram_message" || messageText.length === 0) return "";
-
-  const chatId = asString(telegramContext.chatId, "").trim();
-  const topicId = Math.floor(asNumber(telegramContext.topicId, 0));
-  const username = asString(telegramContext.username, "").trim();
-  const userId = Math.floor(asNumber(telegramContext.userId, 0));
-  const sendEndpoint = asString(telegramTool.sendEndpoint, "/api/agent-tools/telegram/send").trim();
-  const senderLabel =
-    username.length > 0 ? `@${username}` : userId > 0 ? `user ${userId}` : "the operator";
-  const location = [
-    chatId.length > 0 ? `chat ${chatId}` : null,
-    topicId > 0 ? `topic ${topicId}` : null,
-  ].filter(Boolean).join(", ");
-
-  return [
-    "Telegram wake context:",
-    `- From: ${senderLabel}${location ? ` in ${location}` : ""}`,
-    `- Message: ${JSON.stringify(messageText)}`,
-    "",
-    "Before you end this run, you must send a reply back to Telegram.",
-    `Use POST ${sendEndpoint} with JSON like {\"agentId\":\"${agentId}\",\"text\":\"your reply\"}.`,
-    "If no issue work is required, send a concise acknowledgement and stop. Do not only write an internal status update.",
-    "",
-  ].join("\n");
-}
-
 interface ClaudeExecutionInput {
   runId: string;
   agent: AdapterExecutionContext["agent"];
@@ -116,8 +84,6 @@ interface ClaudeRuntimeConfig {
   graceSec: number;
   extraArgs: string[];
 }
-
-type ProcessRunner = typeof runChildProcess;
 
 function buildLoginResult(input: {
   proc: RunProcessResult;
@@ -148,17 +114,31 @@ async function buildClaudeRuntimeConfig(input: ClaudeExecutionInput): Promise<Cl
 
   const command = asString(config.command, "claude");
   const workspaceContext = parseObject(context.paperclipWorkspace);
-  const telegramContext = parseObject(context.paperclipTelegram);
   const workspaceCwd = asString(workspaceContext.cwd, "");
   const workspaceSource = asString(workspaceContext.source, "");
+  const workspaceStrategy = asString(workspaceContext.strategy, "");
   const workspaceId = asString(workspaceContext.workspaceId, "") || null;
   const workspaceRepoUrl = asString(workspaceContext.repoUrl, "") || null;
   const workspaceRepoRef = asString(workspaceContext.repoRef, "") || null;
+  const workspaceBranch = asString(workspaceContext.branchName, "") || null;
+  const workspaceWorktreePath = asString(workspaceContext.worktreePath, "") || null;
+  const agentHome = asString(workspaceContext.agentHome, "") || null;
   const workspaceHints = Array.isArray(context.paperclipWorkspaces)
     ? context.paperclipWorkspaces.filter(
         (value): value is Record<string, unknown> => typeof value === "object" && value !== null,
       )
     : [];
+  const runtimeServiceIntents = Array.isArray(context.paperclipRuntimeServiceIntents)
+    ? context.paperclipRuntimeServiceIntents.filter(
+        (value): value is Record<string, unknown> => typeof value === "object" && value !== null,
+      )
+    : [];
+  const runtimeServices = Array.isArray(context.paperclipRuntimeServices)
+    ? context.paperclipRuntimeServices.filter(
+        (value): value is Record<string, unknown> => typeof value === "object" && value !== null,
+      )
+    : [];
+  const runtimePrimaryUrl = asString(context.paperclipRuntimePrimaryUrl, "");
   const configuredCwd = asString(config.cwd, "");
   const useConfiguredInsteadOfAgentHome = workspaceSource === "agent_home" && configuredCwd.length > 0;
   const effectiveWorkspaceCwd = useConfiguredInsteadOfAgentHome ? "" : workspaceCwd;
@@ -194,12 +174,6 @@ async function buildClaudeRuntimeConfig(input: ClaudeExecutionInput): Promise<Cl
   const linkedIssueIds = Array.isArray(context.issueIds)
     ? context.issueIds.filter((value): value is string => typeof value === "string" && value.trim().length > 0)
     : [];
-  const telegramMessageText = asString(telegramContext.messageText, "");
-  const telegramChatId = asString(telegramContext.chatId, "");
-  const telegramTopicId = Math.floor(asNumber(telegramContext.topicId, 0));
-  const telegramMessageId = Math.floor(asNumber(telegramContext.messageId, 0));
-  const telegramUserId = Math.floor(asNumber(telegramContext.userId, 0));
-  const telegramUsername = asString(telegramContext.username, "");
 
   if (wakeTaskId) {
     env.PAPERCLIP_TASK_ID = wakeTaskId;
@@ -219,29 +193,14 @@ async function buildClaudeRuntimeConfig(input: ClaudeExecutionInput): Promise<Cl
   if (linkedIssueIds.length > 0) {
     env.PAPERCLIP_LINKED_ISSUE_IDS = linkedIssueIds.join(",");
   }
-  if (telegramMessageText) {
-    env.PAPERCLIP_TELEGRAM_MESSAGE_TEXT = telegramMessageText;
-  }
-  if (telegramChatId) {
-    env.PAPERCLIP_TELEGRAM_CHAT_ID = telegramChatId;
-  }
-  if (telegramTopicId > 0) {
-    env.PAPERCLIP_TELEGRAM_TOPIC_ID = String(telegramTopicId);
-  }
-  if (telegramMessageId > 0) {
-    env.PAPERCLIP_TELEGRAM_MESSAGE_ID = String(telegramMessageId);
-  }
-  if (telegramUserId > 0) {
-    env.PAPERCLIP_TELEGRAM_USER_ID = String(telegramUserId);
-  }
-  if (telegramUsername) {
-    env.PAPERCLIP_TELEGRAM_USERNAME = telegramUsername;
-  }
   if (effectiveWorkspaceCwd) {
     env.PAPERCLIP_WORKSPACE_CWD = effectiveWorkspaceCwd;
   }
   if (workspaceSource) {
     env.PAPERCLIP_WORKSPACE_SOURCE = workspaceSource;
+  }
+  if (workspaceStrategy) {
+    env.PAPERCLIP_WORKSPACE_STRATEGY = workspaceStrategy;
   }
   if (workspaceId) {
     env.PAPERCLIP_WORKSPACE_ID = workspaceId;
@@ -252,8 +211,26 @@ async function buildClaudeRuntimeConfig(input: ClaudeExecutionInput): Promise<Cl
   if (workspaceRepoRef) {
     env.PAPERCLIP_WORKSPACE_REPO_REF = workspaceRepoRef;
   }
+  if (workspaceBranch) {
+    env.PAPERCLIP_WORKSPACE_BRANCH = workspaceBranch;
+  }
+  if (workspaceWorktreePath) {
+    env.PAPERCLIP_WORKSPACE_WORKTREE_PATH = workspaceWorktreePath;
+  }
+  if (agentHome) {
+    env.AGENT_HOME = agentHome;
+  }
   if (workspaceHints.length > 0) {
     env.PAPERCLIP_WORKSPACES_JSON = JSON.stringify(workspaceHints);
+  }
+  if (runtimeServiceIntents.length > 0) {
+    env.PAPERCLIP_RUNTIME_SERVICE_INTENTS_JSON = JSON.stringify(runtimeServiceIntents);
+  }
+  if (runtimeServices.length > 0) {
+    env.PAPERCLIP_RUNTIME_SERVICES_JSON = JSON.stringify(runtimeServices);
+  }
+  if (runtimePrimaryUrl) {
+    env.PAPERCLIP_RUNTIME_PRIMARY_URL = runtimePrimaryUrl;
   }
 
   for (const [key, value] of Object.entries(envConfig)) {
@@ -296,17 +273,6 @@ export async function runClaudeLogin(input: {
   authToken?: string;
   onLog?: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
 }) {
-  return runClaudeLoginWithProcessRunner(input, runChildProcess);
-}
-
-export async function runClaudeLoginWithProcessRunner(input: {
-  runId: string;
-  agent: AdapterExecutionContext["agent"];
-  config: Record<string, unknown>;
-  context?: Record<string, unknown>;
-  authToken?: string;
-  onLog?: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
-}, processRunner: ProcessRunner) {
   const onLog = input.onLog ?? (async () => {});
   const runtime = await buildClaudeRuntimeConfig({
     runId: input.runId,
@@ -316,7 +282,7 @@ export async function runClaudeLoginWithProcessRunner(input: {
     authToken: input.authToken,
   });
 
-  const proc = await processRunner(input.runId, runtime.command, ["login"], {
+  const proc = await runChildProcess(input.runId, runtime.command, ["login"], {
     cwd: runtime.cwd,
     env: runtime.env,
     timeoutSec: runtime.timeoutSec,
@@ -336,15 +302,12 @@ export async function runClaudeLoginWithProcessRunner(input: {
   });
 }
 
-export async function executeWithProcessRunner(
-  ctx: AdapterExecutionContext,
-  processRunner: ProcessRunner,
-): Promise<AdapterExecutionResult> {
+export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
   const { runId, agent, runtime, config, context, onLog, onMeta, authToken } = ctx;
 
   const promptTemplate = asString(
     config.promptTemplate,
-    DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
+    "You are agent {{agent.id}} ({{agent.name}}). Continue your Paperclip work.",
   );
   const model = asString(config.model, "");
   const effort = asString(config.effort, "");
@@ -377,7 +340,12 @@ export async function executeWithProcessRunner(
     graceSec,
     extraArgs,
   } = runtimeConfig;
-  const billingType = resolveClaudeBillingType(env);
+  const effectiveEnv = Object.fromEntries(
+    Object.entries({ ...process.env, ...env }).filter(
+      (entry): entry is [string, string] => typeof entry[1] === "string",
+    ),
+  );
+  const billingType = resolveClaudeBillingType(effectiveEnv);
   const skillsDir = await buildSkillsDir();
 
   // When instructionsFilePath is configured, create a combined temp file that
@@ -405,7 +373,8 @@ export async function executeWithProcessRunner(
       `[paperclip] Claude session "${runtimeSessionId}" was saved for cwd "${runtimeSessionCwd}" and will not be resumed in "${cwd}".\n`,
     );
   }
-  const prompt = renderTemplate(promptTemplate, {
+  const bootstrapPromptTemplate = asString(config.bootstrapPromptTemplate, "");
+  const templateData = {
     agentId: agent.id,
     companyId: agent.companyId,
     runId,
@@ -413,9 +382,24 @@ export async function executeWithProcessRunner(
     agent,
     run: { id: runId, source: "on_demand" },
     context,
-  });
-  const telegramWakePrompt = buildTelegramWakePrompt(context, agent.id);
-  const promptWithWakeContext = `${telegramWakePrompt}${prompt}`;
+  };
+  const renderedPrompt = renderTemplate(promptTemplate, templateData);
+  const renderedBootstrapPrompt =
+    !sessionId && bootstrapPromptTemplate.trim().length > 0
+      ? renderTemplate(bootstrapPromptTemplate, templateData).trim()
+      : "";
+  const sessionHandoffNote = asString(context.paperclipSessionHandoffMarkdown, "").trim();
+  const prompt = joinPromptSections([
+    renderedBootstrapPrompt,
+    sessionHandoffNote,
+    renderedPrompt,
+  ]);
+  const promptMetrics = {
+    promptChars: prompt.length,
+    bootstrapPromptChars: renderedBootstrapPrompt.length,
+    sessionHandoffChars: sessionHandoffNote.length,
+    heartbeatPromptChars: renderedPrompt.length,
+  };
 
   const buildClaudeArgs = (resumeSessionId: string | null) => {
     const args = ["--print", "-", "--output-format", "stream-json", "--verbose"];
@@ -459,15 +443,16 @@ export async function executeWithProcessRunner(
         commandArgs: args,
         commandNotes,
         env: redactEnvForLogs(env),
-        prompt: promptWithWakeContext,
+        prompt,
+        promptMetrics,
         context,
       });
     }
 
-    const proc = await processRunner(runId, command, args, {
+    const proc = await runChildProcess(runId, command, args, {
       cwd,
       env,
-      stdin: promptWithWakeContext,
+      stdin: prompt,
       timeoutSec,
       graceSec,
       onLog,
@@ -567,6 +552,7 @@ export async function executeWithProcessRunner(
       sessionParams: resolvedSessionParams,
       sessionDisplayId: resolvedSessionId,
       provider: "anthropic",
+      biller: "anthropic",
       model: parsedStream.model || asString(parsed.model, model),
       billingType,
       costUsd: parsedStream.costUsd ?? asNumber(parsed.total_cost_usd, 0),
@@ -597,8 +583,4 @@ export async function executeWithProcessRunner(
   } finally {
     fs.rm(skillsDir, { recursive: true, force: true }).catch(() => {});
   }
-}
-
-export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
-  return executeWithProcessRunner(ctx, runChildProcess);
 }

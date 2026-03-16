@@ -1,9 +1,9 @@
-import { useEffect, useMemo, useState, useRef } from "react";
+import { useCallback, useEffect, useMemo, useState, useRef } from "react";
 import { useParams, useNavigate, useLocation, Navigate } from "@/lib/router";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { PROJECT_COLORS, isUuidLike } from "@paperclipai/shared";
+import { PROJECT_COLORS, isUuidLike, type BudgetPolicySummary } from "@paperclipai/shared";
+import { budgetsApi } from "../api/budgets";
 import { projectsApi } from "../api/projects";
-import { documentsApi } from "../api/documents";
 import { issuesApi } from "../api/issues";
 import { agentsApi } from "../api/agents";
 import { heartbeatsApi } from "../api/heartbeats";
@@ -12,17 +12,27 @@ import { usePanel } from "../context/PanelContext";
 import { useCompany } from "../context/CompanyContext";
 import { useBreadcrumbs } from "../context/BreadcrumbContext";
 import { queryKeys } from "../lib/queryKeys";
-import { ProjectProperties } from "../components/ProjectProperties";
+import { ProjectProperties, type ProjectConfigFieldKey, type ProjectFieldSaveState } from "../components/ProjectProperties";
 import { InlineEditor } from "../components/InlineEditor";
 import { StatusBadge } from "../components/StatusBadge";
+import { BudgetPolicyCard } from "../components/BudgetPolicyCard";
 import { IssuesList } from "../components/IssuesList";
 import { PageSkeleton } from "../components/PageSkeleton";
-import { DocumentWorkspace } from "../components/DocumentWorkspace";
-import { projectRouteRef } from "../lib/utils";
+import { PageTabBar } from "../components/PageTabBar";
+import { projectRouteRef, cn } from "../lib/utils";
+import { Tabs } from "@/components/ui/tabs";
+import { PluginLauncherOutlet } from "@/plugins/launchers";
+import { PluginSlotMount, PluginSlotOutlet, usePluginSlots } from "@/plugins/slots";
 
 /* ── Top-level tab types ── */
 
-type ProjectTab = "overview" | "document" | "list";
+type ProjectBaseTab = "overview" | "list" | "configuration" | "budget";
+type ProjectPluginTab = `plugin:${string}`;
+type ProjectTab = ProjectBaseTab | ProjectPluginTab;
+
+function isProjectPluginTab(value: string | null): value is ProjectPluginTab {
+  return typeof value === "string" && value.startsWith("plugin:");
+}
 
 function resolveProjectTab(pathname: string, projectId: string): ProjectTab | null {
   const segments = pathname.split("/").filter(Boolean);
@@ -30,7 +40,8 @@ function resolveProjectTab(pathname: string, projectId: string): ProjectTab | nu
   if (projectsIdx === -1 || segments[projectsIdx + 1] !== projectId) return null;
   const tab = segments[projectsIdx + 2];
   if (tab === "overview") return "overview";
-  if (tab === "document") return "document";
+  if (tab === "configuration") return "configuration";
+  if (tab === "budget") return "budget";
   if (tab === "issues") return "list";
   return null;
 }
@@ -197,11 +208,14 @@ export function ProjectDetail() {
     filter?: string;
   }>();
   const { companies, selectedCompanyId, setSelectedCompanyId } = useCompany();
-  const { openPanel, closePanel } = usePanel();
+  const { closePanel } = usePanel();
   const { setBreadcrumbs } = useBreadcrumbs();
   const queryClient = useQueryClient();
   const navigate = useNavigate();
   const location = useLocation();
+  const [fieldSaveStates, setFieldSaveStates] = useState<Partial<Record<ProjectConfigFieldKey, ProjectFieldSaveState>>>({});
+  const fieldSaveRequestIds = useRef<Partial<Record<ProjectConfigFieldKey, number>>>({});
+  const fieldSaveTimers = useRef<Partial<Record<ProjectConfigFieldKey, ReturnType<typeof setTimeout>>>>({});
   const routeProjectRef = projectId ?? "";
   const routeCompanyId = useMemo(() => {
     if (!companyPrefix) return null;
@@ -210,27 +224,39 @@ export function ProjectDetail() {
   }, [companies, companyPrefix]);
   const lookupCompanyId = routeCompanyId ?? selectedCompanyId ?? undefined;
   const canFetchProject = routeProjectRef.length > 0 && (isUuidLike(routeProjectRef) || Boolean(lookupCompanyId));
-
-  const activeTab = routeProjectRef ? resolveProjectTab(location.pathname, routeProjectRef) : null;
+  const activeRouteTab = routeProjectRef ? resolveProjectTab(location.pathname, routeProjectRef) : null;
+  const pluginTabFromSearch = useMemo(() => {
+    const tab = new URLSearchParams(location.search).get("tab");
+    return isProjectPluginTab(tab) ? tab : null;
+  }, [location.search]);
+  const activeTab = activeRouteTab ?? pluginTabFromSearch;
 
   const { data: project, isLoading, error } = useQuery({
     queryKey: [...queryKeys.projects.detail(routeProjectRef), lookupCompanyId ?? null],
     queryFn: () => projectsApi.get(routeProjectRef, lookupCompanyId),
     enabled: canFetchProject,
   });
-  const { data: document } = useQuery({
-    queryKey: project?.id ? queryKeys.documents.project(project.id) : ["documents", "project", "none"],
-    queryFn: () => documentsApi.getProjectDocument(project!.id),
-    enabled: activeTab === "document" && Boolean(project?.id),
-  });
-  const { data: revisions } = useQuery({
-    queryKey: document?.id ? queryKeys.documents.revisions(document.id) : ["documents", "revisions", "none"],
-    queryFn: () => documentsApi.listRevisions(document!.id),
-    enabled: Boolean(document?.id),
-  });
   const canonicalProjectRef = project ? projectRouteRef(project) : routeProjectRef;
   const projectLookupRef = project?.id ?? routeProjectRef;
   const resolvedCompanyId = project?.companyId ?? selectedCompanyId;
+  const {
+    slots: pluginDetailSlots,
+    isLoading: pluginDetailSlotsLoading,
+  } = usePluginSlots({
+    slotTypes: ["detailTab"],
+    entityType: "project",
+    companyId: resolvedCompanyId,
+    enabled: !!resolvedCompanyId,
+  });
+  const pluginTabItems = useMemo(
+    () => pluginDetailSlots.map((slot) => ({
+      value: `plugin:${slot.pluginKey}:${slot.id}` as ProjectPluginTab,
+      label: slot.displayName,
+      slot,
+    })),
+    [pluginDetailSlots],
+  );
+  const activePluginTab = pluginTabItems.find((item) => item.value === activeTab) ?? null;
 
   useEffect(() => {
     if (!project?.companyId || project.companyId === selectedCompanyId) return;
@@ -250,16 +276,19 @@ export function ProjectDetail() {
       projectsApi.update(projectLookupRef, data, resolvedCompanyId ?? lookupCompanyId),
     onSuccess: invalidateProject,
   });
-  const saveDocument = useMutation({
-    mutationFn: (data: { baseRevisionId?: string | null; body: string; changeSummary?: string | null; source?: string }) => {
-      if (!document) throw new Error("Document not found");
-      return documentsApi.createRevision(document.id, data);
-    },
-    onSuccess: () => {
-      if (!project?.id || !document?.id) return;
-      queryClient.invalidateQueries({ queryKey: queryKeys.documents.project(project.id) });
-      queryClient.invalidateQueries({ queryKey: queryKeys.documents.revisions(document.id) });
-      queryClient.invalidateQueries({ queryKey: queryKeys.documents.detail(document.id) });
+
+  const archiveProject = useMutation({
+    mutationFn: (archived: boolean) =>
+      projectsApi.update(
+        projectLookupRef,
+        { archivedAt: archived ? new Date().toISOString() : null },
+        resolvedCompanyId ?? lookupCompanyId,
+      ),
+    onSuccess: (_, archived) => {
+      invalidateProject();
+      if (archived) {
+        navigate("/projects");
+      }
     },
   });
 
@@ -268,6 +297,14 @@ export function ProjectDetail() {
       if (!resolvedCompanyId) throw new Error("No company selected");
       return assetsApi.uploadImage(resolvedCompanyId, file, `projects/${projectLookupRef || "draft"}`);
     },
+  });
+
+  const { data: budgetOverview } = useQuery({
+    queryKey: queryKeys.budgets.overview(resolvedCompanyId ?? "__none__"),
+    queryFn: () => budgetsApi.overview(resolvedCompanyId!),
+    enabled: !!resolvedCompanyId,
+    refetchInterval: 30_000,
+    staleTime: 5_000,
   });
 
   useEffect(() => {
@@ -280,12 +317,20 @@ export function ProjectDetail() {
   useEffect(() => {
     if (!project) return;
     if (routeProjectRef === canonicalProjectRef) return;
+    if (isProjectPluginTab(activeTab)) {
+      navigate(`/projects/${canonicalProjectRef}?tab=${encodeURIComponent(activeTab)}`, { replace: true });
+      return;
+    }
     if (activeTab === "overview") {
       navigate(`/projects/${canonicalProjectRef}/overview`, { replace: true });
       return;
     }
-    if (activeTab === "document") {
-      navigate(`/projects/${canonicalProjectRef}/document`, { replace: true });
+    if (activeTab === "configuration") {
+      navigate(`/projects/${canonicalProjectRef}/configuration`, { replace: true });
+      return;
+    }
+    if (activeTab === "budget") {
+      navigate(`/projects/${canonicalProjectRef}/budget`, { replace: true });
       return;
     }
     if (activeTab === "list") {
@@ -300,11 +345,103 @@ export function ProjectDetail() {
   }, [project, routeProjectRef, canonicalProjectRef, activeTab, filter, navigate]);
 
   useEffect(() => {
-    if (project) {
-      openPanel(<ProjectProperties project={project} onUpdate={(data) => updateProject.mutate(data)} />);
-    }
+    closePanel();
     return () => closePanel();
-  }, [project]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [closePanel]);
+
+  useEffect(() => {
+    return () => {
+      Object.values(fieldSaveTimers.current).forEach((timer) => {
+        if (timer) clearTimeout(timer);
+      });
+    };
+  }, []);
+
+  const setFieldState = useCallback((field: ProjectConfigFieldKey, state: ProjectFieldSaveState) => {
+    setFieldSaveStates((current) => ({ ...current, [field]: state }));
+  }, []);
+
+  const scheduleFieldReset = useCallback((field: ProjectConfigFieldKey, delayMs: number) => {
+    const existing = fieldSaveTimers.current[field];
+    if (existing) clearTimeout(existing);
+    fieldSaveTimers.current[field] = setTimeout(() => {
+      setFieldSaveStates((current) => {
+        const next = { ...current };
+        delete next[field];
+        return next;
+      });
+      delete fieldSaveTimers.current[field];
+    }, delayMs);
+  }, []);
+
+  const updateProjectField = useCallback(async (field: ProjectConfigFieldKey, data: Record<string, unknown>) => {
+    const requestId = (fieldSaveRequestIds.current[field] ?? 0) + 1;
+    fieldSaveRequestIds.current[field] = requestId;
+    setFieldState(field, "saving");
+    try {
+      await projectsApi.update(projectLookupRef, data, resolvedCompanyId ?? lookupCompanyId);
+      invalidateProject();
+      if (fieldSaveRequestIds.current[field] !== requestId) return;
+      setFieldState(field, "saved");
+      scheduleFieldReset(field, 1800);
+    } catch (error) {
+      if (fieldSaveRequestIds.current[field] !== requestId) return;
+      setFieldState(field, "error");
+      scheduleFieldReset(field, 3000);
+      throw error;
+    }
+  }, [invalidateProject, lookupCompanyId, projectLookupRef, resolvedCompanyId, scheduleFieldReset, setFieldState]);
+
+  const projectBudgetSummary = useMemo(() => {
+    const matched = budgetOverview?.policies.find(
+      (policy) => policy.scopeType === "project" && policy.scopeId === (project?.id ?? routeProjectRef),
+    );
+    if (matched) return matched;
+    return {
+      policyId: "",
+      companyId: resolvedCompanyId ?? "",
+      scopeType: "project",
+      scopeId: project?.id ?? routeProjectRef,
+      scopeName: project?.name ?? "Project",
+      metric: "billed_cents",
+      windowKind: "lifetime",
+      amount: 0,
+      observedAmount: 0,
+      remainingAmount: 0,
+      utilizationPercent: 0,
+      warnPercent: 80,
+      hardStopEnabled: true,
+      notifyEnabled: true,
+      isActive: false,
+      status: "ok",
+      paused: Boolean(project?.pausedAt),
+      pauseReason: project?.pauseReason ?? null,
+      windowStart: new Date(),
+      windowEnd: new Date(),
+    } satisfies BudgetPolicySummary;
+  }, [budgetOverview?.policies, project, resolvedCompanyId, routeProjectRef]);
+
+  const budgetMutation = useMutation({
+    mutationFn: (amount: number) =>
+      budgetsApi.upsertPolicy(resolvedCompanyId!, {
+        scopeType: "project",
+        scopeId: project?.id ?? routeProjectRef,
+        amount,
+        windowKind: "lifetime",
+      }),
+    onSuccess: () => {
+      if (!resolvedCompanyId) return;
+      queryClient.invalidateQueries({ queryKey: queryKeys.budgets.overview(resolvedCompanyId) });
+      queryClient.invalidateQueries({ queryKey: queryKeys.projects.detail(routeProjectRef) });
+      queryClient.invalidateQueries({ queryKey: queryKeys.projects.detail(projectLookupRef) });
+      queryClient.invalidateQueries({ queryKey: queryKeys.projects.list(resolvedCompanyId) });
+      queryClient.invalidateQueries({ queryKey: queryKeys.dashboard(resolvedCompanyId) });
+    },
+  });
+
+  if (pluginTabFromSearch && !pluginDetailSlotsLoading && !activePluginTab) {
+    return <Navigate to={`/projects/${canonicalProjectRef}/issues`} replace />;
+  }
 
   // Redirect bare /projects/:id to /projects/:id/issues
   if (routeProjectRef && activeTab === null) {
@@ -316,10 +453,16 @@ export function ProjectDetail() {
   if (!project) return null;
 
   const handleTabChange = (tab: ProjectTab) => {
+    if (isProjectPluginTab(tab)) {
+      navigate(`/projects/${canonicalProjectRef}?tab=${encodeURIComponent(tab)}`);
+      return;
+    }
     if (tab === "overview") {
       navigate(`/projects/${canonicalProjectRef}/overview`);
-    } else if (tab === "document") {
-      navigate(`/projects/${canonicalProjectRef}/document`);
+    } else if (tab === "budget") {
+      navigate(`/projects/${canonicalProjectRef}/budget`);
+    } else if (tab === "configuration") {
+      navigate(`/projects/${canonicalProjectRef}/configuration`);
     } else {
       navigate(`/projects/${canonicalProjectRef}/issues`);
     }
@@ -334,49 +477,71 @@ export function ProjectDetail() {
             onSelect={(color) => updateProject.mutate({ color })}
           />
         </div>
-        <InlineEditor
-          value={project.name}
-          onSave={(name) => updateProject.mutate({ name })}
-          as="h2"
-          className="text-xl font-bold"
+        <div className="min-w-0 space-y-2">
+          <InlineEditor
+            value={project.name}
+            onSave={(name) => updateProject.mutate({ name })}
+            as="h2"
+            className="text-xl font-bold"
+          />
+          {project.pauseReason === "budget" ? (
+            <div className="inline-flex items-center gap-2 rounded-full border border-red-500/30 bg-red-500/10 px-3 py-1 text-[11px] font-medium uppercase tracking-[0.18em] text-red-200">
+              <span className="h-2 w-2 rounded-full bg-red-400" />
+              Paused by budget hard stop
+            </div>
+          ) : null}
+        </div>
+      </div>
+
+      <PluginSlotOutlet
+        slotTypes={["toolbarButton", "contextMenuItem"]}
+        entityType="project"
+        context={{
+          companyId: resolvedCompanyId ?? null,
+          companyPrefix: companyPrefix ?? null,
+          projectId: project.id,
+          projectRef: canonicalProjectRef,
+          entityId: project.id,
+          entityType: "project",
+        }}
+        className="flex flex-wrap gap-2"
+        itemClassName="inline-flex"
+        missingBehavior="placeholder"
+      />
+
+      <PluginLauncherOutlet
+        placementZones={["toolbarButton"]}
+        entityType="project"
+        context={{
+          companyId: resolvedCompanyId ?? null,
+          companyPrefix: companyPrefix ?? null,
+          projectId: project.id,
+          projectRef: canonicalProjectRef,
+          entityId: project.id,
+          entityType: "project",
+        }}
+        className="flex flex-wrap gap-2"
+        itemClassName="inline-flex"
+      />
+
+      <Tabs value={activeTab ?? "list"} onValueChange={(value) => handleTabChange(value as ProjectTab)}>
+        <PageTabBar
+          items={[
+            { value: "overview", label: "Overview" },
+            { value: "list", label: "List" },
+            { value: "configuration", label: "Configuration" },
+            { value: "budget", label: "Budget" },
+            ...pluginTabItems.map((item) => ({
+              value: item.value,
+              label: item.label,
+            })),
+          ]}
+          align="start"
+          value={activeTab ?? "list"}
+          onValueChange={(value) => handleTabChange(value as ProjectTab)}
         />
-      </div>
+      </Tabs>
 
-      {/* Top-level project tabs */}
-      <div className="flex items-center gap-1 border-b border-border">
-        <button
-          className={`px-3 py-2 text-sm font-medium transition-colors border-b-2 ${
-            activeTab === "overview"
-              ? "border-foreground text-foreground"
-              : "border-transparent text-muted-foreground hover:text-foreground"
-          }`}
-          onClick={() => handleTabChange("overview")}
-        >
-          Overview
-        </button>
-        <button
-          className={`px-3 py-2 text-sm font-medium transition-colors border-b-2 ${
-            activeTab === "document"
-              ? "border-foreground text-foreground"
-              : "border-transparent text-muted-foreground hover:text-foreground"
-          }`}
-          onClick={() => handleTabChange("document")}
-        >
-          Document
-        </button>
-        <button
-          className={`px-3 py-2 text-sm font-medium transition-colors border-b-2 ${
-            activeTab === "list"
-              ? "border-foreground text-foreground"
-              : "border-transparent text-muted-foreground hover:text-foreground"
-          }`}
-          onClick={() => handleTabChange("list")}
-        >
-          List
-        </button>
-      </div>
-
-      {/* Tab content */}
       {activeTab === "overview" && (
         <OverviewContent
           project={project}
@@ -392,16 +557,42 @@ export function ProjectDetail() {
         <ProjectIssuesList projectId={project.id} companyId={resolvedCompanyId} />
       )}
 
-      {activeTab === "document" && (
-        <DocumentWorkspace
-          heading="Project Document"
-          document={document}
-          revisions={revisions ?? []}
-          onSave={async (data) => {
-            await saveDocument.mutateAsync(data);
+      {activeTab === "configuration" && (
+        <div className="max-w-4xl">
+          <ProjectProperties
+            project={project}
+            onUpdate={(data) => updateProject.mutate(data)}
+            onFieldUpdate={updateProjectField}
+            getFieldSaveState={(field) => fieldSaveStates[field] ?? "idle"}
+            onArchive={(archived) => archiveProject.mutate(archived)}
+            archivePending={archiveProject.isPending}
+          />
+        </div>
+      )}
+
+      {activeTab === "budget" && resolvedCompanyId ? (
+        <div className="max-w-3xl">
+          <BudgetPolicyCard
+            summary={projectBudgetSummary}
+            variant="plain"
+            isSaving={budgetMutation.isPending}
+            onSave={(amount) => budgetMutation.mutate(amount)}
+          />
+        </div>
+      ) : null}
+
+      {activePluginTab && (
+        <PluginSlotMount
+          slot={activePluginTab.slot}
+          context={{
+            companyId: resolvedCompanyId,
+            companyPrefix: companyPrefix ?? null,
+            projectId: project.id,
+            projectRef: canonicalProjectRef,
+            entityId: project.id,
+            entityType: "project",
           }}
-          isSaving={saveDocument.isPending}
-          emptyLabel="No project document yet."
+          missingBehavior="placeholder"
         />
       )}
     </div>

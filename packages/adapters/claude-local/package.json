@@ -1,6 +1,6 @@
 {
   "name": "@paperclipai/adapter-claude-local",
-  "version": "0.2.7",
+  "version": "0.3.1",
   "type": "module",
   "exports": {
     ".": "./src/index.ts",
@@ -38,13 +38,16 @@
   "scripts": {
     "build": "tsc",
     "clean": "rm -rf dist",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "probe:quota": "pnpm exec tsx src/cli/quota-probe.ts --json",
+    "probe:quota:raw": "pnpm exec tsx src/cli/quota-probe.ts --json --raw-cli"
   },
   "dependencies": {
     "@paperclipai/adapter-utils": "workspace:*",
     "picocolors": "^1.1.1"
   },
   "devDependencies": {
+    "@types/node": "^24.6.0",
     "typescript": "^5.7.3"
   }
 }

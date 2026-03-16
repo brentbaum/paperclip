@@ -1,20 +1,16 @@
-import { memo, useCallback, useEffect, useMemo, useRef, useState, type ChangeEvent } from "react";
+import { memo, useEffect, useMemo, useRef, useState, type ChangeEvent } from "react";
 import { Link, useLocation } from "react-router-dom";
-import type { IssueComment, Agent, IssueExecutionMode, RemoteExecutionTarget } from "@paperclipai/shared";
+import type { IssueComment, Agent } from "@paperclipai/shared";
 import { Button } from "@/components/ui/button";
-import { Paperclip, RotateCcw } from "lucide-react";
+import { Check, Copy, Paperclip } from "lucide-react";
 import { Identity } from "./Identity";
 import { InlineEntitySelector, type InlineEntityOption } from "./InlineEntitySelector";
-import { IssueExecutionControls } from "./IssueExecutionControls";
 import { MarkdownBody } from "./MarkdownBody";
 import { MarkdownEditor, type MarkdownEditorRef, type MentionOption } from "./MarkdownEditor";
 import { StatusBadge } from "./StatusBadge";
+import { AgentIcon } from "./AgentIconPicker";
 import { formatDateTime } from "../lib/utils";
-import {
-  readLastRemoteTargetId,
-  resolvePreferredRemoteTargetId,
-  writeLastRemoteTargetId,
-} from "../lib/remoteExecutionSelection";
+import { PluginSlotOutlet } from "@/plugins/slots";
 
 interface CommentWithRunMeta extends IssueComment {
   runId?: string | null;
@@ -29,17 +25,17 @@ interface LinkedRunItem {
   startedAt: Date | string | null;
 }
 
-interface CommentIssueUpdate {
+interface CommentReassignment {
   assigneeAgentId: string | null;
   assigneeUserId: string | null;
-  executionMode?: IssueExecutionMode;
-  executionTargetId?: string | null;
 }
 
 interface CommentThreadProps {
   comments: CommentWithRunMeta[];
   linkedRuns?: LinkedRunItem[];
-  onAdd: (body: string, reopen?: boolean, issueUpdate?: CommentIssueUpdate) => Promise<void>;
+  companyId?: string | null;
+  projectId?: string | null;
+  onAdd: (body: string, reopen?: boolean, reassignment?: CommentReassignment) => Promise<void>;
   issueStatus?: string;
   agentMap?: Map<string, Agent>;
   imageUploadHandler?: (file: File) => Promise<string>;
@@ -50,19 +46,7 @@ interface CommentThreadProps {
   enableReassign?: boolean;
   reassignOptions?: InlineEntityOption[];
   currentAssigneeValue?: string;
-  currentAssigneeAgentId?: string | null;
-  executionMode?: IssueExecutionMode;
-  executionTargetId?: string | null;
-  executionTargets?: RemoteExecutionTarget[];
-  remoteTargetScopeKey?: string | null;
-  remoteProjectRequirementLabel?: string;
-  remoteExecutionContextReady?: boolean;
   mentions?: MentionOption[];
-  /** When set, run links call this instead of navigating to the agent run page. */
-  onRunClick?: (runId: string, agentId: string) => void;
-  /** Callback to retry a failed run. When provided, shows a retry button on failed runs. */
-  onRetryRun?: (run: LinkedRunItem) => void;
-  retryingRunId?: string | null;
 }
 
 const CLOSED_STATUSES = new Set(["done", "cancelled"]);
@@ -96,7 +80,7 @@ function clearDraft(draftKey: string) {
   }
 }
 
-function parseReassignment(target: string): CommentIssueUpdate | null {
+function parseReassignment(target: string): CommentReassignment | null {
   if (!target || target === "__none__") {
     return { assigneeAgentId: null, assigneeUserId: null };
   }
@@ -111,6 +95,25 @@ function parseReassignment(target: string): CommentIssueUpdate | null {
   return null;
 }
 
+function CopyMarkdownButton({ text }: { text: string }) {
+  const [copied, setCopied] = useState(false);
+  return (
+    <button
+      type="button"
+      className="text-muted-foreground hover:text-foreground transition-colors"
+      title="Copy as markdown"
+      onClick={() => {
+        navigator.clipboard.writeText(text).then(() => {
+          setCopied(true);
+          setTimeout(() => setCopied(false), 2000);
+        });
+      }}
+    >
+      {copied ? <Check className="h-3 w-3" /> : <Copy className="h-3 w-3" />}
+    </button>
+  );
+}
+
 type TimelineItem =
   | { kind: "comment"; id: string; createdAtMs: number; comment: CommentWithRunMeta }
   | { kind: "run"; id: string; createdAtMs: number; run: LinkedRunItem };
@@ -118,17 +121,15 @@ type TimelineItem =
 const TimelineList = memo(function TimelineList({
   timeline,
   agentMap,
+  companyId,
+  projectId,
   highlightCommentId,
-  onRunClick,
-  onRetryRun,
-  retryingRunId,
 }: {
   timeline: TimelineItem[];
   agentMap?: Map<string, Agent>;
+  companyId?: string | null;
+  projectId?: string | null;
   highlightCommentId?: string | null;
-  onRunClick?: (runId: string, agentId: string) => void;
-  onRetryRun?: (run: LinkedRunItem) => void;
-  retryingRunId?: string | null;
 }) {
   if (timeline.length === 0) {
     return <p className="text-sm text-muted-foreground">No comments or runs yet.</p>;
@@ -154,32 +155,13 @@ const TimelineList = memo(function TimelineList({
               </div>
               <div className="flex items-center gap-2 text-xs">
                 <span className="text-muted-foreground">Run</span>
-                {onRunClick ? (
-                  <button
-                    onClick={() => onRunClick(run.runId, run.agentId)}
-                    className="inline-flex items-center rounded-md border border-border bg-accent/40 px-2 py-1 font-mono text-muted-foreground hover:text-foreground hover:bg-accent/60 transition-colors cursor-pointer"
-                  >
-                    {run.runId.slice(0, 8)}
-                  </button>
-                ) : (
-                  <Link
-                    to={`/agents/${run.agentId}/runs/${run.runId}`}
-                    className="inline-flex items-center rounded-md border border-border bg-accent/40 px-2 py-1 font-mono text-muted-foreground hover:text-foreground hover:bg-accent/60 transition-colors"
-                  >
-                    {run.runId.slice(0, 8)}
-                  </Link>
-                )}
+                <Link
+                  to={`/agents/${run.agentId}/runs/${run.runId}`}
+                  className="inline-flex items-center rounded-md border border-border bg-accent/40 px-2 py-1 font-mono text-muted-foreground hover:text-foreground hover:bg-accent/60 transition-colors"
+                >
+                  {run.runId.slice(0, 8)}
+                </Link>
                 <StatusBadge status={run.status} />
-                {onRetryRun && (run.status === "failed" || run.status === "timed_out") && (
-                  <button
-                    onClick={() => onRetryRun(run)}
-                    disabled={retryingRunId === run.runId}
-                    className="inline-flex items-center gap-1 rounded-md border border-border px-2 py-1 text-xs text-muted-foreground hover:text-foreground hover:bg-accent/60 transition-colors disabled:opacity-50"
-                  >
-                    <RotateCcw className="h-3 w-3" />
-                    {retryingRunId === run.runId ? "Retrying…" : "Retry"}
-                  </button>
-                )}
               </div>
             </div>
           );
@@ -204,24 +186,54 @@ const TimelineList = memo(function TimelineList({
               ) : (
                 <Identity name="You" size="sm" />
               )}
-              <a
-                href={`#comment-${comment.id}`}
-                className="text-xs text-muted-foreground hover:text-foreground hover:underline transition-colors"
-              >
-                {formatDateTime(comment.createdAt)}
-              </a>
+              <span className="flex items-center gap-1.5">
+                {companyId ? (
+                  <PluginSlotOutlet
+                    slotTypes={["commentContextMenuItem"]}
+                    entityType="comment"
+                    context={{
+                      companyId,
+                      projectId: projectId ?? null,
+                      entityId: comment.id,
+                      entityType: "comment",
+                      parentEntityId: comment.issueId,
+                    }}
+                    className="flex flex-wrap items-center gap-1.5"
+                    itemClassName="inline-flex"
+                    missingBehavior="placeholder"
+                  />
+                ) : null}
+                <a
+                  href={`#comment-${comment.id}`}
+                  className="text-xs text-muted-foreground hover:text-foreground hover:underline transition-colors"
+                >
+                  {formatDateTime(comment.createdAt)}
+                </a>
+                <CopyMarkdownButton text={comment.body} />
+              </span>
             </div>
             <MarkdownBody className="text-sm">{comment.body}</MarkdownBody>
+            {companyId ? (
+              <div className="mt-2 space-y-2">
+                <PluginSlotOutlet
+                  slotTypes={["commentAnnotation"]}
+                  entityType="comment"
+                  context={{
+                    companyId,
+                    projectId: projectId ?? null,
+                    entityId: comment.id,
+                    entityType: "comment",
+                    parentEntityId: comment.issueId,
+                  }}
+                  className="space-y-2"
+                  itemClassName="rounded-md"
+                  missingBehavior="placeholder"
+                />
+              </div>
+            ) : null}
             {comment.runId && (
               <div className="mt-2 pt-2 border-t border-border/60">
-                {comment.runAgentId && onRunClick ? (
-                  <button
-                    onClick={() => onRunClick(comment.runId!, comment.runAgentId!)}
-                    className="inline-flex items-center rounded-md border border-border bg-accent/30 px-2 py-1 text-[10px] font-mono text-muted-foreground hover:text-foreground hover:bg-accent/50 transition-colors cursor-pointer"
-                  >
-                    run {comment.runId.slice(0, 8)}
-                  </button>
-                ) : comment.runAgentId ? (
+                {comment.runAgentId ? (
                   <Link
                     to={`/agents/${comment.runAgentId}/runs/${comment.runId}`}
                     className="inline-flex items-center rounded-md border border-border bg-accent/30 px-2 py-1 text-[10px] font-mono text-muted-foreground hover:text-foreground hover:bg-accent/50 transition-colors"
@@ -245,6 +257,8 @@ const TimelineList = memo(function TimelineList({
 export function CommentThread({
   comments,
   linkedRuns = [],
+  companyId,
+  projectId,
   onAdd,
   issueStatus,
   agentMap,
@@ -255,25 +269,13 @@ export function CommentThread({
   enableReassign = false,
   reassignOptions = [],
   currentAssigneeValue = "",
-  currentAssigneeAgentId = null,
-  executionMode: currentExecutionMode = "default",
-  executionTargetId: currentExecutionTargetId = null,
-  executionTargets = [],
-  remoteTargetScopeKey = null,
-  remoteProjectRequirementLabel = "Agent required for remote",
-  remoteExecutionContextReady = true,
   mentions: providedMentions,
-  onRunClick,
-  onRetryRun,
-  retryingRunId,
 }: CommentThreadProps) {
   const [body, setBody] = useState("");
   const [reopen, setReopen] = useState(true);
   const [submitting, setSubmitting] = useState(false);
   const [attaching, setAttaching] = useState(false);
   const [reassignTarget, setReassignTarget] = useState(currentAssigneeValue);
-  const [executionMode, setExecutionMode] = useState<IssueExecutionMode>(currentExecutionMode);
-  const [executionTargetId, setExecutionTargetId] = useState(currentExecutionTargetId ?? "");
   const [highlightCommentId, setHighlightCommentId] = useState<string | null>(null);
   const editorRef = useRef<MarkdownEditorRef>(null);
   const attachInputRef = useRef<HTMLInputElement | null>(null);
@@ -338,14 +340,6 @@ export function CommentThread({
     setReassignTarget(currentAssigneeValue);
   }, [currentAssigneeValue]);
 
-  useEffect(() => {
-    setExecutionMode(currentExecutionMode);
-  }, [currentExecutionMode]);
-
-  useEffect(() => {
-    setExecutionTargetId(currentExecutionTargetId ?? "");
-  }, [currentExecutionTargetId]);
-
   // Scroll to comment when URL hash matches #comment-{id}
   useEffect(() => {
     const hash = location.hash;
@@ -364,131 +358,19 @@ export function CommentThread({
     }
   }, [location.hash, comments]);
 
-  const handleMentionSelect = useCallback(
-    (option: MentionOption) => {
-      if (!enableReassign || !option.id) return;
-      // Agent mentions use kind "agent" (or no kind, which defaults to agent)
-      if (option.kind === "project") return;
-      // Match against reassignOptions using the "agent:{id}" format
-      const targetValue = `agent:${option.id}`;
-      const match = reassignOptions.find((o) => o.id === targetValue);
-      if (match) {
-        setReassignTarget(targetValue);
-      }
-    },
-    [enableReassign, reassignOptions],
-  );
-
-  const selectedAssigneeAgentId = useMemo(() => {
-    if (reassignTarget.startsWith("agent:")) {
-      return reassignTarget.slice("agent:".length) || null;
-    }
-    if (reassignTarget.startsWith("user:")) return null;
-    return currentAssigneeAgentId;
-  }, [currentAssigneeAgentId, reassignTarget]);
-
-  const selectedAssigneeAdapterType =
-    (selectedAssigneeAgentId ? agentMap?.get(selectedAssigneeAgentId)?.adapterType : null) ?? null;
-  const availableExecutionTargets = useMemo(
-    () =>
-      executionTargets.filter((target) =>
-        selectedAssigneeAdapterType ? target.supportedAdapters.includes(selectedAssigneeAdapterType) : true,
-      ),
-    [executionTargets, selectedAssigneeAdapterType],
-  );
-  const canUseRemoteExecution = Boolean(selectedAssigneeAgentId && selectedAssigneeAdapterType);
-  const remoteRequirementLabel =
-    !selectedAssigneeAgentId || !selectedAssigneeAdapterType
-      ? "Agent required for remote"
-      : remoteProjectRequirementLabel;
-
-  useEffect(() => {
-    if (!remoteExecutionContextReady) return;
-    if (!canUseRemoteExecution && executionMode === "remote" && currentExecutionMode !== "remote") {
-      setExecutionMode("default");
-      setExecutionTargetId("");
-      return;
-    }
-    if (executionMode === "default" && executionTargetId) {
-      setExecutionTargetId("");
-      return;
-    }
-    if (
-      executionMode === "remote" &&
-      (!executionTargetId ||
-        !availableExecutionTargets.some((target) => target.id === executionTargetId))
-    ) {
-      const nextTargetId = resolvePreferredRemoteTargetId(
-        availableExecutionTargets,
-        readLastRemoteTargetId(remoteTargetScopeKey),
-      );
-      setExecutionTargetId(nextTargetId);
-      if (nextTargetId) writeLastRemoteTargetId(remoteTargetScopeKey, nextTargetId);
-    }
-  }, [
-    availableExecutionTargets,
-    canUseRemoteExecution,
-    currentExecutionMode,
-    executionMode,
-    executionTargetId,
-    remoteExecutionContextReady,
-    remoteTargetScopeKey,
-  ]);
-
-  function handleExecutionModeChange(mode: IssueExecutionMode) {
-    setExecutionMode(mode);
-    if (mode !== "remote") {
-      setExecutionTargetId("");
-      return;
-    }
-    const nextTargetId = resolvePreferredRemoteTargetId(
-      availableExecutionTargets,
-      readLastRemoteTargetId(remoteTargetScopeKey),
-    );
-    setExecutionTargetId(nextTargetId);
-    if (nextTargetId) writeLastRemoteTargetId(remoteTargetScopeKey, nextTargetId);
-  }
-
-  function handleExecutionTargetChange(targetId: string) {
-    setExecutionTargetId(targetId);
-    writeLastRemoteTargetId(remoteTargetScopeKey, targetId);
-  }
-
   async function handleSubmit() {
     const trimmed = body.trim();
     if (!trimmed) return;
     const hasReassignment = enableReassign && reassignTarget !== currentAssigneeValue;
     const reassignment = hasReassignment ? parseReassignment(reassignTarget) : null;
-    const issueUpdate: CommentIssueUpdate = reassignment ?? {
-      assigneeAgentId: currentAssigneeAgentId,
-      assigneeUserId: currentAssigneeValue.startsWith("user:")
-        ? currentAssigneeValue.slice("user:".length) || null
-        : null,
-    };
-
-    if (executionMode !== currentExecutionMode) {
-      issueUpdate.executionMode = executionMode;
-    }
-    if (executionMode === "remote") {
-      const nextTargetId = executionTargetId || null;
-      if (nextTargetId !== (currentExecutionTargetId ?? null)) {
-        issueUpdate.executionTargetId = nextTargetId;
-      }
-    } else if (currentExecutionTargetId) {
-      issueUpdate.executionTargetId = null;
-    }
-
-    const hasIssueUpdate =
-      Boolean(reassignment) ||
-      issueUpdate.executionMode !== undefined ||
-      issueUpdate.executionTargetId !== undefined;
 
     setSubmitting(true);
     try {
-      await onAdd(trimmed, isClosed && reopen ? true : undefined, hasIssueUpdate ? issueUpdate : undefined);
+      await onAdd(trimmed, isClosed && reopen ? true : undefined, reassignment ?? undefined);
       setBody("");
       if (draftKey) clearDraft(draftKey);
       setReopen(false);
+      setReassignTarget(currentAssigneeValue);
     } finally {
       setSubmitting(false);
     }
@@ -506,16 +388,19 @@ export function CommentThread({
     }
   }
 
-  const canSubmit =
-    !submitting &&
-    !!body.trim() &&
-    (executionMode !== "remote" || Boolean(executionTargetId));
+  const canSubmit = !submitting && !!body.trim();
 
   return (
     <div className="space-y-4">
       <h3 className="text-sm font-semibold">Comments &amp; Runs ({timeline.length})</h3>
 
-      <TimelineList timeline={timeline} agentMap={agentMap} highlightCommentId={highlightCommentId} onRunClick={onRunClick} onRetryRun={onRetryRun} retryingRunId={retryingRunId} />
+      <TimelineList
+        timeline={timeline}
+        agentMap={agentMap}
+        companyId={companyId}
+        projectId={projectId}
+        highlightCommentId={highlightCommentId}
+      />
 
       {liveRunSlot}
 
@@ -527,11 +412,10 @@ export function CommentThread({
           placeholder="Leave a comment..."
           mentions={mentions}
           onSubmit={handleSubmit}
-          onMentionSelect={handleMentionSelect}
           imageUploadHandler={imageUploadHandler}
           contentClassName="min-h-[60px] text-sm"
         />
-        <div className="flex items-center justify-end gap-2 flex-wrap">
+        <div className="flex items-center justify-end gap-3">
           {onAttachImage && (
             <div className="mr-auto flex items-center gap-3">
               <input
@@ -573,21 +457,34 @@ export function CommentThread({
               emptyMessage="No assignees found."
               onChange={setReassignTarget}
               className="text-xs h-8"
+              renderTriggerValue={(option) => {
+                if (!option) return <span className="text-muted-foreground">Assignee</span>;
+                const agentId = option.id.startsWith("agent:") ? option.id.slice("agent:".length) : null;
+                const agent = agentId ? agentMap?.get(agentId) : null;
+                return (
+                  <>
+                    {agent ? (
+                      <AgentIcon icon={agent.icon} className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+                    ) : null}
+                    <span className="truncate">{option.label}</span>
+                  </>
+                );
+              }}
+              renderOption={(option) => {
+                if (!option.id) return <span className="truncate">{option.label}</span>;
+                const agentId = option.id.startsWith("agent:") ? option.id.slice("agent:".length) : null;
+                const agent = agentId ? agentMap?.get(agentId) : null;
+                return (
+                  <>
+                    {agent ? (
+                      <AgentIcon icon={agent.icon} className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+                    ) : null}
+                    <span className="truncate">{option.label}</span>
+                  </>
+                );
+              }}
             />
           )}
-          <IssueExecutionControls
-            executionMode={executionMode}
-            executionTargetId={executionTargetId}
-            onExecutionModeChange={handleExecutionModeChange}
-            onExecutionTargetChange={handleExecutionTargetChange}
-            targets={availableExecutionTargets}
-            canUseRemote={canUseRemoteExecution}
-            size="sm"
-            triggerClassName="h-8 text-xs"
-            textClassName="text-xs"
-            showPrefix={false}
-            remoteRequirementLabel={remoteRequirementLabel}
-          />
           <Button size="sm" disabled={!canSubmit} onClick={handleSubmit}>
             {submitting ? "Posting..." : "Comment"}
           </Button>

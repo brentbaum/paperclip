@@ -1,5 +1,5 @@
 {
-  "id": "3ffc545e-f03e-4a4d-8fcc-9ecb3c60ba80",
+  "id": "beafd21e-2453-4df4-9148-630e9dd62532",
   "prevId": "10b08f4e-4837-488c-a3ed-0d66a97d7257",
   "version": "7",
   "dialect": "postgresql",
@@ -2873,643 +2873,6 @@
       "checkConstraints": {},
       "isRLSEnabled": false
     },
-    "public.document_agent_states": {
-      "name": "document_agent_states",
-      "schema": "",
-      "columns": {
-        "id": {
-          "name": "id",
-          "type": "uuid",
-          "primaryKey": true,
-          "notNull": true,
-          "default": "gen_random_uuid()"
-        },
-        "company_id": {
-          "name": "company_id",
-          "type": "uuid",
-          "primaryKey": false,
-          "notNull": true
-        },
-        "document_id": {
-          "name": "document_id",
-          "type": "uuid",
-          "primaryKey": false,
-          "notNull": true
-        },
-        "agent_id": {
-          "name": "agent_id",
-          "type": "uuid",
-          "primaryKey": false,
-          "notNull": true
-        },
-        "last_delivered_revision_id": {
-          "name": "last_delivered_revision_id",
-          "type": "uuid",
-          "primaryKey": false,
-          "notNull": false
-        },
-        "last_written_revision_id": {
-          "name": "last_written_revision_id",
-          "type": "uuid",
-          "primaryKey": false,
-          "notNull": false
-        },
-        "updated_at": {
-          "name": "updated_at",
-          "type": "timestamp with time zone",
-          "primaryKey": false,
-          "notNull": true,
-          "default": "now()"
-        }
-      },
-      "indexes": {
-        "document_agent_states_agent_document_idx": {
-          "name": "document_agent_states_agent_document_idx",
-          "columns": [
-            {
-              "expression": "agent_id",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            },
-            {
-              "expression": "document_id",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            }
-          ],
-          "isUnique": false,
-          "concurrently": false,
-          "method": "btree",
-          "with": {}
-        },
-        "document_agent_states_agent_document_unique": {
-          "name": "document_agent_states_agent_document_unique",
-          "columns": [
-            {
-              "expression": "agent_id",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            },
-            {
-              "expression": "document_id",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            }
-          ],
-          "isUnique": true,
-          "concurrently": false,
-          "method": "btree",
-          "with": {}
-        },
-        "document_agent_states_company_document_agent_idx": {
-          "name": "document_agent_states_company_document_agent_idx",
-          "columns": [
-            {
-              "expression": "company_id",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            },
-            {
-              "expression": "document_id",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            },
-            {
-              "expression": "agent_id",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            }
-          ],
-          "isUnique": false,
-          "concurrently": false,
-          "method": "btree",
-          "with": {}
-        },
-        "document_agent_states_last_delivered_idx": {
-          "name": "document_agent_states_last_delivered_idx",
-          "columns": [
-            {
-              "expression": "last_delivered_revision_id",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            }
-          ],
-          "isUnique": false,
-          "concurrently": false,
-          "method": "btree",
-          "with": {}
-        }
-      },
-      "foreignKeys": {
-        "document_agent_states_company_id_companies_id_fk": {
-          "name": "document_agent_states_company_id_companies_id_fk",
-          "tableFrom": "document_agent_states",
-          "tableTo": "companies",
-          "columnsFrom": [
-            "company_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
-          "onDelete": "no action",
-          "onUpdate": "no action"
-        },
-        "document_agent_states_document_id_documents_id_fk": {
-          "name": "document_agent_states_document_id_documents_id_fk",
-          "tableFrom": "document_agent_states",
-          "tableTo": "documents",
-          "columnsFrom": [
-            "document_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
-          "onDelete": "no action",
-          "onUpdate": "no action"
-        },
-        "document_agent_states_agent_id_agents_id_fk": {
-          "name": "document_agent_states_agent_id_agents_id_fk",
-          "tableFrom": "document_agent_states",
-          "tableTo": "agents",
-          "columnsFrom": [
-            "agent_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
-          "onDelete": "no action",
-          "onUpdate": "no action"
-        },
-        "document_agent_states_last_delivered_revision_id_document_revisions_id_fk": {
-          "name": "document_agent_states_last_delivered_revision_id_document_revisions_id_fk",
-          "tableFrom": "document_agent_states",
-          "tableTo": "document_revisions",
-          "columnsFrom": [
-            "last_delivered_revision_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
-          "onDelete": "no action",
-          "onUpdate": "no action"
-        },
-        "document_agent_states_last_written_revision_id_document_revisions_id_fk": {
-          "name": "document_agent_states_last_written_revision_id_document_revisions_id_fk",
-          "tableFrom": "document_agent_states",
-          "tableTo": "document_revisions",
-          "columnsFrom": [
-            "last_written_revision_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
-          "onDelete": "no action",
-          "onUpdate": "no action"
-        }
-      },
-      "compositePrimaryKeys": {},
-      "uniqueConstraints": {},
-      "policies": {},
-      "checkConstraints": {},
-      "isRLSEnabled": false
-    },
-    "public.document_revisions": {
-      "name": "document_revisions",
-      "schema": "",
-      "columns": {
-        "id": {
-          "name": "id",
-          "type": "uuid",
-          "primaryKey": true,
-          "notNull": true,
-          "default": "gen_random_uuid()"
-        },
-        "company_id": {
-          "name": "company_id",
-          "type": "uuid",
-          "primaryKey": false,
-          "notNull": true
-        },
-        "document_id": {
-          "name": "document_id",
-          "type": "uuid",
-          "primaryKey": false,
-          "notNull": true
-        },
-        "revision_number": {
-          "name": "revision_number",
-          "type": "integer",
-          "primaryKey": false,
-          "notNull": true
-        },
-        "parent_revision_id": {
-          "name": "parent_revision_id",
-          "type": "uuid",
-          "primaryKey": false,
-          "notNull": false
-        },
-        "author_agent_id": {
-          "name": "author_agent_id",
-          "type": "uuid",
-          "primaryKey": false,
-          "notNull": false
-        },
-        "author_user_id": {
-          "name": "author_user_id",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false
-        },
-        "source": {
-          "name": "source",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true
-        },
-        "change_summary": {
-          "name": "change_summary",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false
-        },
-        "body": {
-          "name": "body",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true
-        },
-        "created_at": {
-          "name": "created_at",
-          "type": "timestamp with time zone",
-          "primaryKey": false,
-          "notNull": true,
-          "default": "now()"
-        }
-      },
-      "indexes": {
-        "document_revisions_document_revision_number_idx": {
-          "name": "document_revisions_document_revision_number_idx",
-          "columns": [
-            {
-              "expression": "document_id",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            },
-            {
-              "expression": "revision_number",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            }
-          ],
-          "isUnique": false,
-          "concurrently": false,
-          "method": "btree",
-          "with": {}
-        },
-        "document_revisions_document_revision_unique": {
-          "name": "document_revisions_document_revision_unique",
-          "columns": [
-            {
-              "expression": "document_id",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            },
-            {
-              "expression": "revision_number",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            }
-          ],
-          "isUnique": true,
-          "concurrently": false,
-          "method": "btree",
-          "with": {}
-        }
-      },
-      "foreignKeys": {
-        "document_revisions_company_id_companies_id_fk": {
-          "name": "document_revisions_company_id_companies_id_fk",
-          "tableFrom": "document_revisions",
-          "tableTo": "companies",
-          "columnsFrom": [
-            "company_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
-          "onDelete": "no action",
-          "onUpdate": "no action"
-        },
-        "document_revisions_document_id_documents_id_fk": {
-          "name": "document_revisions_document_id_documents_id_fk",
-          "tableFrom": "document_revisions",
-          "tableTo": "documents",
-          "columnsFrom": [
-            "document_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
-          "onDelete": "no action",
-          "onUpdate": "no action"
-        },
-        "document_revisions_parent_revision_id_document_revisions_id_fk": {
-          "name": "document_revisions_parent_revision_id_document_revisions_id_fk",
-          "tableFrom": "document_revisions",
-          "tableTo": "document_revisions",
-          "columnsFrom": [
-            "parent_revision_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
-          "onDelete": "no action",
-          "onUpdate": "no action"
-        },
-        "document_revisions_author_agent_id_agents_id_fk": {
-          "name": "document_revisions_author_agent_id_agents_id_fk",
-          "tableFrom": "document_revisions",
-          "tableTo": "agents",
-          "columnsFrom": [
-            "author_agent_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
-          "onDelete": "no action",
-          "onUpdate": "no action"
-        }
-      },
-      "compositePrimaryKeys": {},
-      "uniqueConstraints": {},
-      "policies": {},
-      "checkConstraints": {},
-      "isRLSEnabled": false
-    },
-    "public.documents": {
-      "name": "documents",
-      "schema": "",
-      "columns": {
-        "id": {
-          "name": "id",
-          "type": "uuid",
-          "primaryKey": true,
-          "notNull": true,
-          "default": "gen_random_uuid()"
-        },
-        "company_id": {
-          "name": "company_id",
-          "type": "uuid",
-          "primaryKey": false,
-          "notNull": true
-        },
-        "scope": {
-          "name": "scope",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true
-        },
-        "title": {
-          "name": "title",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true
-        },
-        "format": {
-          "name": "format",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "default": "'markdown'"
-        },
-        "project_id": {
-          "name": "project_id",
-          "type": "uuid",
-          "primaryKey": false,
-          "notNull": false
-        },
-        "approval_id": {
-          "name": "approval_id",
-          "type": "uuid",
-          "primaryKey": false,
-          "notNull": false
-        },
-        "agent_id": {
-          "name": "agent_id",
-          "type": "uuid",
-          "primaryKey": false,
-          "notNull": false
-        },
-        "day": {
-          "name": "day",
-          "type": "date",
-          "primaryKey": false,
-          "notNull": false
-        },
-        "latest_revision_id": {
-          "name": "latest_revision_id",
-          "type": "uuid",
-          "primaryKey": false,
-          "notNull": false
-        },
-        "created_by_agent_id": {
-          "name": "created_by_agent_id",
-          "type": "uuid",
-          "primaryKey": false,
-          "notNull": false
-        },
-        "created_by_user_id": {
-          "name": "created_by_user_id",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false
-        },
-        "archived_at": {
-          "name": "archived_at",
-          "type": "timestamp with time zone",
-          "primaryKey": false,
-          "notNull": false
-        },
-        "created_at": {
-          "name": "created_at",
-          "type": "timestamp with time zone",
-          "primaryKey": false,
-          "notNull": true,
-          "default": "now()"
-        },
-        "updated_at": {
-          "name": "updated_at",
-          "type": "timestamp with time zone",
-          "primaryKey": false,
-          "notNull": true,
-          "default": "now()"
-        }
-      },
-      "indexes": {
-        "documents_company_scope_archived_idx": {
-          "name": "documents_company_scope_archived_idx",
-          "columns": [
-            {
-              "expression": "company_id",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            },
-            {
-              "expression": "scope",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            },
-            {
-              "expression": "archived_at",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            }
-          ],
-          "isUnique": false,
-          "concurrently": false,
-          "method": "btree",
-          "with": {}
-        },
-        "documents_project_id_unique": {
-          "name": "documents_project_id_unique",
-          "columns": [
-            {
-              "expression": "project_id",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            }
-          ],
-          "isUnique": true,
-          "concurrently": false,
-          "method": "btree",
-          "with": {}
-        },
-        "documents_approval_id_unique": {
-          "name": "documents_approval_id_unique",
-          "columns": [
-            {
-              "expression": "approval_id",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            }
-          ],
-          "isUnique": true,
-          "concurrently": false,
-          "method": "btree",
-          "with": {}
-        },
-        "documents_agent_day_unique": {
-          "name": "documents_agent_day_unique",
-          "columns": [
-            {
-              "expression": "agent_id",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            },
-            {
-              "expression": "day",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            }
-          ],
-          "isUnique": true,
-          "concurrently": false,
-          "method": "btree",
-          "with": {}
-        }
-      },
-      "foreignKeys": {
-        "documents_company_id_companies_id_fk": {
-          "name": "documents_company_id_companies_id_fk",
-          "tableFrom": "documents",
-          "tableTo": "companies",
-          "columnsFrom": [
-            "company_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
-          "onDelete": "no action",
-          "onUpdate": "no action"
-        },
-        "documents_project_id_projects_id_fk": {
-          "name": "documents_project_id_projects_id_fk",
-          "tableFrom": "documents",
-          "tableTo": "projects",
-          "columnsFrom": [
-            "project_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
-          "onDelete": "no action",
-          "onUpdate": "no action"
-        },
-        "documents_approval_id_approvals_id_fk": {
-          "name": "documents_approval_id_approvals_id_fk",
-          "tableFrom": "documents",
-          "tableTo": "approvals",
-          "columnsFrom": [
-            "approval_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
-          "onDelete": "no action",
-          "onUpdate": "no action"
-        },
-        "documents_agent_id_agents_id_fk": {
-          "name": "documents_agent_id_agents_id_fk",
-          "tableFrom": "documents",
-          "tableTo": "agents",
-          "columnsFrom": [
-            "agent_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
-          "onDelete": "no action",
-          "onUpdate": "no action"
-        },
-        "documents_created_by_agent_id_agents_id_fk": {
-          "name": "documents_created_by_agent_id_agents_id_fk",
-          "tableFrom": "documents",
-          "tableTo": "agents",
-          "columnsFrom": [
-            "created_by_agent_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
-          "onDelete": "no action",
-          "onUpdate": "no action"
-        }
-      },
-      "compositePrimaryKeys": {},
-      "uniqueConstraints": {},
-      "policies": {},
-      "checkConstraints": {},
-      "isRLSEnabled": false
-    },
     "public.goals": {
       "name": "goals",
       "schema": "",
@@ -4723,6 +4086,66 @@
           "columns": [
             {
               "expression": "company_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "issue_comments_company_issue_created_at_idx": {
+          "name": "issue_comments_company_issue_created_at_idx",
+          "columns": [
+            {
+              "expression": "company_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "issue_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "created_at",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "issue_comments_company_author_issue_created_at_idx": {
+          "name": "issue_comments_company_author_issue_created_at_idx",
+          "columns": [
+            {
+              "expression": "company_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "author_user_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "issue_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "created_at",
               "isExpression": false,
               "asc": true,
               "nulls": "last"
