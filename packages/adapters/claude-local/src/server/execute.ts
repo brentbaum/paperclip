@@ -85,13 +85,17 @@ function buildTelegramWakePrompt(context: Record<string, unknown>, agentId: stri
     topicId > 0 ? `topic ${topicId}` : null,
   ].filter(Boolean).join(", ");
 
+  const replyPayload: Record<string, unknown> = { agentId, text: "your reply" };
+  if (chatId.length > 0) replyPayload.chatId = chatId;
+  if (topicId > 0) replyPayload.topicId = topicId;
+
   return [
     "Telegram wake context:",
     `- From: ${senderLabel}${location ? ` in ${location}` : ""}`,
     `- Message: ${JSON.stringify(messageText)}`,
     "",
     "Before you end this run, you must send a reply back to Telegram.",
-    `Use POST ${sendEndpoint} with JSON like {\"agentId\":\"${agentId}\",\"text\":\"your reply\"}.`,
+    `Use POST ${sendEndpoint} with JSON body: ${JSON.stringify(replyPayload)}`,
     "If no issue work is required, send a concise acknowledgement and stop. Do not only write an internal status update.",
     "",
   ].join("\n");

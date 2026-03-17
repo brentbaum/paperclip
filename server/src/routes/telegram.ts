@@ -9,6 +9,8 @@ const sendTelegramMessageSchema = z.object({
   text: z.string().min(1),
   status: z.enum(["done", "blocked"]).optional(),
   issueId: z.string().min(1).optional(),
+  chatId: z.string().min(1).optional(),
+  topicId: z.number().int().optional(),
 });
 
 export function telegramRoutes(telegram: Pick<TelegramService, "sendToAgentTopic">) {
@@ -36,6 +38,8 @@ export function telegramRoutes(telegram: Pick<TelegramService, "sendToAgentTopic
         text: req.body.text,
         mirrorStatus: req.body.status ?? null,
         issueId: req.body.issueId ?? null,
+        overrideChatId: req.body.chatId ?? null,
+        overrideTopicId: req.body.topicId ?? null,
       });
 
       if (!result.ok) {

@@ -105,6 +105,8 @@ describe("telegram agent tool route", () => {
       text: "hello",
       mirrorStatus: null,
       issueId: null,
+      overrideChatId: null,
+      overrideTopicId: null,
     });
   });
 
@@ -125,6 +127,32 @@ describe("telegram agent tool route", () => {
     expect(res.status).toBe(403);
     expect(res.body).toEqual({ error: "Agents may only send telegram messages for themselves" });
     expect(sendToAgentTopic).not.toHaveBeenCalled();
+  });
+
+  it("passes chatId and topicId overrides to sendToAgentTopic", async () => {
+    const sendToAgentTopic = vi.fn(async () => ({ ok: true as const, messageId: 502 }));
+
+    const res = await invokeSendRoute({
+      actor: {
+        type: "agent",
+        agentId: "agent-1",
+        companyId: "company-1",
+        source: "agent_key",
+      },
+      body: { agentId: "agent-1", text: "reply", chatId: "-100123456", topicId: 42 },
+      sendToAgentTopic,
+    });
+
+    expect(res.status).toBe(201);
+    expect(sendToAgentTopic).toHaveBeenCalledWith({
+      companyId: "company-1",
+      agentId: "agent-1",
+      text: "reply",
+      mirrorStatus: null,
+      issueId: null,
+      overrideChatId: "-100123456",
+      overrideTopicId: 42,
+    });
   });
 
   it("rejects company mismatch responses from telegram service", async () => {

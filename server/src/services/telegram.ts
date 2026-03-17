@@ -131,6 +131,8 @@ type SendToAgentTopicInput = {
   idempotencyKey?: string;
   mirrorStatus?: "done" | "blocked" | null;
   issueId?: string | null;
+  overrideChatId?: string | null;
+  overrideTopicId?: number | null;
 };
 
 type SendApprovalRequestInput = {
@@ -295,6 +297,11 @@ function readTelegramDescription(err: unknown): string | null {
 function isTopicNotModifiedError(err: unknown) {
   const description = readTelegramDescription(err);
   return Boolean(description && description.includes("TOPIC_NOT_MODIFIED"));
+}
+
+function isTopicInvalidError(err: unknown) {
+  const description = readTelegramDescription(err);
+  return Boolean(description && description.includes("TOPIC_ID_INVALID"));
 }
 
 function isLongPollingConflictError(err: unknown) {
@@ -1159,13 +1166,22 @@ export function telegramService(db: Db, deps: TelegramServiceDeps) {
             if (isTopicNotModifiedError(err)) {
               continue;
             }
-            logger.warn(
-              { err, companyId, agentId: agent.id, topicId: existingTopicId },
-              "telegram topic rename failed",
-            );
+            if (isTopicInvalidError(err)) {
+              logger.info(
+                { companyId, agentId: agent.id, topicId: existingTopicId },
+                "telegram topic was deleted externally, recreating",
+              );
+              delete deps.config.telegramTopicMapping[agent.id];
+            } else {
+              logger.warn(
+                { err, companyId, agentId: agent.id, topicId: existingTopicId },
+                "telegram topic rename failed",
+              );
+              continue;
+            }
           }
         }
-        continue;
+        if (deps.config.telegramTopicMapping[agent.id]) continue;
       }
       const topic = await retryTelegramCall(() => activeBot.api.createForumTopic(chatId, desiredTopicName));
       deps.config.telegramTopicMapping[agent.id] = topic.message_thread_id;
@@ -1212,9 +1228,9 @@ export function telegramService(db: Db, deps: TelegramServiceDeps) {
     if (!isEnabled()) {
       return { ok: false as const, error: "telegram disabled" };
     }
-    const chatId = getChatId();
+    const defaultChatId = getChatId();
     const activeBot = await ensureBot();
-    if (!chatId || !activeBot) {
+    if (!defaultChatId || !activeBot) {
       return { ok: false as const, error: "telegram disabled" };
     }
 
@@ -1228,17 +1244,24 @@ export function telegramService(db: Db, deps: TelegramServiceDeps) {
       return { ok: false as const, error: "agent-company mismatch" };
     }
 
-    let topicId = deps.config.telegramTopicMapping[input.agentId];
+    // Use override chatId/topicId if provided (reply to originating chat/topic),
+    // otherwise fall back to the agent's configured topic mapping.
+    const chatId = input.overrideChatId || defaultChatId;
+    let topicId: number | undefined = input.overrideTopicId ?? undefined;
+
     if (!topicId) {
-      try {
-        await syncTopics(owner.companyId);
-      } catch (err) {
-        logger.warn({ err, agentId: input.agentId, companyId: owner.companyId }, "telegram send sync failed");
-      }
       topicId = deps.config.telegramTopicMapping[input.agentId];
-    }
-    if (!topicId) {
-      return { ok: false as const, error: "agent topic not configured" };
+      if (!topicId) {
+        try {
+          await syncTopics(owner.companyId);
+        } catch (err) {
+          logger.warn({ err, agentId: input.agentId, companyId: owner.companyId }, "telegram send sync failed");
+        }
+        topicId = deps.config.telegramTopicMapping[input.agentId];
+      }
+      if (!topicId) {
+        return { ok: false as const, error: "agent topic not configured" };
+      }
     }
 
     const text = input.mirrorStatus ? `[${input.mirrorStatus.toUpperCase()}] ${input.text}` : input.text;
