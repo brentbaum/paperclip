@@ -9,6 +9,7 @@ import {
   index,
   uniqueIndex,
 } from "drizzle-orm/pg-core";
+import { sql } from "drizzle-orm";
 import { agents } from "./agents.js";
 import { projects } from "./projects.js";
 import { goals } from "./goals.js";
@@ -48,6 +49,7 @@ export const issues = pgTable(
     cancelledAt: timestamp("cancelled_at", { withTimezone: true }),
     hiddenAt: timestamp("hidden_at", { withTimezone: true }),
     viewedAt: timestamp("viewed_at", { withTimezone: true }),
+    scheduledAt: timestamp("scheduled_at", { withTimezone: true }),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
@@ -69,6 +71,9 @@ export const issues = pgTable(
     ),
     parentIdx: index("issues_company_parent_idx").on(table.companyId, table.parentId),
     projectIdx: index("issues_company_project_idx").on(table.companyId, table.projectId),
+    scheduledAtIdx: index("issues_scheduled_at_idx")
+      .on(table.scheduledAt)
+      .where(sql`${table.scheduledAt} is not null`),
     identifierIdx: uniqueIndex("issues_identifier_idx").on(table.identifier),
   }),
 );

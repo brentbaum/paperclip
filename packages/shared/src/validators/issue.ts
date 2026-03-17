@@ -43,6 +43,7 @@ const issueBaseSchema = z.object({
   billingCode: z.string().optional().nullable(),
   assigneeAdapterOverrides: issueAssigneeAdapterOverridesSchema.optional().nullable(),
   executionWorkspaceSettings: issueExecutionWorkspaceSettingsSchema.optional().nullable(),
+  scheduledAt: z.string().datetime().nullable().optional(),
   labelIds: z.array(z.string().uuid()).optional(),
 });
 
@@ -77,6 +78,7 @@ export type CreateIssueLabel = z.infer<typeof createIssueLabelSchema>;
 export const updateIssueSchema = issueBaseSchema.partial().extend({
   comment: z.string().min(1).optional(),
   hiddenAt: z.string().datetime().nullable().optional(),
+  scheduledAt: z.string().datetime().nullable().optional(),
 });
 
 export type UpdateIssue = z.infer<typeof updateIssueSchema>;

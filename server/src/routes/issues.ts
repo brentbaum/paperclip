@@ -804,6 +804,9 @@ export function issueRoutes(db: Db, storage: StorageService) {
       existing.status === "backlog" &&
       issue.status !== "backlog" &&
       req.body.status !== undefined;
+    const wasReopened =
+      (existing.status === "done" || existing.status === "cancelled") &&
+      issue.status === "todo";
 
     // Merge all wakeups from this update into one enqueue per agent to avoid duplicate runs.
     void (async () => {
@@ -818,6 +821,23 @@ export function issueRoutes(db: Db, storage: StorageService) {
           requestedByActorType: actor.actorType,
           requestedByActorId: actor.actorId,
           contextSnapshot: { issueId: issue.id, source: "issue.update" },
+        });
+      } else if (wasReopened && issue.assigneeAgentId && issue.assigneeAgentId !== actor.agentId) {
+        wakeups.set(issue.assigneeAgentId, {
+          source: "automation",
+          triggerDetail: "system",
+          reason: "issue_reopened",
+          payload: { issueId: issue.id, mutation: "update", reopenedFrom: existing.status },
+          requestedByActorType: actor.actorType,
+          requestedByActorId: actor.actorId,
+          contextSnapshot: {
+            issueId: issue.id,
+            taskId: issue.id,
+            source: "issue.update.reopen",
+            wakeReason: "issue_reopened",
+            reopenedFrom: existing.status,
+            ...(comment ? { commentId: comment.id, wakeCommentId: comment.id } : {}),
+          },
         });
       }
 

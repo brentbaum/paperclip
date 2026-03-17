@@ -1,6 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { and, asc, desc, eq, gt, inArray, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, inArray, isNotNull, lte, notInArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import type { BillingType } from "@paperclipai/shared";
 import {
@@ -3125,6 +3125,7 @@ export function heartbeatService(db: Db) {
       let checked = 0;
       let enqueued = 0;
       let skipped = 0;
+      let scheduledIssuesProcessed = 0;
 
       for (const agent of allAgents) {
         if (agent.status === "paused" || agent.status === "terminated" || agent.status === "pending_approval") continue;
@@ -3152,7 +3153,81 @@ export function heartbeatService(db: Db) {
         else skipped += 1;
       }
 
-      return { checked, enqueued, skipped };
+      const scheduledIssues = await db
+        .select({
+          id: issues.id,
+          assigneeAgentId: issues.assigneeAgentId,
+        })
+        .from(issues)
+        .where(
+          and(
+            lte(issues.scheduledAt, now),
+            isNotNull(issues.scheduledAt),
+            notInArray(issues.status, ["done", "cancelled"]),
+            isNotNull(issues.assigneeAgentId),
+          ),
+        );
+
+      if (scheduledIssues.length > 0) {
+        logger.info(
+          { scheduledIssueCount: scheduledIssues.length, now: now.toISOString() },
+          "tickTimers: processing scheduled issues",
+        );
+      }
+
+      for (const issue of scheduledIssues) {
+        try {
+          const assigneeAgentId = issue.assigneeAgentId;
+          if (!assigneeAgentId) {
+            logger.warn({ issueId: issue.id }, "tickTimers: scheduled issue missing assignee");
+            continue;
+          }
+
+          logger.info(
+            { issueId: issue.id, assigneeAgentId, now: now.toISOString() },
+            "tickTimers: waking agent for scheduled issue",
+          );
+
+          const run = await enqueueWakeup(assigneeAgentId, {
+            source: "automation",
+            triggerDetail: "system",
+            reason: "scheduled_issue_ready",
+            contextSnapshot: {
+              issueId: issue.id,
+              wakeReason: "scheduled_issue_ready",
+            },
+            requestedByActorType: "system",
+            requestedByActorId: "scheduled_issue_scheduler",
+          });
+
+          if (!run) {
+            logger.warn(
+              { issueId: issue.id, assigneeAgentId },
+              "tickTimers: scheduled issue wakeup skipped",
+            );
+            continue;
+          }
+
+          await db
+            .update(issues)
+            .set({ scheduledAt: null })
+            .where(eq(issues.id, issue.id));
+
+          scheduledIssuesProcessed += 1;
+
+          logger.info(
+            { issueId: issue.id, assigneeAgentId, runId: run.id },
+            "tickTimers: scheduled issue processed",
+          );
+        } catch (err) {
+          logger.error(
+            { err, issueId: issue.id, assigneeAgentId: issue.assigneeAgentId },
+            "tickTimers: scheduled issue processing failed",
+          );
+        }
+      }
+
+      return { checked, enqueued, skipped, scheduledIssuesProcessed };
     },
 
     cancelRun: (runId: string) => cancelRunInternal(runId),

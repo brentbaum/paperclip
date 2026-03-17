@@ -125,6 +125,7 @@ export interface Issue {
   cancelledAt: Date | null;
   hiddenAt: Date | null;
   viewedAt?: Date | null;
+  scheduledAt: Date | null;
   labelIds?: string[];
   labels?: IssueLabel[];
   planDocument?: IssueDocument | null;
