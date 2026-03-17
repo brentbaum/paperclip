@@ -1,5 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
+import { promisify } from "node:util";
 import { and, asc, desc, eq, gt, inArray, isNotNull, lte, notInArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import type { BillingType } from "@paperclipai/shared";
@@ -22,6 +23,7 @@ import { getServerAdapter, runningProcesses } from "../adapters/index.js";
 import type { AdapterExecutionResult, AdapterInvocationMeta, AdapterSessionCodec, UsageSummary } from "../adapters/index.js";
 import { createLocalAgentJwt } from "../agent-auth-jwt.js";
 import { parseObject, asBoolean, asNumber, appendWithCap, MAX_EXCERPT_BYTES } from "../adapters/utils.js";
+import { validateCron, nextCronTickFromExpression } from "./cron.js";
 import { costService } from "./costs.js";
 import { budgetService, type BudgetEnforcementScope } from "./budgets.js";
 import { secretService } from "./secrets.js";
@@ -1188,9 +1190,13 @@ export function heartbeatService(db: Db) {
     const runtimeConfig = parseObject(agent.runtimeConfig);
     const heartbeat = parseObject(runtimeConfig.heartbeat);
 
+    const rawCron = typeof heartbeat.cron === "string" ? heartbeat.cron.trim() : null;
+    const cronExpression = rawCron && validateCron(rawCron) === null ? rawCron : null;
+
     return {
       enabled: asBoolean(heartbeat.enabled, true),
       intervalSec: Math.max(0, asNumber(heartbeat.intervalSec, 0)),
+      cronExpression,
       wakeOnDemand: asBoolean(heartbeat.wakeOnDemand ?? heartbeat.wakeOnAssignment ?? heartbeat.wakeOnOnDemand ?? heartbeat.wakeOnAutomation, true),
       maxConcurrentRuns: normalizeMaxConcurrentRuns(heartbeat.maxConcurrentRuns),
     };
@@ -3130,12 +3136,35 @@ export function heartbeatService(db: Db) {
       for (const agent of allAgents) {
         if (agent.status === "paused" || agent.status === "terminated" || agent.status === "pending_approval") continue;
         const policy = parseHeartbeatPolicy(agent);
-        if (!policy.enabled || policy.intervalSec <= 0) continue;
+        if (!policy.enabled) continue;
+
+        const hasCron = !!policy.cronExpression;
+        const hasInterval = policy.intervalSec > 0;
+        if (!hasCron && !hasInterval) continue;
 
         checked += 1;
-        const baseline = new Date(agent.lastHeartbeatAt ?? agent.createdAt).getTime();
-        const elapsedMs = now.getTime() - baseline;
-        if (elapsedMs < policy.intervalSec * 1000) continue;
+        const baseline = new Date(agent.lastHeartbeatAt ?? agent.createdAt);
+
+        let shouldWake = false;
+        let reason = "interval_elapsed";
+
+        if (hasCron) {
+          // Cron-based: check if there's a cron tick between baseline and now
+          const nextTick = nextCronTickFromExpression(policy.cronExpression!, baseline);
+          if (nextTick && nextTick.getTime() <= now.getTime()) {
+            shouldWake = true;
+            reason = "cron_schedule";
+          }
+        } else if (hasInterval) {
+          // Legacy interval-based: simple elapsed time check
+          const elapsedMs = now.getTime() - baseline.getTime();
+          if (elapsedMs >= policy.intervalSec * 1000) {
+            shouldWake = true;
+            reason = "interval_elapsed";
+          }
+        }
+
+        if (!shouldWake) continue;
 
         const run = await enqueueWakeup(agent.id, {
           source: "timer",
@@ -3145,7 +3174,8 @@ export function heartbeatService(db: Db) {
           requestedByActorId: "heartbeat_scheduler",
           contextSnapshot: {
             source: "scheduler",
-            reason: "interval_elapsed",
+            reason,
+            ...(hasCron ? { cronExpression: policy.cronExpression } : {}),
             now: now.toISOString(),
           },
         });
