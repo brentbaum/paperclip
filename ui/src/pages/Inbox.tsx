@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { Link, useLocation, useNavigate } from "@/lib/router";
-import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { useQuery, useQueries, useMutation, useQueryClient } from "@tanstack/react-query";
 import { approvalsApi } from "../api/approvals";
 import { accessApi } from "../api/access";
 import { ApiError } from "../api/client";
@@ -19,10 +19,12 @@ import { IssueRow } from "../components/IssueRow";
 import { PriorityIcon } from "../components/PriorityIcon";
 import { StatusIcon } from "../components/StatusIcon";
 import { StatusBadge } from "../components/StatusBadge";
+import { MarkdownBody } from "../components/MarkdownBody";
 import { timeAgo } from "../lib/timeAgo";
 import { Button } from "@/components/ui/button";
 import { Separator } from "@/components/ui/separator";
 import { Tabs } from "@/components/ui/tabs";
+import { Textarea } from "@/components/ui/textarea";
 import {
   Select,
   SelectContent,
@@ -34,13 +36,16 @@ import {
   Inbox as InboxIcon,
   AlertTriangle,
   ArrowUpRight,
+  ChevronDown,
+  ChevronUp,
+  MessageSquare,
   XCircle,
   X,
   RotateCcw,
 } from "lucide-react";
 import { Identity } from "../components/Identity";
 import { PageTabBar } from "../components/PageTabBar";
-import type { HeartbeatRun, Issue, JoinRequest } from "@paperclipai/shared";
+import type { HeartbeatRun, Issue, IssueComment, JoinRequest } from "@paperclipai/shared";
 import {
   ACTIONABLE_APPROVAL_STATUSES,
   getLatestFailedRunsByAgent,
@@ -93,6 +98,15 @@ function readIssueIdFromRun(run: HeartbeatRun): string | null {
   if (typeof taskId === "string" && taskId.length > 0) return taskId;
 
   return null;
+}
+
+function latestAgentComment(comments: IssueComment[] | undefined): IssueComment | null {
+  const latest = comments?.[0] ?? null;
+  return latest?.authorAgentId ? latest : null;
+}
+
+function commentPreview(body: string): string {
+  return body.trim();
 }
 
 function FailedRunCard({
@@ -243,6 +257,8 @@ export function Inbox() {
   const [allCategoryFilter, setAllCategoryFilter] = useState<InboxCategoryFilter>("everything");
   const [allApprovalFilter, setAllApprovalFilter] = useState<InboxApprovalFilter>("all");
   const { dismissed, dismiss } = useDismissedInboxItems();
+  const [expandedIssueComments, setExpandedIssueComments] = useState<Record<string, boolean>>({});
+  const [replyDrafts, setReplyDrafts] = useState<Record<string, string>>({});
 
   const pathSegment = location.pathname.split("/").pop() ?? "recent";
   const tab: InboxTab =
@@ -334,6 +350,24 @@ export function Inbox() {
     () => touchedIssues.filter((issue) => issue.isUnreadForMe),
     [touchedIssues],
   );
+
+  // TODO: uncomment when unviewedAssignedToMe / assignedToMeIssues are wired up
+  // const unreadAssignedIssueCommentQueries = useQueries({
+  //   queries: unviewedAssignedToMe.map((issue) => ({
+  //     queryKey: queryKeys.issues.comments(issue.id),
+  //     queryFn: () => issuesApi.listComments(issue.id),
+  //     enabled: !!selectedCompanyId,
+  //   })),
+  // });
+  //
+  // const latestAgentCommentByIssueId = useMemo(() => {
+  //   const map = new Map<string, IssueComment>();
+  //   for (const [index, issue] of unviewedAssignedToMe.entries()) {
+  //     const latest = latestAgentComment(unreadAssignedIssueCommentQueries[index]?.data);
+  //     if (latest) map.set(issue.id, latest);
+  //   }
+  //   return map;
+  // }, [unviewedAssignedToMe, unreadAssignedIssueCommentQueries]);
 
   const agentById = useMemo(() => {
     const map = new Map<string, string>();
@@ -492,6 +526,37 @@ export function Inbox() {
     },
   });
 
+  const replyToIssueMutation = useMutation({
+    mutationFn: async ({ issueId, body }: { issueId: string; body: string }) => {
+      const comment = await issuesApi.addComment(issueId, body);
+      try {
+        await issuesApi.markViewed(issueId);
+      } catch {
+        // Best-effort: the reply succeeded, so don't fail the whole action on read-state sync.
+      }
+      return { issueId, comment };
+    },
+    onSuccess: ({ issueId }) => {
+      setActionError(null);
+      setReplyDrafts((current) => {
+        const next = { ...current };
+        delete next[issueId];
+        return next;
+      });
+      setExpandedIssueComments((current) => ({ ...current, [issueId]: false }));
+      queryClient.invalidateQueries({ queryKey: queryKeys.issues.comments(issueId) });
+      queryClient.invalidateQueries({ queryKey: queryKeys.issues.detail(issueId) });
+      if (selectedCompanyId) {
+        queryClient.invalidateQueries({ queryKey: queryKeys.issues.list(selectedCompanyId) });
+        queryClient.invalidateQueries({ queryKey: queryKeys.issues.listAssignedToMe(selectedCompanyId) });
+        queryClient.invalidateQueries({ queryKey: queryKeys.sidebarBadges(selectedCompanyId) });
+      }
+    },
+    onError: (err) => {
+      setActionError(err instanceof Error ? err.message : "Failed to post reply");
+    },
+  });
+
   if (!selectedCompanyId) {
     return <EmptyState icon={InboxIcon} message="Select a company to view inbox." />;
   }
@@ -642,6 +707,150 @@ export function Inbox() {
           }
         />
       )}
+
+      {/* TODO: "Assigned To Me" section - needs showAssignedSection, unviewedAssignedToMe, assignedToMeIssues, isUnviewed, UserCheck */}
+      {/* showAssignedSection && (
+        <>
+          {showSeparatorBefore("assigned_to_me") && <Separator />}
+          <div>
+            <h3 className="mb-3 text-sm font-semibold uppercase tracking-wide text-muted-foreground">
+              Assigned To Me
+            </h3>
+            <div className="divide-y divide-border border border-border">
+              {(tab === "new" ? unviewedAssignedToMe : assignedToMeIssues).map((issue) => (
+                (() => {
+                  const latestComment = isUnviewed(issue)
+                    ? latestAgentCommentByIssueId.get(issue.id) ?? null
+                    : null;
+                  const isExpanded = !!expandedIssueComments[issue.id];
+                  const replyDraft = replyDrafts[issue.id] ?? "";
+                  const isReplying =
+                    replyToIssueMutation.isPending &&
+                    replyToIssueMutation.variables?.issueId === issue.id;
+
+                  return (
+                    <div key={issue.id} className="px-4 py-3">
+                      <div className="flex items-center gap-3">
+                        <UserCheck className="h-4 w-4 shrink-0 text-blue-600 dark:text-blue-400" />
+                        <PriorityIcon priority={issue.priority} />
+                        <StatusIcon status={issue.status} />
+                        <span className="text-xs font-mono text-muted-foreground">
+                          {issue.identifier ?? issue.id.slice(0, 8)}
+                        </span>
+                        <Link
+                          to={`/issues/${issue.identifier ?? issue.id}`}
+                          className="min-w-0 flex-1 truncate text-sm no-underline text-inherit hover:text-foreground"
+                        >
+                          {issue.title}
+                        </Link>
+                        <span className="shrink-0 text-xs text-muted-foreground">
+                          updated {timeAgo(issue.updatedAt)}
+                        </span>
+                      </div>
+
+                      {latestComment && (
+                        <div className="mt-3 ml-10 rounded-lg border border-border bg-accent/20 p-3">
+                          <div className="flex items-center justify-between gap-3">
+                            <div className="flex min-w-0 items-center gap-2 text-xs text-muted-foreground">
+                              <MessageSquare className="h-3.5 w-3.5 shrink-0" />
+                              <Identity
+                                name={agentName(latestComment.authorAgentId) ?? "Agent"}
+                                size="sm"
+                              />
+                              <span className="truncate">commented {timeAgo(latestComment.createdAt)}</span>
+                            </div>
+                            <div className="flex items-center gap-2">
+                              <Button
+                                type="button"
+                                variant="ghost"
+                                size="sm"
+                                className="h-7 px-2 text-xs"
+                                onClick={() =>
+                                  setExpandedIssueComments((current) => ({
+                                    ...current,
+                                    [issue.id]: !current[issue.id],
+                                  }))
+                                }
+                              >
+                                {isExpanded ? (
+                                  <>
+                                    Collapse
+                                    <ChevronUp className="ml-1 h-3.5 w-3.5" />
+                                  </>
+                                ) : (
+                                  <>
+                                    Expand
+                                    <ChevronDown className="ml-1 h-3.5 w-3.5" />
+                                  </>
+                                )}
+                              </Button>
+                            </div>
+                          </div>
+
+                          {isExpanded ? (
+                            <div className="mt-3 space-y-3">
+                              <div className="rounded-md border border-border bg-background px-3 py-2">
+                                <MarkdownBody className="text-sm">
+                                  {latestComment.body}
+                                </MarkdownBody>
+                              </div>
+                              <div className="space-y-2">
+                                <Textarea
+                                  value={replyDraft}
+                                  onChange={(event) =>
+                                    setReplyDrafts((current) => ({
+                                      ...current,
+                                      [issue.id]: event.target.value,
+                                    }))
+                                  }
+                                  placeholder="Reply to this issue..."
+                                  className="min-h-24 text-sm"
+                                />
+                                <div className="flex items-center justify-end gap-2">
+                                  <Button
+                                    type="button"
+                                    variant="outline"
+                                    size="sm"
+                                    onClick={() =>
+                                      setExpandedIssueComments((current) => ({
+                                        ...current,
+                                        [issue.id]: false,
+                                      }))
+                                    }
+                                  >
+                                    Cancel
+                                  </Button>
+                                  <Button
+                                    type="button"
+                                    size="sm"
+                                    disabled={isReplying || !replyDraft.trim()}
+                                    onClick={() =>
+                                      replyToIssueMutation.mutate({
+                                        issueId: issue.id,
+                                        body: replyDraft.trim(),
+                                      })
+                                    }
+                                  >
+                                    {isReplying ? "Posting..." : "Reply"}
+                                  </Button>
+                                </div>
+                              </div>
+                            </div>
+                          ) : (
+                            <p className="mt-2 whitespace-pre-wrap break-words text-sm text-muted-foreground line-clamp-3">
+                              {commentPreview(latestComment.body)}
+                            </p>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })()
+              ))}
+            </div>
+          </div>
+        </>
+      ) */}
 
       {showApprovalsSection && (
         <>
