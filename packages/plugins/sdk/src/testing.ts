@@ -362,6 +362,8 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
           assigneeAgentId: input.assigneeAgentId ?? null,
           assigneeUserId: null,
           checkoutRunId: null,
+          executionMode: "default",
+          executionTargetId: null,
           executionRunId: null,
           executionAgentNameKey: null,
           executionLockedAt: null,
@@ -377,6 +379,8 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
           completedAt: null,
           cancelledAt: null,
           hiddenAt: null,
+          viewedAt: null,
+          scheduledAt: null,
           createdAt: now,
           updatedAt: now,
         };
