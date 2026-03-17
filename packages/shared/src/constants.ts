@@ -108,6 +108,18 @@ export const AGENT_ICON_NAMES = [
 ] as const;
 export type AgentIconName = (typeof AGENT_ICON_NAMES)[number];
 
+export const DOCUMENT_FORMATS = ["markdown"] as const;
+export type DocumentFormat = (typeof DOCUMENT_FORMATS)[number];
+
+export const DOCUMENT_SCOPES = ["project", "approval", "agent_daily"] as const;
+export type DocumentScope = (typeof DOCUMENT_SCOPES)[number];
+
+export const ISSUE_EXECUTION_MODES = ["default", "remote"] as const;
+export type IssueExecutionMode = (typeof ISSUE_EXECUTION_MODES)[number];
+
+export const REMOTE_EXECUTION_LEASE_STATUSES = ["active", "expired", "destroyed", "error"] as const;
+export type RemoteExecutionLeaseStatus = (typeof REMOTE_EXECUTION_LEASE_STATUSES)[number];
+
 export const ISSUE_STATUSES = [
   "backlog",
   "todo",

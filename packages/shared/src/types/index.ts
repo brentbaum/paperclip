@@ -32,8 +32,6 @@ export type {
   IssueComment,
   IssueDocument,
   IssueDocumentSummary,
-  DocumentRevision,
-  DocumentFormat,
   LegacyPlanDocument,
   IssueAncestor,
   IssueAncestorProject,
