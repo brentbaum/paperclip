@@ -2376,7 +2376,19 @@ export function heartbeatService(db: Db) {
       triggerDetail,
       payload,
     });
-    const issueId = readNonEmptyString(enrichedContextSnapshot.issueId) ?? issueIdFromPayload;
+    let issueId = readNonEmptyString(enrichedContextSnapshot.issueId) ?? issueIdFromPayload;
+
+    // Resolve human-readable identifiers (e.g. "REF-31") to UUIDs
+    if (issueId && /^[A-Z]+-\d+$/i.test(issueId)) {
+      const resolved = await issuesSvc.getByIdentifier(issueId);
+      if (resolved) {
+        issueId = resolved.id;
+        enrichedContextSnapshot.issueId = resolved.id;
+        if (enrichedContextSnapshot.taskId === issueIdFromPayload) {
+          enrichedContextSnapshot.taskId = resolved.id;
+        }
+      }
+    }
 
     const agent = await getAgent(agentId);
     if (!agent) throw notFound("Agent not found");
@@ -2739,10 +2751,14 @@ export function heartbeatService(db: Db) {
     );
     const shouldQueueFollowupForCommentWake =
       Boolean(wakeCommentId) && Boolean(sameScopeRunningRun) && !sameScopeQueuedRun;
+    const shouldQueueFollowupForTelegramWake =
+      reason === "telegram_message" && Boolean(sameScopeRunningRun) && !sameScopeQueuedRun;
 
     const coalescedTargetRun =
       sameScopeQueuedRun ??
-      (shouldQueueFollowupForCommentWake ? null : sameScopeRunningRun ?? null);
+      (shouldQueueFollowupForCommentWake || shouldQueueFollowupForTelegramWake
+        ? null
+        : sameScopeRunningRun ?? null);
 
     if (coalescedTargetRun) {
       const mergedContextSnapshot = mergeCoalescedContextSnapshot(
