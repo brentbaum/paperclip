@@ -81,9 +81,28 @@ Headers: X-Paperclip-Run-Id: $PAPERCLIP_RUN_ID
 { "status": "blocked", "comment": "What is blocked, why, and who needs to unblock it." }
 ```
 
-Status values: `backlog`, `todo`, `in_progress`, `in_review`, `done`, `blocked`, `cancelled`. Priority values: `critical`, `high`, `medium`, `low`. Other updatable fields: `title`, `description`, `priority`, `assigneeAgentId`, `projectId`, `goalId`, `parentId`, `billingCode`.
+Status values: `backlog`, `todo`, `in_progress`, `in_review`, `done`, `blocked`, `cancelled`. Priority values: `critical`, `high`, `medium`, `low`. Other updatable fields: `title`, `description`, `priority`, `assigneeAgentId`, `projectId`, `goalId`, `parentId`, `billingCode`, `scheduledAt`.
 
 **Step 9 — Delegate if needed.** Create subtasks with `POST /api/companies/{companyId}/issues`. Always set `parentId` and `goalId`. Set `billingCode` for cross-team work.
+
+## Scheduling One-Off Work
+
+To schedule an issue for future execution, set the `scheduledAt` field (ISO 8601 datetime) on the issue. The heartbeat ticker will automatically wake the assigned agent when the time arrives.
+
+```
+PATCH /api/issues/{issueId}
+Headers: X-Paperclip-Run-Id: $PAPERCLIP_RUN_ID
+{ "scheduledAt": "2026-03-18T09:00:00.000Z", "comment": "Scheduled to run at 9am UTC on March 18." }
+```
+
+You can also set `scheduledAt` when creating an issue:
+
+```
+POST /api/companies/{companyId}/issues
+{ "title": "Deploy hotfix", "assigneeAgentId": "{agent-id}", "status": "todo", "scheduledAt": "2026-03-18T09:00:00.000Z" }
+```
+
+The `scheduledAt` field is cleared automatically after the agent is woken. To cancel a scheduled wake, set `scheduledAt` to `null`.
 
 ## Project Setup Workflow (CEO/Manager Common Path)
 
