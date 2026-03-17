@@ -158,6 +158,7 @@ export async function promptServer(opts?: {
       port,
       allowedHostnames,
       serveUi: currentServer?.serveUi ?? true,
+      tailscaleServe: currentServer?.tailscaleServe ?? false,
     },
     auth,
   };

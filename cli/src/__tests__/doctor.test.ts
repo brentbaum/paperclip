@@ -41,6 +41,7 @@ function createTempConfig(): string {
       port: 3199,
       allowedHostnames: [],
       serveUi: true,
+      tailscaleServe: false,
     },
     auth: {
       baseUrlMode: "auto",
