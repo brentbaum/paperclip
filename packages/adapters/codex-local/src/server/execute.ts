@@ -42,6 +42,38 @@ function stripCodexRolloutNoise(text: string): string {
   return kept.join("\n");
 }
 
+function buildTelegramWakePrompt(context: Record<string, unknown>, agentId: string) {
+  const wakeReason = asString(context.wakeReason, "").trim();
+  const telegramContext = parseObject(context.paperclipTelegram);
+  const tools = parseObject(context.paperclipTools);
+  const telegramTool = parseObject(tools.telegram);
+  const messageText = asString(telegramContext.messageText, "").trim();
+  if (wakeReason !== "telegram_message" || messageText.length === 0) return "";
+
+  const chatId = asString(telegramContext.chatId, "").trim();
+  const topicId = Math.floor(asNumber(telegramContext.topicId, 0));
+  const username = asString(telegramContext.username, "").trim();
+  const userId = Math.floor(asNumber(telegramContext.userId, 0));
+  const sendEndpoint = asString(telegramTool.sendEndpoint, "/api/agent-tools/telegram/send").trim();
+  const senderLabel =
+    username.length > 0 ? `@${username}` : userId > 0 ? `user ${userId}` : "the operator";
+  const location = [
+    chatId.length > 0 ? `chat ${chatId}` : null,
+    topicId > 0 ? `topic ${topicId}` : null,
+  ].filter(Boolean).join(", ");
+
+  return [
+    "Telegram wake context:",
+    `- From: ${senderLabel}${location ? ` in ${location}` : ""}`,
+    `- Message: ${JSON.stringify(messageText)}`,
+    "",
+    "Before you end this run, you must send a reply back to Telegram.",
+    `Use POST ${sendEndpoint} with JSON like {\"agentId\":\"${agentId}\",\"text\":\"your reply\"}.`,
+    "If no issue work is required, send a concise acknowledgement and stop. Do not only write an internal status update.",
+    "",
+  ].join("\n");
+}
+
 function firstNonEmptyLine(text: string): string {
   return (
     text
@@ -258,6 +290,17 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const linkedIssueIds = Array.isArray(context.issueIds)
     ? context.issueIds.filter((value): value is string => typeof value === "string" && value.trim().length > 0)
     : [];
+  const wakeMessage =
+    typeof context.wakeMessage === "string" && context.wakeMessage.trim().length > 0
+      ? context.wakeMessage.trim()
+      : null;
+  const telegramContext = parseObject(context.paperclipTelegram);
+  const telegramMessageText = asString(telegramContext.messageText, "");
+  const telegramChatId = asString(telegramContext.chatId, "");
+  const telegramTopicId = Math.floor(asNumber(telegramContext.topicId, 0));
+  const telegramMessageId = Math.floor(asNumber(telegramContext.messageId, 0));
+  const telegramUserId = Math.floor(asNumber(telegramContext.userId, 0));
+  const telegramUsername = asString(telegramContext.username, "");
   if (wakeTaskId) {
     env.PAPERCLIP_TASK_ID = wakeTaskId;
   }
@@ -266,6 +309,27 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   }
   if (wakeCommentId) {
     env.PAPERCLIP_WAKE_COMMENT_ID = wakeCommentId;
+  }
+  if (wakeMessage) {
+    env.PAPERCLIP_WAKE_MESSAGE = wakeMessage;
+  }
+  if (telegramMessageText) {
+    env.PAPERCLIP_TELEGRAM_MESSAGE_TEXT = telegramMessageText;
+  }
+  if (telegramChatId) {
+    env.PAPERCLIP_TELEGRAM_CHAT_ID = telegramChatId;
+  }
+  if (telegramTopicId > 0) {
+    env.PAPERCLIP_TELEGRAM_TOPIC_ID = String(telegramTopicId);
+  }
+  if (telegramMessageId > 0) {
+    env.PAPERCLIP_TELEGRAM_MESSAGE_ID = String(telegramMessageId);
+  }
+  if (telegramUserId > 0) {
+    env.PAPERCLIP_TELEGRAM_USER_ID = String(telegramUserId);
+  }
+  if (telegramUsername) {
+    env.PAPERCLIP_TELEGRAM_USERNAME = telegramUsername;
   }
   if (approvalId) {
     env.PAPERCLIP_APPROVAL_ID = approvalId;
@@ -403,7 +467,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       ? renderTemplate(bootstrapPromptTemplate, templateData).trim()
       : "";
   const sessionHandoffNote = asString(context.paperclipSessionHandoffMarkdown, "").trim();
+  const telegramWakePrompt = buildTelegramWakePrompt(context, agent.id);
   const prompt = joinPromptSections([
+    telegramWakePrompt,
     instructionsPrefix,
     renderedBootstrapPrompt,
     sessionHandoffNote,

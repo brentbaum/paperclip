@@ -174,6 +174,10 @@ function readNonEmptyString(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value : null;
 }
 
+function readFiniteNumber(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
 function normalizeLedgerBillingType(value: unknown): BillingType {
   const raw = readNonEmptyString(value);
   switch (raw) {
@@ -462,6 +466,19 @@ function enrichWakeContextSnapshot(input: {
   const commentIdFromPayload = readNonEmptyString(payload?.["commentId"]);
   const taskKey = deriveTaskKey(contextSnapshot, payload);
   const wakeCommentId = deriveCommentId(contextSnapshot, payload);
+  const existingTelegramContext = parseObject(contextSnapshot.paperclipTelegram);
+  const telegramMessageText =
+    readNonEmptyString(existingTelegramContext.messageText) ?? readNonEmptyString(payload?.["text"]);
+  const telegramChatId =
+    readNonEmptyString(existingTelegramContext.chatId) ?? readNonEmptyString(payload?.["chatId"]);
+  const telegramTopicId =
+    readFiniteNumber(existingTelegramContext.topicId) ?? readFiniteNumber(payload?.["topicId"]);
+  const telegramMessageId =
+    readFiniteNumber(existingTelegramContext.messageId) ?? readFiniteNumber(payload?.["messageId"]);
+  const telegramUserId =
+    readFiniteNumber(existingTelegramContext.userId) ?? readFiniteNumber(payload?.["telegramUserId"]);
+  const telegramUsername =
+    readNonEmptyString(existingTelegramContext.username) ?? readNonEmptyString(payload?.["telegramUsername"]);
 
   if (!readNonEmptyString(contextSnapshot["wakeReason"]) && reason) {
     contextSnapshot.wakeReason = reason;
@@ -486,6 +503,27 @@ function enrichWakeContextSnapshot(input: {
   }
   if (!readNonEmptyString(contextSnapshot["wakeTriggerDetail"]) && triggerDetail) {
     contextSnapshot.wakeTriggerDetail = triggerDetail;
+  }
+  const wakeMessage = readNonEmptyString(payload?.["text"]);
+  if (!readNonEmptyString(contextSnapshot["wakeMessage"]) && wakeMessage) {
+    contextSnapshot.wakeMessage = wakeMessage;
+  }
+  if (
+    telegramMessageText ||
+    telegramChatId ||
+    telegramTopicId !== null ||
+    telegramMessageId !== null ||
+    telegramUserId !== null ||
+    telegramUsername
+  ) {
+    contextSnapshot.paperclipTelegram = {
+      ...(telegramMessageText ? { messageText: telegramMessageText } : {}),
+      ...(telegramChatId ? { chatId: telegramChatId } : {}),
+      ...(telegramTopicId !== null ? { topicId: telegramTopicId } : {}),
+      ...(telegramMessageId !== null ? { messageId: telegramMessageId } : {}),
+      ...(telegramUserId !== null ? { userId: telegramUserId } : {}),
+      ...(telegramUsername ? { username: telegramUsername } : {}),
+    };
   }
 
   return {
@@ -1863,6 +1901,14 @@ export function heartbeatService(db: Db) {
           "local agent jwt secret missing or invalid; running without injected PAPERCLIP_API_KEY",
         );
       }
+      context.paperclipTools = {
+        ...((context.paperclipTools as Record<string, unknown> | undefined) ?? {}),
+        telegram: {
+          sendEndpoint: "/api/agent-tools/telegram/send",
+          defaultAgentId: agent.id,
+          supportsStatusFlags: true,
+        },
+      };
       const adapterResult = await adapter.execute({
         runId: run.id,
         agent,

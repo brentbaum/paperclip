@@ -397,6 +397,62 @@ describe("telegramService", () => {
     );
   });
 
+  it("passes full telegram payload including text, chatId, topicId, and user info to wakeup", async () => {
+    const fakeBot = new FakeBot();
+    const wakeup = vi.fn(async () => null);
+    const deps = baseDeps({
+      createBot: async () => fakeBot,
+      heartbeat: { wakeup },
+      config: {
+        telegramBotToken: "bot-token",
+        telegramChatId: "-100123",
+        telegramTopicMapping: { "agent-1": 5001 },
+        telegramStatusTopicId: undefined,
+        telegramApprovalsTopicId: undefined,
+      },
+    });
+
+    const svc = telegramService({} as any, deps);
+    await svc.start();
+    await fakeBot.emitMessage({
+      text: "Create a ticket assigned to the CEO to get me a haircut",
+      chatId: "-100123",
+      topicId: 5001,
+      messageId: 99,
+      fromId: 42,
+      username: "operator",
+    });
+
+    expect(wakeup).toHaveBeenCalledTimes(1);
+    const [agentId, opts] = wakeup.mock.calls[0]!;
+    expect(agentId).toBe("agent-1");
+    expect(opts.reason).toBe("telegram_message");
+    expect(opts.source).toBe("automation");
+
+    // Verify the payload contains all telegram metadata
+    expect(opts.payload).toEqual(
+      expect.objectContaining({
+        text: "Create a ticket assigned to the CEO to get me a haircut",
+        chatId: "-100123",
+        topicId: 5001,
+        messageId: 99,
+        telegramUserId: 42,
+        telegramUsername: "operator",
+      }),
+    );
+
+    // Verify contextSnapshot includes source info
+    expect(opts.contextSnapshot).toEqual(
+      expect.objectContaining({
+        source: "telegram",
+        reason: "message",
+        chatId: "-100123",
+        topicId: 5001,
+        messageId: 99,
+      }),
+    );
+  });
+
   it("sends typing indicator while a telegram-triggered run is active", async () => {
     vi.useFakeTimers();
 
