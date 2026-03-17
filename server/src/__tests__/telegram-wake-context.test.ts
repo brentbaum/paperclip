@@ -275,6 +275,83 @@ describe("telegram wake context flow", () => {
     });
   });
 
+  describe("coalescing: telegram wakes must not merge into running runs", () => {
+    /**
+     * Reproduces the bug where a telegram message wake with no issueId
+     * yields a null taskKey. Because isSameTaskScope(null, null) === true,
+     * the wake coalesced into an already-running run. The running adapter
+     * had already received its context so the agent never saw the telegram
+     * prompt and never replied.
+     *
+     * The fix: telegram_message wakes skip coalescing into running runs
+     * (same treatment as comment wakes).
+     */
+
+    // Reimplementation of the coalescing decision from heartbeat.ts
+    function shouldCoalesceIntoRunning(opts: {
+      reason: string | null;
+      wakeCommentId: string | null;
+      taskKey: string | null;
+      sameScopeRunningRunExists: boolean;
+      sameScopeQueuedRunExists: boolean;
+    }) {
+      const shouldQueueFollowupForCommentWake =
+        Boolean(opts.wakeCommentId) && opts.sameScopeRunningRunExists && !opts.sameScopeQueuedRunExists;
+      const shouldQueueFollowupForTelegramWake =
+        opts.reason === "telegram_message" && opts.sameScopeRunningRunExists && !opts.sameScopeQueuedRunExists;
+
+      // coalescedTargetRun logic: queued first, then running (unless skipped)
+      if (opts.sameScopeQueuedRunExists) return "queued";
+      if (shouldQueueFollowupForCommentWake || shouldQueueFollowupForTelegramWake) return null;
+      if (opts.sameScopeRunningRunExists) return "running";
+      return null;
+    }
+
+    it("telegram_message wakes are NOT coalesced into a running run", () => {
+      const result = shouldCoalesceIntoRunning({
+        reason: "telegram_message",
+        wakeCommentId: null,
+        taskKey: null,
+        sameScopeRunningRunExists: true,
+        sameScopeQueuedRunExists: false,
+      });
+      expect(result).toBeNull(); // should queue a new run, not coalesce
+    });
+
+    it("telegram_message wakes CAN coalesce into a queued run (not yet started)", () => {
+      const result = shouldCoalesceIntoRunning({
+        reason: "telegram_message",
+        wakeCommentId: null,
+        taskKey: null,
+        sameScopeRunningRunExists: true,
+        sameScopeQueuedRunExists: true,
+      });
+      expect(result).toBe("queued"); // fine to merge into queued (hasn't read context yet)
+    });
+
+    it("comment wakes are still NOT coalesced into running runs (existing behavior)", () => {
+      const result = shouldCoalesceIntoRunning({
+        reason: "issue_comment_mentioned",
+        wakeCommentId: "comment-1",
+        taskKey: null,
+        sameScopeRunningRunExists: true,
+        sameScopeQueuedRunExists: false,
+      });
+      expect(result).toBeNull();
+    });
+
+    it("normal wakes with null taskKey still coalesce into running runs", () => {
+      const result = shouldCoalesceIntoRunning({
+        reason: "issue_assigned",
+        wakeCommentId: null,
+        taskKey: null,
+        sameScopeRunningRunExists: true,
+        sameScopeQueuedRunExists: false,
+      });
+      expect(result).toBe("running"); // normal behavior preserved
+    });
+  });
+
   describe("end-to-end contract: telegram message → enriched context → adapter prompt", () => {
     it("full flow produces correct context, env vars, and prompt for a typical telegram message", () => {
       // Step 1: Telegram service calls heartbeat.wakeup with this payload

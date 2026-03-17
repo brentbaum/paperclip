@@ -26,6 +26,9 @@ import { assetRoutes } from "./routes/assets.js";
 import { accessRoutes } from "./routes/access.js";
 import { pluginRoutes } from "./routes/plugins.js";
 import { pluginUiStaticRoutes } from "./routes/plugin-ui-static.js";
+import { documentRoutes } from "./routes/documents.js";
+import { processControlRoutes } from "./routes/process-control.js";
+import { telegramRoutes } from "./routes/telegram.js";
 import { applyUiBranding } from "./ui-branding.js";
 import { logger } from "./middleware/logger.js";
 import { DEFAULT_LOCAL_PLUGIN_DIR, pluginLoader } from "./services/plugin-loader.js";
@@ -58,7 +61,7 @@ export async function createApp(
     bindHost: string;
     authReady: boolean;
     companyDeletionEnabled: boolean;
-    telegramService?: unknown;
+    telegramService?: Pick<import("./services/telegram.js").TelegramService, "sendToAgentTopic">;
     instanceId?: string;
     hostVersion?: string;
     localPluginDir?: string;
@@ -129,6 +132,9 @@ export async function createApp(
   );
   api.use("/companies", companyRoutes(db));
   api.use(agentRoutes(db));
+  if (opts.telegramService) {
+    api.use(telegramRoutes(opts.telegramService));
+  }
   api.use(assetRoutes(db, opts.storageService));
   api.use(projectRoutes(db));
   api.use(issueRoutes(db, opts.storageService));
@@ -139,6 +145,8 @@ export async function createApp(
   api.use(activityRoutes(db));
   api.use(dashboardRoutes(db));
   api.use(sidebarBadgeRoutes(db));
+  api.use(documentRoutes(db));
+  api.use(processControlRoutes());
   const hostServicesDisposers = new Map<string, () => void>();
   const workerManager = createPluginWorkerManager();
   const pluginRegistry = pluginRegistryService(db);
