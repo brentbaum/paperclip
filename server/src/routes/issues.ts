@@ -1187,6 +1187,7 @@ export function issueRoutes(db: Db, storage: StorageService) {
       userId: actor.actorType === "user" ? actor.actorId : undefined,
     });
 
+
     await logActivity(db, {
       companyId: currentIssue.companyId,
       actorType: actor.actorType,

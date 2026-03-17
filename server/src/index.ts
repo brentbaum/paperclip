@@ -25,7 +25,7 @@ import { createApp } from "./app.js";
 import { loadConfig } from "./config.js";
 import { logger } from "./middleware/logger.js";
 import { setupLiveEventsWebSocketServer } from "./realtime/live-events-ws.js";
-import { heartbeatService, reconcilePersistedRuntimeServicesOnStartup } from "./services/index.js";
+import { agentService, approvalService, companyService, createSpeechToTextService, heartbeatService, issueService, reconcilePersistedRuntimeServicesOnStartup, telegramService } from "./services/index.js";
 import { createStorageServiceFromConfig } from "./storage/index.js";
 import { printStartupBanner } from "./startup-banner.js";
 import { getBoardClaimWarningUrl, initializeBoardClaimChallenge } from "./board-claim.js";
@@ -388,11 +388,11 @@ export async function startServer(): Promise<StartedServer> {
         "Use authenticated mode for non-loopback deployments.",
     );
   }
-  
+
   if (config.deploymentMode === "local_trusted" && config.deploymentExposure !== "private") {
     throw new Error("local_trusted mode only supports private exposure");
   }
-  
+
   if (config.deploymentMode === "authenticated") {
     if (config.authBaseUrlMode === "explicit" && !config.authPublicBaseUrl) {
       throw new Error("auth.baseUrlMode=explicit requires auth.publicBaseUrl");
@@ -462,6 +462,32 @@ export async function startServer(): Promise<StartedServer> {
   const listenPort = await detectPort(config.port);
   const uiMode = config.uiDevMiddleware ? "vite-dev" : config.serveUi ? "static" : "none";
   const storageService = createStorageServiceFromConfig(config);
+  const heartbeat = heartbeatService(db as any);
+  const stt = config.sttProvider === "local_sherpa"
+    ? createSpeechToTextService({
+      provider: "local_sherpa",
+      modelDir: config.sttModelDir,
+      numThreads: config.sttNumThreads,
+      nvidiaModel: config.sttNvidiaModel,
+      nvidiaBaseUrl: config.sttNvidiaBaseUrl,
+    })
+    : config.sttNvidiaApiKey
+      ? createSpeechToTextService({
+        provider: "nvidia_parakeet",
+        nvidiaApiKey: config.sttNvidiaApiKey,
+        nvidiaModel: config.sttNvidiaModel,
+        nvidiaBaseUrl: config.sttNvidiaBaseUrl,
+      })
+      : undefined;
+  const telegram = telegramService(db as any, {
+    config,
+    heartbeat,
+    approvals: approvalService(db as any),
+    issues: issueService(db as any),
+    agents: agentService(db as any),
+    companies: companyService(db as any),
+    stt,
+  });
   const app = await createApp(db as any, {
     uiMode,
     serverPort: listenPort,
@@ -472,6 +498,7 @@ export async function startServer(): Promise<StartedServer> {
     bindHost: config.host,
     authReady,
     companyDeletionEnabled: config.companyDeletionEnabled,
+    telegramService: telegram,
     betterAuthHandler,
     resolveSession,
   });
@@ -509,8 +536,6 @@ export async function startServer(): Promise<StartedServer> {
     });
   
   if (config.heartbeatSchedulerEnabled) {
-    const heartbeat = heartbeatService(db as any);
-  
     // Reap orphaned running runs at startup while in-memory execution state is empty,
     // then resume any persisted queued runs that were waiting on the previous process.
     void heartbeat
@@ -541,7 +566,11 @@ export async function startServer(): Promise<StartedServer> {
         });
     }, config.heartbeatSchedulerIntervalMs);
   }
-  
+
+  await telegram.start().catch((err) => {
+    logger.error({ err }, "telegram service failed to start");
+  });
+
   if (config.databaseBackupEnabled) {
     const backupIntervalMs = config.databaseBackupIntervalMinutes * 60 * 1000;
     let backupInFlight = false;

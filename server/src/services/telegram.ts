@@ -11,6 +11,7 @@ import { logActivity, type LogActivityInput } from "./activity-log.js";
 import { subscribeCompanyLiveEvents } from "./live-events.js";
 import { parseNewCommand } from "./telegram-new-parser.js";
 import { readConfigFile, writeConfigFile } from "../config-file.js";
+import type { SpeechToTextService } from "./speech-to-text.js";
 
 type AgentService = ReturnType<typeof agentService>;
 type IssueService = ReturnType<typeof issueService>;
@@ -27,11 +28,20 @@ interface TelegramConfigView {
   telegramApprovalsTopicId: number | undefined;
 }
 
+interface TelegramVoiceInfo {
+  file_id: string;
+  file_unique_id: string;
+  duration: number;
+  mime_type?: string;
+  file_size?: number;
+}
+
 interface TelegramMessageContextLike {
   from?: { id?: number; is_bot?: boolean; username?: string } | null;
   message?:
     | {
       text?: string;
+      voice?: TelegramVoiceInfo;
       message_id?: number;
       message_thread_id?: number;
       chat?: { id?: string | number } | null;
@@ -82,6 +92,7 @@ interface TelegramBotLike {
       callbackQueryId: string,
       options?: Record<string, unknown>,
     ): Promise<unknown>;
+    getFile?(fileId: string): Promise<{ file_path?: string }>;
   };
   on(filter: string, handler: (ctx: any) => Promise<void> | void): void;
   start(options?: Record<string, unknown>): Promise<void>;
@@ -110,6 +121,7 @@ interface TelegramServiceDeps {
   };
   createBot?: (token: string) => TelegramBotLike | Promise<TelegramBotLike>;
   logActivityFn?: (db: Db, input: LogActivityInput) => Promise<void>;
+  stt?: SpeechToTextService;
 }
 
 type SendToAgentTopicInput = {
@@ -756,6 +768,7 @@ export function telegramService(db: Db, deps: TelegramServiceDeps) {
 
     const messageId =
       typeof ctx.message?.message_id === "number" ? ctx.message.message_id : null;
+
     const run = await deps.heartbeat.wakeup(mappedAgentId, {
       source: "automation",
       triggerDetail: "system",
@@ -773,6 +786,88 @@ export function telegramService(db: Db, deps: TelegramServiceDeps) {
       contextSnapshot: {
         source: "telegram",
         reason: "message",
+        chatId: configuredChatId,
+        topicId,
+        messageId,
+      },
+    });
+    if (run && topicId) {
+      startTypingIndicator(run.id, configuredChatId, topicId, run.status);
+    }
+  }
+
+  async function handleInboundVoiceMessage(ctx: TelegramMessageContextLike) {
+    if (ctx.from?.is_bot) return;
+    const voice = ctx.message?.voice;
+    if (!voice) return;
+
+    const incomingChatId = String(ctx.message?.chat?.id ?? ctx.chat?.id ?? "");
+    const configuredChatId = getChatId();
+    if (!configuredChatId || incomingChatId !== configuredChatId) return;
+
+    const topicId =
+      typeof ctx.message?.message_thread_id === "number" ? ctx.message.message_thread_id : null;
+    if (!topicId) return;
+
+    const mappedAgentId = reverseTopicMapping().get(topicId);
+    if (!mappedAgentId) return;
+
+    const messageId =
+      typeof ctx.message?.message_id === "number" ? ctx.message.message_id : null;
+
+    let transcribedText = "";
+
+    if (deps.stt) {
+      try {
+        const activeBot = await ensureBot();
+        if (!activeBot || typeof activeBot.api.getFile !== "function") {
+          logger.warn("telegram bot missing getFile API — cannot download voice");
+        } else {
+          const fileInfo = await activeBot.api.getFile(voice.file_id);
+          if (fileInfo.file_path) {
+            const botToken = deps.config.telegramBotToken;
+            const fileUrl = `https://api.telegram.org/file/bot${botToken}/${fileInfo.file_path}`;
+            const fileResponse = await fetch(fileUrl);
+            if (fileResponse.ok) {
+              const arrayBuffer = await fileResponse.arrayBuffer();
+              const audioBuffer = Buffer.from(arrayBuffer);
+              const result = await deps.stt.transcribe(audioBuffer, voice.mime_type);
+              transcribedText = result.text;
+            } else {
+              logger.warn(
+                { status: fileResponse.status, fileId: voice.file_id },
+                "failed to download telegram voice file",
+              );
+            }
+          }
+        }
+      } catch (err) {
+        logger.warn({ err, fileId: voice.file_id }, "voice transcription failed");
+      }
+    }
+
+    const text = transcribedText || "[Voice message — transcription unavailable]";
+
+    const run = await deps.heartbeat.wakeup(mappedAgentId, {
+      source: "automation",
+      triggerDetail: "system",
+      reason: "telegram_message",
+      idempotencyKey:
+        messageId !== null ? `telegram:${configuredChatId}:${topicId}:${messageId}` : undefined,
+      payload: {
+        text,
+        isVoiceMessage: true,
+        voiceDurationSec: voice.duration,
+        voiceFileId: voice.file_id,
+        chatId: configuredChatId,
+        topicId,
+        messageId,
+        telegramUserId: ctx.from?.id ?? null,
+        telegramUsername: ctx.from?.username ?? null,
+      },
+      contextSnapshot: {
+        source: "telegram",
+        reason: "voice_message",
         chatId: configuredChatId,
         topicId,
         messageId,
@@ -865,7 +960,7 @@ export function telegramService(db: Db, deps: TelegramServiceDeps) {
           ? await deps.approvals.approve(parsed.approvalId, "board")
           : await deps.approvals.reject(parsed.approvalId, "board");
 
-      const status = updated.status === "approved" ? "approved" : "rejected";
+      const status = updated.approval.status === "approved" ? "approved" : "rejected";
       if (typeof activeBot.api.editMessageText === "function" && typeof messageId === "number") {
         await retryTelegramCall(() =>
           activeBot.api.editMessageText?.(
@@ -920,6 +1015,13 @@ export function telegramService(db: Db, deps: TelegramServiceDeps) {
         await handleInboundMessage(ctx);
       } catch (err) {
         logger.error({ err }, "telegram inbound handler failed");
+      }
+    });
+    activeBot.on("message:voice", async (ctx: TelegramMessageContextLike) => {
+      try {
+        await handleInboundVoiceMessage(ctx);
+      } catch (err) {
+        logger.error({ err }, "telegram voice handler failed");
       }
     });
     activeBot.on("callback_query:data", async (ctx: TelegramCallbackContextLike) => {

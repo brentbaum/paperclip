@@ -72,6 +72,12 @@ export interface Config {
   telegramTopicMapping: Record<string, number>;
   telegramStatusTopicId: number | undefined;
   telegramApprovalsTopicId: number | undefined;
+  sttProvider: "local_sherpa" | "nvidia_parakeet";
+  sttModelDir: string | undefined;
+  sttNumThreads: number;
+  sttNvidiaApiKey: string | undefined;
+  sttNvidiaModel: string;
+  sttNvidiaBaseUrl: string;
   tailscaleServe: boolean;
   heartbeatSchedulerEnabled: boolean;
   heartbeatSchedulerIntervalMs: number;
@@ -91,6 +97,7 @@ export function loadConfig(): Config {
   const fileSecrets = fileConfig?.secrets;
   const fileStorage = fileConfig?.storage;
   const fileTelegram = fileConfig?.telegram;
+  const fileStt = fileConfig?.stt;
   const strictModeFromEnv = process.env.PAPERCLIP_SECRETS_STRICT_MODE;
   const secretsStrictMode =
     strictModeFromEnv !== undefined
@@ -278,6 +285,12 @@ export function loadConfig(): Config {
     telegramTopicMapping: fileTelegram?.topicMapping ?? {},
     telegramStatusTopicId: telegramStatusTopicIdFromEnv ?? fileTelegram?.statusTopicId ?? undefined,
     telegramApprovalsTopicId: telegramApprovalsTopicIdFromEnv ?? fileTelegram?.approvalsTopicId ?? undefined,
+    sttProvider: (process.env.STT_PROVIDER ?? fileStt?.provider ?? "local_sherpa") as "local_sherpa" | "nvidia_parakeet",
+    sttModelDir: process.env.STT_MODEL_DIR ?? fileStt?.modelDir ?? undefined,
+    sttNumThreads: Number(process.env.STT_NUM_THREADS) || (fileStt?.numThreads ?? 2),
+    sttNvidiaApiKey: process.env.NVIDIA_API_KEY ?? fileStt?.nvidiaApiKey ?? undefined,
+    sttNvidiaModel: process.env.NVIDIA_STT_MODEL ?? fileStt?.nvidiaModel ?? "nvidia/parakeet-tdt-0.6b-v2",
+    sttNvidiaBaseUrl: process.env.NVIDIA_STT_BASE_URL ?? fileStt?.nvidiaBaseUrl ?? "https://integrate.api.nvidia.com/v1",
     tailscaleServe,
     heartbeatSchedulerEnabled: process.env.HEARTBEAT_SCHEDULER_ENABLED !== "false",
     heartbeatSchedulerIntervalMs: Math.max(10000, Number(process.env.HEARTBEAT_SCHEDULER_INTERVAL_MS) || 30000),

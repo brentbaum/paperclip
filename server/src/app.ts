@@ -58,6 +58,7 @@ export async function createApp(
     bindHost: string;
     authReady: boolean;
     companyDeletionEnabled: boolean;
+    telegramService?: unknown;
     instanceId?: string;
     hostVersion?: string;
     localPluginDir?: string;
