@@ -96,6 +96,14 @@ export const queryKeys = {
   liveRuns: (companyId: string) => ["live-runs", companyId] as const,
   runIssues: (runId: string) => ["run-issues", runId] as const,
   org: (companyId: string) => ["org", companyId] as const,
+  documents: {
+    detail: (documentId: string) => ["documents", "detail", documentId] as const,
+    revisions: (documentId: string) => ["documents", "revisions", documentId] as const,
+    diff: (documentId: string, from?: string | null, to?: string | null) =>
+      ["documents", "diff", documentId, from, to] as const,
+    approval: (approvalId: string) => ["documents", "approval", approvalId] as const,
+    issuePlan: (issueId: string) => ["documents", "issue-plan", issueId] as const,
+  },
   plugins: {
     all: ["plugins"] as const,
     examples: ["plugins", "examples"] as const,

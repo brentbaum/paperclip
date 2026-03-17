@@ -11,7 +11,7 @@ import { validate } from "../middleware/validate.js";
 import { logger } from "../middleware/logger.js";
 import {
   approvalService,
-  documentService,
+  // documentService, // TODO: Re-enable when scoped document service methods are restored
   heartbeatService,
   issueApprovalService,
   logActivity,
@@ -30,7 +30,7 @@ function redactApprovalPayload<T extends { payload: Record<string, unknown> }>(a
 export function approvalRoutes(db: Db) {
   const router = Router();
   const svc = approvalService(db);
-  const documentsSvc = documentService(db);
+  // const documentsSvc = documentService(db); // TODO: Re-enable when scoped document service methods are restored
   const heartbeat = heartbeatService(db);
   const issueApprovalsSvc = issueApprovalService(db);
   const secretsSvc = secretService(db);
@@ -88,13 +88,14 @@ export function approvalRoutes(db: Db) {
     });
 
     let responseApproval = approval;
-    if (approval.type === "approve_ceo_strategy") {
-      await documentsSvc.getOrCreateApprovalDocument(approval.id, {
-        agentId: actor.agentId,
-        userId: actor.actorType === "user" ? actor.actorId : null,
-      });
-      responseApproval = (await svc.getById(approval.id)) ?? approval;
-    }
+    // TODO: Restore scoped document creation once document service supports getOrCreateApprovalDocument
+    // if (approval.type === "approve_ceo_strategy") {
+    //   await documentsSvc.getOrCreateApprovalDocument(approval.id, {
+    //     agentId: actor.agentId,
+    //     userId: actor.actorType === "user" ? actor.actorId : null,
+    //   });
+    //   responseApproval = (await svc.getById(approval.id)) ?? approval;
+    // }
 
     if (uniqueIssueIds.length > 0) {
       await issueApprovalsSvc.linkManyForApproval(approval.id, uniqueIssueIds, {
@@ -299,12 +300,13 @@ export function approvalRoutes(db: Db) {
       : undefined;
     const actor = getActorInfo(req);
     const approval = await svc.resubmit(id, normalizedPayload);
-    if (approval.type === "approve_ceo_strategy") {
-      await documentsSvc.getOrCreateApprovalDocument(approval.id, {
-        agentId: actor.agentId,
-        userId: actor.actorType === "user" ? actor.actorId : null,
-      });
-    }
+    // TODO: Restore scoped document creation once document service supports getOrCreateApprovalDocument
+    // if (approval.type === "approve_ceo_strategy") {
+    //   await documentsSvc.getOrCreateApprovalDocument(approval.id, {
+    //     agentId: actor.agentId,
+    //     userId: actor.actorType === "user" ? actor.actorId : null,
+    //   });
+    // }
     const responseApproval = (await svc.getById(approval.id)) ?? approval;
     await logActivity(db, {
       companyId: approval.companyId,
