@@ -94,6 +94,18 @@ These files are entirely custom to our fork (they don't exist upstream at all). 
 
 But this list is not exhaustive — the fork delta from Step 2b is. If a file appears in the fork delta but isn't listed here, it still has fork changes that must be preserved.
 
+#### Files With Fork Modifications (Both Sides Changed)
+
+These files exist upstream but our fork has added to them. Auto-resolved merges may silently drop our additions — always verify:
+
+- `ui/src/pages/AgentDetail.tsx` — Files tab (fork) alongside Skills tab (upstream)
+- `server/src/index.ts` — Telegram service init, self-restart handler registration
+- `scripts/dev-runner.mjs` — Supervisor loop with self-restart (built mode)
+- `package.json` — `dev` script uses built mode supervisor
+- `server/src/app.ts` — documentRoutes, processControlRoutes, telegramRoutes
+- `server/src/routes/index.ts` — telegram + remoteExecution exports
+- `ui/src/lib/queryKeys.ts` — documents query keys
+
 #### Merging Shared Files (Both Sides Changed)
 
 When a file appears in both the fork delta and the conflict list, you must read both sides and merge manually. Common patterns:
