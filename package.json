@@ -3,10 +3,9 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "node scripts/dev-runner.mjs watch",
+    "dev": "node scripts/dev-runner.mjs built",
     "dev:watch": "node scripts/dev-runner.mjs watch",
     "dev:once": "node scripts/dev-runner.mjs dev",
-    "dev:built": "node scripts/dev-runner.mjs built",
     "dev:server": "pnpm --filter @paperclipai/server dev",
     "dev:ui": "pnpm --filter @paperclipai/ui dev",
     "build": "pnpm -r build",
