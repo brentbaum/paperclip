@@ -1249,6 +1249,19 @@ export function telegramService(db: Db, deps: TelegramServiceDeps) {
     const chatId = input.overrideChatId || defaultChatId;
     let topicId: number | undefined = input.overrideTopicId ?? undefined;
 
+    logger.info(
+      {
+        agentId: input.agentId,
+        overrideChatId: input.overrideChatId,
+        overrideTopicId: input.overrideTopicId,
+        resolvedChatId: chatId,
+        defaultChatId,
+        usingOverrideChatId: Boolean(input.overrideChatId),
+        usingOverrideTopicId: input.overrideTopicId != null,
+      },
+      "telegram sendToAgentTopic chatId/topicId resolution",
+    );
+
     if (!topicId) {
       topicId = deps.config.telegramTopicMapping[input.agentId];
       if (!topicId) {
