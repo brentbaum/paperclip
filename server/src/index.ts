@@ -29,6 +29,7 @@ import { agentService, approvalService, companyService, createSpeechToTextServic
 import { createStorageServiceFromConfig } from "./storage/index.js";
 import { printStartupBanner } from "./startup-banner.js";
 import { getBoardClaimWarningUrl, initializeBoardClaimChallenge } from "./board-claim.js";
+import { registerSelfRestartHandler, getSelfRestartExitCode } from "./process-control.js";
 
 type BetterAuthSessionUser = {
   id: string;
@@ -698,6 +699,12 @@ export async function startServer(): Promise<StartedServer> {
       void shutdown("SIGTERM");
     });
   }
+
+  registerSelfRestartHandler((reason) => {
+    const code = getSelfRestartExitCode();
+    logger.info({ reason, exitCode: code }, "Self-restart requested");
+    process.exit(code);
+  });
 
   return {
     server,

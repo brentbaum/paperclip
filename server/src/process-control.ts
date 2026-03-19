@@ -3,7 +3,7 @@ const DEFAULT_SELF_RESTART_EXIT_CODE = 75;
 let restartHandler: ((reason: string) => void) | null = null;
 
 export function isSelfRestartEnabled(): boolean {
-  return process.env.PAPERCLIP_ALLOW_SELF_RESTART === "true";
+  return process.env.PAPERCLIP_ALLOW_SELF_RESTART !== "false";
 }
 
 export function getSelfRestartExitCode(): number {
