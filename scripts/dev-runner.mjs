@@ -3,8 +3,13 @@ import { spawn } from "node:child_process";
 import { createInterface } from "node:readline/promises";
 import { stdin, stdout } from "node:process";
 
-const mode = process.argv[2] === "watch" ? "watch" : "dev";
+const requestedMode = process.argv[2];
+const mode =
+  requestedMode === "watch" || requestedMode === "built"
+    ? requestedMode
+    : "dev";
 const cliArgs = process.argv.slice(3);
+const SELF_RESTART_EXIT_CODE = 75;
 
 const tailscaleAuthFlagNames = new Set([
   "--tailscale-auth",
@@ -216,17 +221,82 @@ async function buildPluginSdk() {
 
 await buildPluginSdk();
 
-const serverScript = mode === "watch" ? "dev:watch" : "dev";
-const child = spawn(
-  pnpmBin,
-  ["--filter", "@paperclipai/server", serverScript, ...forwardedArgs],
-  { stdio: "inherit", env, shell: process.platform === "win32" },
-);
+let activeChild = null;
+let requestedSignal = null;
 
-child.on("exit", (code, signal) => {
-  if (signal) {
-    process.kill(process.pid, signal);
+for (const signal of ["SIGINT", "SIGTERM"]) {
+  process.once(signal, () => {
+    requestedSignal = signal;
+    if (activeChild) {
+      activeChild.kill(signal);
+      return;
+    }
+    process.exit(0);
+  });
+}
+
+function spawnServer(args, childEnv) {
+  return new Promise((resolve) => {
+    const child = spawn(
+      pnpmBin,
+      args,
+      { stdio: "inherit", env: childEnv, shell: process.platform === "win32" },
+    );
+    activeChild = child;
+
+    child.on("exit", (code, signal) => {
+      if (activeChild === child) {
+        activeChild = null;
+      }
+      resolve({ code: code ?? 0, signal });
+    });
+  });
+}
+
+function exitForResult(result) {
+  if (result.signal) {
+    process.kill(process.pid, result.signal);
     return;
   }
-  process.exit(code ?? 0);
-});
+  process.exit(result.code ?? 0);
+}
+
+async function run() {
+  const serverScript = mode === "watch" ? "dev:watch" : "dev";
+
+  if (mode !== "built") {
+    const result = await spawnServer(
+      ["--filter", "@paperclipai/server", serverScript, ...forwardedArgs],
+      env,
+    );
+    exitForResult(result);
+    return;
+  }
+
+  console.log("[paperclip] built mode: run dev:once with self-restart support");
+  while (!requestedSignal) {
+    const result = await spawnServer(
+      ["dev:once", ...forwardedArgs],
+      {
+        ...env,
+        PAPERCLIP_ALLOW_SELF_RESTART: "true",
+        PAPERCLIP_SELF_RESTART_EXIT_CODE: String(SELF_RESTART_EXIT_CODE),
+      },
+    );
+
+    if (requestedSignal) {
+      exitForResult(result);
+      return;
+    }
+
+    if (result.code === SELF_RESTART_EXIT_CODE) {
+      console.log("[paperclip] restart requested; relaunching");
+      continue;
+    }
+
+    exitForResult(result);
+    return;
+  }
+}
+
+await run();
