@@ -1,5 +1,5 @@
-import { useEffect, useMemo } from "react";
-import { useSearchParams } from "@/lib/router";
+import { useEffect, useMemo, useCallback, useRef } from "react";
+import { useLocation, useSearchParams } from "@/lib/router";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { issuesApi } from "../api/issues";
 import { agentsApi } from "../api/agents";
@@ -7,6 +7,7 @@ import { heartbeatsApi } from "../api/heartbeats";
 import { useCompany } from "../context/CompanyContext";
 import { useBreadcrumbs } from "../context/BreadcrumbContext";
 import { queryKeys } from "../lib/queryKeys";
+import { createIssueDetailLocationState } from "../lib/issueDetailBreadcrumb";
 import { EmptyState } from "../components/EmptyState";
 import { IssuesList } from "../components/IssuesList";
 import { CircleDot } from "lucide-react";
@@ -14,8 +15,34 @@ import { CircleDot } from "lucide-react";
 export function Issues() {
   const { selectedCompanyId } = useCompany();
   const { setBreadcrumbs } = useBreadcrumbs();
+  const location = useLocation();
   const [searchParams] = useSearchParams();
   const queryClient = useQueryClient();
+
+  const initialSearch = searchParams.get("q") ?? "";
+  const debounceRef = useRef<ReturnType<typeof setTimeout>>(undefined);
+  const handleSearchChange = useCallback((search: string) => {
+    clearTimeout(debounceRef.current);
+    debounceRef.current = setTimeout(() => {
+      const trimmedSearch = search.trim();
+      const currentSearch = new URLSearchParams(window.location.search).get("q") ?? "";
+      if (currentSearch === trimmedSearch) return;
+
+      const url = new URL(window.location.href);
+      if (trimmedSearch) {
+        url.searchParams.set("q", trimmedSearch);
+      } else {
+        url.searchParams.delete("q");
+      }
+
+      const nextUrl = `${url.pathname}${url.search}${url.hash}`;
+      window.history.replaceState(window.history.state, "", nextUrl);
+    }, 300);
+  }, []);
+
+  useEffect(() => {
+    return () => clearTimeout(debounceRef.current);
+  }, []);
 
   const { data: agents } = useQuery({
     queryKey: queryKeys.agents.list(selectedCompanyId!),
@@ -37,6 +64,15 @@ export function Issues() {
     }
     return ids;
   }, [liveRuns]);
+
+  const issueLinkState = useMemo(
+    () =>
+      createIssueDetailLocationState(
+        "Issues",
+        `${location.pathname}${location.search}${location.hash}`,
+      ),
+    [location.pathname, location.search, location.hash],
+  );
 
   useEffect(() => {
     setBreadcrumbs([{ label: "Issues" }]);
@@ -68,7 +104,10 @@ export function Issues() {
       agents={agents}
       liveIssueIds={liveIssueIds}
       viewStateKey="paperclip:issues-view"
+      issueLinkState={issueLinkState}
       initialAssignees={searchParams.get("assignee") ? [searchParams.get("assignee")!] : undefined}
+      initialSearch={initialSearch}
+      onSearchChange={handleSearchChange}
       onUpdateIssue={(id, data) => updateIssue.mutate({ id, data })}
     />
   );

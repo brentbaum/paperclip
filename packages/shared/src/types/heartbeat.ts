@@ -1,4 +1,6 @@
 import type {
+  AgentRole,
+  AgentStatus,
   HeartbeatInvocationSource,
   HeartbeatRunStatus,
   WakeupTriggerDetail,
@@ -105,4 +107,21 @@ export interface AgentWakeupRequest {
   error: string | null;
   createdAt: Date;
   updatedAt: Date;
+}
+
+export interface InstanceSchedulerHeartbeatAgent {
+  id: string;
+  companyId: string;
+  companyName: string;
+  companyIssuePrefix: string;
+  agentName: string;
+  agentUrlKey: string;
+  role: AgentRole;
+  title: string | null;
+  status: AgentStatus;
+  adapterType: string;
+  intervalSec: number;
+  heartbeatEnabled: boolean;
+  schedulerActive: boolean;
+  lastHeartbeatAt: Date | null;
 }

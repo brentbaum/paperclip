@@ -1,10 +1,10 @@
 import fs from "node:fs/promises";
-import { execFile } from "node:child_process";
-import os from "node:os";
 import path from "node:path";
+import { execFile as execFileCallback } from "node:child_process";
 import { promisify } from "node:util";
-import { and, asc, desc, eq, gt, inArray, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, inArray, isNotNull, lte, notInArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
+import type { BillingType } from "@paperclipai/shared";
 import {
   agents,
   agentRuntimeState,
@@ -12,60 +12,162 @@ import {
   agentWakeupRequests,
   heartbeatRunEvents,
   heartbeatRuns,
-  costEvents,
   issues,
+  projects,
   projectWorkspaces,
-  remoteExecutionLeases,
-  remoteExecutionTargets,
 } from "@paperclipai/db";
 import { conflict, notFound } from "../errors.js";
 import { logger } from "../middleware/logger.js";
 import { publishLiveEvent } from "./live-events.js";
 import { getRunLogStore, type RunLogHandle } from "./run-log-store.js";
 import { getServerAdapter, runningProcesses } from "../adapters/index.js";
-import type { AdapterExecutionResult, AdapterInvocationMeta, AdapterSessionCodec } from "../adapters/index.js";
+import type { AdapterExecutionResult, AdapterInvocationMeta, AdapterSessionCodec, UsageSummary } from "../adapters/index.js";
 import { createLocalAgentJwt } from "../agent-auth-jwt.js";
 import { parseObject, asBoolean, asNumber, appendWithCap, MAX_EXCERPT_BYTES } from "../adapters/utils.js";
+import { validateCron, nextCronTickFromExpression } from "./cron.js";
+import { costService } from "./costs.js";
+import { budgetService, type BudgetEnforcementScope } from "./budgets.js";
 import { secretService } from "./secrets.js";
-import { documentService } from "./documents.js";
-import { resolveDefaultAgentWorkspaceDir, resolveHomeAwarePath } from "../home-paths.js";
-import { remoteExecutionService } from "./remote-execution.js";
+import { resolveDefaultAgentWorkspaceDir, resolveManagedProjectWorkspaceDir } from "../home-paths.js";
+import { summarizeHeartbeatRunResultJson } from "./heartbeat-run-summary.js";
 import {
-  buildRemoteBranchName,
-  buildRemoteRoot,
-  executeRemoteRun,
-  planRemoteRuntimePathSync,
-  runRemoteProcess,
-  uploadLocalPathAsRemoteArchive,
-} from "./remote-execution-runner.js";
-import { executeWithProcessRunner as executeCodexWithProcessRunner } from "@paperclipai/adapter-codex-local/server";
-import { executeWithProcessRunner as executeClaudeWithProcessRunner } from "@paperclipai/adapter-claude-local/server";
+  buildWorkspaceReadyComment,
+  cleanupExecutionWorkspaceArtifacts,
+  ensureRuntimeServicesForRun,
+  persistAdapterManagedRuntimeServices,
+  realizeExecutionWorkspace,
+  releaseRuntimeServicesForRun,
+  sanitizeRuntimeServiceBaseEnv,
+} from "./workspace-runtime.js";
+import { issueService } from "./issues.js";
+import { executionWorkspaceService } from "./execution-workspaces.js";
+import { workspaceOperationService } from "./workspace-operations.js";
+import {
+  buildExecutionWorkspaceAdapterConfig,
+  gateProjectExecutionWorkspacePolicy,
+  parseIssueExecutionWorkspaceSettings,
+  parseProjectExecutionWorkspacePolicy,
+  resolveExecutionWorkspaceMode,
+} from "./execution-workspace-policy.js";
+import { instanceSettingsService } from "./instance-settings.js";
+import { redactCurrentUserText, redactCurrentUserValue } from "../log-redaction.js";
+import {
+  hasSessionCompactionThresholds,
+  resolveSessionCompactionPolicy,
+  type SessionCompactionPolicy,
+} from "@paperclipai/adapter-utils";
 
 const MAX_LIVE_LOG_CHUNK_BYTES = 8 * 1024;
-const HEARTBEAT_MAX_CONCURRENT_RUNS_DEFAULT = 10;
+const HEARTBEAT_MAX_CONCURRENT_RUNS_DEFAULT = 1;
 const HEARTBEAT_MAX_CONCURRENT_RUNS_MAX = 10;
-export const HEARTBEAT_ORPHAN_REAP_STALE_THRESHOLD_MS = 5 * 60 * 1000;
 const DEFERRED_WAKE_CONTEXT_KEY = "_paperclipWakeContext";
 const startLocksByAgent = new Map<string, Promise<void>>();
 const REPO_ONLY_CWD_SENTINEL = "/__paperclip_repo_only__";
-const execFileAsync = promisify(execFile);
-const REMOTE_AGENT_FILE_MAX_BYTES = 512 * 1024;
-const REMOTE_AGENT_CONTEXT_SKIP_DIRS = new Set([
-  ".git",
-  ".jj",
-  ".worktrees",
-  "node_modules",
-  "build",
-  "dist",
-  ".next",
-  "coverage",
-  "test-results",
-  "playwright-report",
-  "tmp",
-  "logs",
-  ".logs",
+const MANAGED_WORKSPACE_GIT_CLONE_TIMEOUT_MS = 10 * 60 * 1000;
+const execFile = promisify(execFileCallback);
+const SESSIONED_LOCAL_ADAPTERS = new Set([
+  "claude_local",
+  "codex_local",
+  "cursor",
+  "gemini_local",
+  "opencode_local",
+  "pi_local",
 ]);
-const REMOTE_AGENT_CONTEXT_ROOT_DIR = "agents";
+
+function deriveRepoNameFromRepoUrl(repoUrl: string | null): string | null {
+  const trimmed = repoUrl?.trim() ?? "";
+  if (!trimmed) return null;
+  try {
+    const parsed = new URL(trimmed);
+    const cleanedPath = parsed.pathname.replace(/\/+$/, "");
+    const repoName = cleanedPath.split("/").filter(Boolean).pop()?.replace(/\.git$/i, "") ?? "";
+    return repoName || null;
+  } catch {
+    return null;
+  }
+}
+
+async function ensureManagedProjectWorkspace(input: {
+  companyId: string;
+  projectId: string;
+  repoUrl: string | null;
+}): Promise<{ cwd: string; warning: string | null }> {
+  const cwd = resolveManagedProjectWorkspaceDir({
+    companyId: input.companyId,
+    projectId: input.projectId,
+    repoName: deriveRepoNameFromRepoUrl(input.repoUrl),
+  });
+  await fs.mkdir(path.dirname(cwd), { recursive: true });
+  const stats = await fs.stat(cwd).catch(() => null);
+
+  if (!input.repoUrl) {
+    if (!stats) {
+      await fs.mkdir(cwd, { recursive: true });
+    }
+    return { cwd, warning: null };
+  }
+
+  const gitDirExists = await fs
+    .stat(path.resolve(cwd, ".git"))
+    .then((entry) => entry.isDirectory())
+    .catch(() => false);
+  if (gitDirExists) {
+    return { cwd, warning: null };
+  }
+
+  if (stats) {
+    const entries = await fs.readdir(cwd).catch(() => []);
+    if (entries.length > 0) {
+      return {
+        cwd,
+        warning: `Managed workspace path "${cwd}" already exists but is not a git checkout. Using it as-is.`,
+      };
+    }
+    await fs.rm(cwd, { recursive: true, force: true });
+  }
+
+  try {
+    await execFile("git", ["clone", input.repoUrl, cwd], {
+      env: sanitizeRuntimeServiceBaseEnv(process.env),
+      timeout: MANAGED_WORKSPACE_GIT_CLONE_TIMEOUT_MS,
+    });
+    return { cwd, warning: null };
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    throw new Error(`Failed to prepare managed checkout for "${input.repoUrl}" at "${cwd}": ${reason}`);
+  }
+}
+
+const heartbeatRunListColumns = {
+  id: heartbeatRuns.id,
+  companyId: heartbeatRuns.companyId,
+  agentId: heartbeatRuns.agentId,
+  invocationSource: heartbeatRuns.invocationSource,
+  triggerDetail: heartbeatRuns.triggerDetail,
+  status: heartbeatRuns.status,
+  startedAt: heartbeatRuns.startedAt,
+  finishedAt: heartbeatRuns.finishedAt,
+  error: heartbeatRuns.error,
+  wakeupRequestId: heartbeatRuns.wakeupRequestId,
+  exitCode: heartbeatRuns.exitCode,
+  signal: heartbeatRuns.signal,
+  usageJson: heartbeatRuns.usageJson,
+  resultJson: heartbeatRuns.resultJson,
+  sessionIdBefore: heartbeatRuns.sessionIdBefore,
+  sessionIdAfter: heartbeatRuns.sessionIdAfter,
+  logStore: heartbeatRuns.logStore,
+  logRef: heartbeatRuns.logRef,
+  logBytes: heartbeatRuns.logBytes,
+  logSha256: heartbeatRuns.logSha256,
+  logCompressed: heartbeatRuns.logCompressed,
+  stdoutExcerpt: sql<string | null>`NULL`.as("stdoutExcerpt"),
+  stderrExcerpt: sql<string | null>`NULL`.as("stderrExcerpt"),
+  errorCode: heartbeatRuns.errorCode,
+  externalRunId: heartbeatRuns.externalRunId,
+  contextSnapshot: heartbeatRuns.contextSnapshot,
+  createdAt: heartbeatRuns.createdAt,
+  updatedAt: heartbeatRuns.updatedAt,
+} as const;
 
 function appendExcerpt(prev: string, chunk: string) {
   return appendWithCap(prev, chunk, MAX_EXCERPT_BYTES);
@@ -75,25 +177,6 @@ function normalizeMaxConcurrentRuns(value: unknown) {
   const parsed = Math.floor(asNumber(value, HEARTBEAT_MAX_CONCURRENT_RUNS_DEFAULT));
   if (!Number.isFinite(parsed)) return HEARTBEAT_MAX_CONCURRENT_RUNS_DEFAULT;
   return Math.max(HEARTBEAT_MAX_CONCURRENT_RUNS_DEFAULT, Math.min(HEARTBEAT_MAX_CONCURRENT_RUNS_MAX, parsed));
-}
-
-function normalizeOrphanReapStaleThresholdMs(value: number | undefined) {
-  if (!Number.isFinite(value)) return HEARTBEAT_ORPHAN_REAP_STALE_THRESHOLD_MS;
-  return Math.max(0, Math.floor(value!));
-}
-
-export function shouldReapRunAsOrphan(
-  run: Pick<typeof heartbeatRuns.$inferSelect, "updatedAt">,
-  now: Date,
-  staleThresholdMs: number,
-) {
-  const refTime = run.updatedAt ? new Date(run.updatedAt).getTime() : 0;
-  return now.getTime() - refTime >= staleThresholdMs;
-}
-
-function readRemoteSetupScript(metadata: Record<string, unknown> | null | undefined) {
-  const script = readNonEmptyString(metadata?.setupScript);
-  return script?.trim() || null;
 }
 
 async function withAgentStartLock<T>(agentId: string, fn: () => Promise<T>) {
@@ -124,6 +207,19 @@ interface WakeupOptions {
   contextSnapshot?: Record<string, unknown>;
 }
 
+type UsageTotals = {
+  inputTokens: number;
+  cachedInputTokens: number;
+  outputTokens: number;
+};
+
+type SessionCompactionDecision = {
+  rotate: boolean;
+  reason: string | null;
+  handoffMarkdown: string | null;
+  previousRunId: string | null;
+};
+
 interface ParsedIssueAssigneeAdapterOverrides {
   adapterConfig: Record<string, unknown> | null;
   useProjectWorkspace: boolean | null;
@@ -145,6 +241,20 @@ export type ResolvedWorkspaceForRun = {
   warnings: string[];
 };
 
+type ProjectWorkspaceCandidate = {
+  id: string;
+};
+
+export function prioritizeProjectWorkspaceCandidatesForRun<T extends ProjectWorkspaceCandidate>(
+  rows: T[],
+  preferredWorkspaceId: string | null | undefined,
+): T[] {
+  if (!preferredWorkspaceId) return rows;
+  const preferredIndex = rows.findIndex((row) => row.id === preferredWorkspaceId);
+  if (preferredIndex <= 0) return rows;
+  return [rows[preferredIndex]!, ...rows.slice(0, preferredIndex), ...rows.slice(preferredIndex + 1)];
+}
+
 function readNonEmptyString(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value : null;
 }
@@ -153,190 +263,132 @@ function readFiniteNumber(value: unknown): number | null {
   return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
 
-async function runGit(args: string[], cwd?: string) {
-  try {
-    const { stdout } = await execFileAsync("git", args, {
-      cwd,
-      encoding: "utf-8",
-    });
-    return readNonEmptyString(stdout?.trim());
-  } catch {
-    return null;
+function normalizeLedgerBillingType(value: unknown): BillingType {
+  const raw = readNonEmptyString(value);
+  switch (raw) {
+    case "api":
+    case "metered_api":
+      return "metered_api";
+    case "subscription":
+    case "subscription_included":
+      return "subscription_included";
+    case "subscription_overage":
+      return "subscription_overage";
+    case "credits":
+      return "credits";
+    case "fixed":
+      return "fixed";
+    default:
+      return "unknown";
   }
 }
 
-export async function inferRepoFromWorkingDirectory(cwd: string) {
-  const repoRoot = await runGit(["rev-parse", "--show-toplevel"], cwd);
-  if (!repoRoot) return null;
-
-  const remotesRaw = await runGit(["remote"], repoRoot);
-  const remotes =
-    remotesRaw?.split(/\r?\n/).map((line) => line.trim()).filter(Boolean) ?? [];
-  const remoteName = remotes.includes("origin")
-    ? "origin"
-    : remotes.length === 1
-      ? remotes[0]!
-      : null;
-  const repoUrl = remoteName
-    ? await runGit(["remote", "get-url", remoteName], repoRoot)
-    : null;
-  const repoRef =
-    (await runGit(["symbolic-ref", "--quiet", "--short", "HEAD"], repoRoot)) ??
-    (await runGit(["rev-parse", "HEAD"], repoRoot));
-
-  return {
-    repoRoot,
-    repoUrl,
-    repoRef,
-  };
+function resolveLedgerBiller(result: AdapterExecutionResult): string {
+  return readNonEmptyString(result.biller) ?? readNonEmptyString(result.provider) ?? "unknown";
 }
 
-export async function resolveGitIdentityForRemoteCommit(input: {
-  repoRoot: string | null;
-  sourceCwd: string | null;
-  resolvedWorkspace: Pick<ResolvedWorkspaceForRun, "cwd" | "workspaceHints">;
-  previousSessionParams: Record<string, unknown> | null;
-  runtimeSessionParams: Record<string, unknown> | null;
-  agentAdapterConfig: Record<string, unknown> | null;
-}) {
-  const configuredAgentCwdRaw = readNonEmptyString(input.agentAdapterConfig?.cwd);
-  const configuredAgentCwd = configuredAgentCwdRaw
-    ? resolveHomeAwarePath(configuredAgentCwdRaw)
-    : null;
-  const candidateCwds = [
-    input.repoRoot,
-    input.sourceCwd,
-    ...input.resolvedWorkspace.workspaceHints.map((workspace) => readNonEmptyString(workspace.cwd)),
-    readNonEmptyString(input.runtimeSessionParams?.cwd),
-    readNonEmptyString(input.previousSessionParams?.cwd),
-    readNonEmptyString(input.resolvedWorkspace.cwd),
-    configuredAgentCwd,
-  ]
-    .filter((value): value is string => Boolean(value && value !== REPO_ONLY_CWD_SENTINEL))
-    .filter((value, index, values) => values.indexOf(value) === index);
-
-  for (const candidateCwd of candidateCwds) {
-    const name = await runGit(["config", "--local", "--get", "user.name"], candidateCwd);
-    const email = await runGit(["config", "--local", "--get", "user.email"], candidateCwd);
-    if (name && email) {
-      return { name, email, source: "repo" as const, sourceCwd: candidateCwd };
-    }
-  }
-
-  const globalName = await runGit(["config", "--global", "--get", "user.name"]);
-  const globalEmail = await runGit(["config", "--global", "--get", "user.email"]);
-  if (globalName && globalEmail) {
-    return { name: globalName, email: globalEmail, source: "global" as const, sourceCwd: null };
-  }
-
-  return null;
+function normalizeBilledCostCents(costUsd: number | null | undefined, billingType: BillingType): number {
+  if (billingType === "subscription_included") return 0;
+  if (typeof costUsd !== "number" || !Number.isFinite(costUsd)) return 0;
+  return Math.max(0, Math.round(costUsd * 100));
 }
 
-export async function resolveRemoteRepoForExecution(input: {
-  resolvedWorkspace: Pick<ResolvedWorkspaceForRun, "cwd" | "repoUrl" | "repoRef" | "workspaceHints">;
-  previousSessionParams: Record<string, unknown> | null;
-  runtimeSessionParams: Record<string, unknown> | null;
-  agentAdapterConfig: Record<string, unknown> | null;
-}) {
-  const fallbackRepoUrl = input.resolvedWorkspace.repoUrl;
-  const fallbackRepoRef = input.resolvedWorkspace.repoRef;
+async function resolveLedgerScopeForRun(
+  db: Db,
+  companyId: string,
+  run: typeof heartbeatRuns.$inferSelect,
+) {
+  const context = parseObject(run.contextSnapshot);
+  const contextIssueId = readNonEmptyString(context.issueId);
+  const contextProjectId = readNonEmptyString(context.projectId);
 
-  const configuredAgentCwdRaw = readNonEmptyString(input.agentAdapterConfig?.cwd);
-  const configuredAgentCwd = configuredAgentCwdRaw
-    ? resolveHomeAwarePath(configuredAgentCwdRaw)
-    : null;
-  const candidateCwds = [
-    ...input.resolvedWorkspace.workspaceHints.map((workspace) => readNonEmptyString(workspace.cwd)),
-    readNonEmptyString(input.runtimeSessionParams?.cwd),
-    readNonEmptyString(input.previousSessionParams?.cwd),
-    readNonEmptyString(input.resolvedWorkspace.cwd),
-    configuredAgentCwd,
-  ]
-    .filter((value): value is string => Boolean(value && value !== REPO_ONLY_CWD_SENTINEL))
-    .filter((value, index, values) => values.indexOf(value) === index);
-
-  for (const candidateCwd of candidateCwds) {
-    const inferredRepo = await inferRepoFromWorkingDirectory(candidateCwd);
-    if (!inferredRepo) continue;
+  if (!contextIssueId) {
     return {
-      repoUrl: fallbackRepoUrl ?? inferredRepo?.repoUrl ?? null,
-      repoRef: fallbackRepoRef ?? inferredRepo?.repoRef ?? input.resolvedWorkspace.repoRef,
-      repoRoot: inferredRepo.repoRoot ?? null,
-      sourceCwd: candidateCwd,
+      issueId: null,
+      projectId: contextProjectId,
     };
   }
 
+  const issue = await db
+    .select({
+      id: issues.id,
+      projectId: issues.projectId,
+    })
+    .from(issues)
+    .where(and(eq(issues.id, contextIssueId), eq(issues.companyId, companyId)))
+    .then((rows) => rows[0] ?? null);
+
   return {
-    repoUrl: fallbackRepoUrl ?? null,
-    repoRef: fallbackRepoRef ?? input.resolvedWorkspace.repoRef,
-    repoRoot: null as string | null,
-    sourceCwd: null as string | null,
+    issueId: issue?.id ?? null,
+    projectId: issue?.projectId ?? contextProjectId,
   };
 }
 
-export async function collectRemoteAgentContextFiles(input: {
-  repoRoot: string | null;
-  agentAdapterConfig: Record<string, unknown> | null;
-}) {
-  const configuredAgentCwdRaw = readNonEmptyString(input.agentAdapterConfig?.cwd);
-  const configuredAgentCwd = configuredAgentCwdRaw
-    ? resolveHomeAwarePath(configuredAgentCwdRaw)
-    : null;
-  const baseRoot = input.repoRoot ?? configuredAgentCwd;
-  if (!baseRoot) return null;
-
-  const candidateRoots = [
-    path.join(baseRoot, REMOTE_AGENT_CONTEXT_ROOT_DIR),
-    configuredAgentCwd ? path.join(configuredAgentCwd, REMOTE_AGENT_CONTEXT_ROOT_DIR) : null,
-  ]
-    .filter((value): value is string => Boolean(value))
-    .filter((value, index, values) => values.indexOf(value) === index);
-
-  const files = new Set<string>();
-
-  const walk = async (dir: string) => {
-    const entries = await fs.readdir(dir, { withFileTypes: true }).catch(() => []);
-    for (const entry of entries) {
-      const nextPath = path.join(dir, entry.name);
-      if (entry.isSymbolicLink()) continue;
-      if (entry.isDirectory()) {
-        if (REMOTE_AGENT_CONTEXT_SKIP_DIRS.has(entry.name)) continue;
-        await walk(nextPath);
-        continue;
-      }
-      if (!entry.isFile()) continue;
-      const stat = await fs.stat(nextPath).catch(() => null);
-      if (!stat?.isFile() || stat.size > REMOTE_AGENT_FILE_MAX_BYTES) continue;
-      files.add(nextPath);
-    }
+function normalizeUsageTotals(usage: UsageSummary | null | undefined): UsageTotals | null {
+  if (!usage) return null;
+  return {
+    inputTokens: Math.max(0, Math.floor(asNumber(usage.inputTokens, 0))),
+    cachedInputTokens: Math.max(0, Math.floor(asNumber(usage.cachedInputTokens, 0))),
+    outputTokens: Math.max(0, Math.floor(asNumber(usage.outputTokens, 0))),
   };
+}
 
-  for (const candidateRoot of candidateRoots) {
-    const stat = await fs.stat(candidateRoot).catch(() => null);
-    if (!stat?.isDirectory()) continue;
-    await walk(candidateRoot);
-  }
+function readRawUsageTotals(usageJson: unknown): UsageTotals | null {
+  const parsed = parseObject(usageJson);
+  if (Object.keys(parsed).length === 0) return null;
 
-  const relativeFiles = [...files]
-    .filter((filePath) => {
-      const relative = path.relative(baseRoot, filePath);
-      return relative.length > 0 && !relative.startsWith("..") && !path.isAbsolute(relative);
-    })
-    .sort((left, right) => left.localeCompare(right));
-  if (relativeFiles.length === 0) return null;
+  const inputTokens = Math.max(
+    0,
+    Math.floor(asNumber(parsed.rawInputTokens, asNumber(parsed.inputTokens, 0))),
+  );
+  const cachedInputTokens = Math.max(
+    0,
+    Math.floor(asNumber(parsed.rawCachedInputTokens, asNumber(parsed.cachedInputTokens, 0))),
+  );
+  const outputTokens = Math.max(
+    0,
+    Math.floor(asNumber(parsed.rawOutputTokens, asNumber(parsed.outputTokens, 0))),
+  );
 
-  const stagingDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-remote-agent-files-"));
-  for (const filePath of relativeFiles) {
-    const relative = path.relative(baseRoot, filePath);
-    const targetPath = path.join(stagingDir, relative);
-    await fs.mkdir(path.dirname(targetPath), { recursive: true });
-    await fs.copyFile(filePath, targetPath);
+  if (inputTokens <= 0 && cachedInputTokens <= 0 && outputTokens <= 0) {
+    return null;
   }
 
   return {
-    stagingDir,
-    fileCount: relativeFiles.length,
+    inputTokens,
+    cachedInputTokens,
+    outputTokens,
   };
+}
+
+function deriveNormalizedUsageDelta(current: UsageTotals | null, previous: UsageTotals | null): UsageTotals | null {
+  if (!current) return null;
+  if (!previous) return { ...current };
+
+  const inputTokens = current.inputTokens >= previous.inputTokens
+    ? current.inputTokens - previous.inputTokens
+    : current.inputTokens;
+  const cachedInputTokens = current.cachedInputTokens >= previous.cachedInputTokens
+    ? current.cachedInputTokens - previous.cachedInputTokens
+    : current.cachedInputTokens;
+  const outputTokens = current.outputTokens >= previous.outputTokens
+    ? current.outputTokens - previous.outputTokens
+    : current.outputTokens;
+
+  return {
+    inputTokens: Math.max(0, inputTokens),
+    cachedInputTokens: Math.max(0, cachedInputTokens),
+    outputTokens: Math.max(0, outputTokens),
+  };
+}
+
+function formatCount(value: number | null | undefined) {
+  if (typeof value !== "number" || !Number.isFinite(value)) return "0";
+  return value.toLocaleString("en-US");
+}
+
+export function parseSessionCompactionPolicy(agent: typeof agents.$inferSelect): SessionCompactionPolicy {
+  return resolveSessionCompactionPolicy(agent.adapterType, agent.runtimeConfig).policy;
 }
 
 export function resolveRuntimeSessionParamsForWorkspace(input: {
@@ -443,29 +495,27 @@ function deriveTaskKey(
 export function shouldResetTaskSessionForWake(
   contextSnapshot: Record<string, unknown> | null | undefined,
 ) {
+  if (contextSnapshot?.forceFreshSession === true) return true;
+
   const wakeReason = readNonEmptyString(contextSnapshot?.wakeReason);
   if (wakeReason === "issue_assigned") return true;
+  return false;
+}
 
-  const wakeSource = readNonEmptyString(contextSnapshot?.wakeSource);
-  if (wakeSource === "timer") return true;
-
-  const wakeTriggerDetail = readNonEmptyString(contextSnapshot?.wakeTriggerDetail);
-  return wakeSource === "on_demand" && wakeTriggerDetail === "manual";
+export function formatRuntimeWorkspaceWarningLog(warning: string) {
+  return {
+    stream: "stdout" as const,
+    chunk: `[paperclip] ${warning}\n`,
+  };
 }
 
 function describeSessionResetReason(
   contextSnapshot: Record<string, unknown> | null | undefined,
 ) {
+  if (contextSnapshot?.forceFreshSession === true) return "forceFreshSession was requested";
+
   const wakeReason = readNonEmptyString(contextSnapshot?.wakeReason);
   if (wakeReason === "issue_assigned") return "wake reason is issue_assigned";
-
-  const wakeSource = readNonEmptyString(contextSnapshot?.wakeSource);
-  if (wakeSource === "timer") return "wake source is timer";
-
-  const wakeTriggerDetail = readNonEmptyString(contextSnapshot?.wakeTriggerDetail);
-  if (wakeSource === "on_demand" && wakeTriggerDetail === "manual") {
-    return "this is a manual invoke";
-  }
   return null;
 }
 
@@ -530,6 +580,10 @@ function enrichWakeContextSnapshot(input: {
   }
   if (!readNonEmptyString(contextSnapshot["wakeTriggerDetail"]) && triggerDetail) {
     contextSnapshot.wakeTriggerDetail = triggerDetail;
+  }
+  const wakeMessage = readNonEmptyString(payload?.["text"]);
+  if (!readNonEmptyString(contextSnapshot["wakeMessage"]) && wakeMessage) {
+    contextSnapshot.wakeMessage = wakeMessage;
   }
   if (
     telegramMessageText ||
@@ -678,26 +732,19 @@ function resolveNextSessionState(input: {
   };
 }
 
-function mergeWorkspaceRepoIntoSessionParams(
-  params: Record<string, unknown> | null,
-  resolvedWorkspace: ResolvedWorkspaceForRun,
-) {
-  if (!params) return null;
-  const next = { ...params };
-  if (resolvedWorkspace.repoUrl && !readNonEmptyString(next.repoUrl)) {
-    next.repoUrl = resolvedWorkspace.repoUrl;
-  }
-  if (resolvedWorkspace.repoRef && !readNonEmptyString(next.repoRef)) {
-    next.repoRef = resolvedWorkspace.repoRef;
-  }
-  return next;
-}
-
 export function heartbeatService(db: Db) {
+  const instanceSettings = instanceSettingsService(db);
+
   const runLogStore = getRunLogStore();
   const secretsSvc = secretService(db);
-  const documentsSvc = documentService(db);
-  const remoteExecSvc = remoteExecutionService(db);
+  const issuesSvc = issueService(db);
+  const executionWorkspacesSvc = executionWorkspaceService(db);
+  const workspaceOperationsSvc = workspaceOperationService(db);
+  const activeRunExecutions = new Set<string>();
+  const budgetHooks = {
+    cancelWorkForScope: cancelBudgetScopeWork,
+  };
+  const budgets = budgetService(db, budgetHooks);
 
   async function getAgent(agentId: string) {
     return db
@@ -743,6 +790,176 @@ export function heartbeatService(db: Db) {
       .then((rows) => rows[0] ?? null);
   }
 
+  async function getLatestRunForSession(
+    agentId: string,
+    sessionId: string,
+    opts?: { excludeRunId?: string | null },
+  ) {
+    const conditions = [
+      eq(heartbeatRuns.agentId, agentId),
+      eq(heartbeatRuns.sessionIdAfter, sessionId),
+    ];
+    if (opts?.excludeRunId) {
+      conditions.push(sql`${heartbeatRuns.id} <> ${opts.excludeRunId}`);
+    }
+    return db
+      .select()
+      .from(heartbeatRuns)
+      .where(and(...conditions))
+      .orderBy(desc(heartbeatRuns.createdAt))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+  }
+
+  async function getOldestRunForSession(agentId: string, sessionId: string) {
+    return db
+      .select({
+        id: heartbeatRuns.id,
+        createdAt: heartbeatRuns.createdAt,
+      })
+      .from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.agentId, agentId), eq(heartbeatRuns.sessionIdAfter, sessionId)))
+      .orderBy(asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+  }
+
+  async function resolveNormalizedUsageForSession(input: {
+    agentId: string;
+    runId: string;
+    sessionId: string | null;
+    rawUsage: UsageTotals | null;
+  }) {
+    const { agentId, runId, sessionId, rawUsage } = input;
+    if (!sessionId || !rawUsage) {
+      return {
+        normalizedUsage: rawUsage,
+        previousRawUsage: null as UsageTotals | null,
+        derivedFromSessionTotals: false,
+      };
+    }
+
+    const previousRun = await getLatestRunForSession(agentId, sessionId, { excludeRunId: runId });
+    const previousRawUsage = readRawUsageTotals(previousRun?.usageJson);
+    return {
+      normalizedUsage: deriveNormalizedUsageDelta(rawUsage, previousRawUsage),
+      previousRawUsage,
+      derivedFromSessionTotals: previousRawUsage !== null,
+    };
+  }
+
+  async function evaluateSessionCompaction(input: {
+    agent: typeof agents.$inferSelect;
+    sessionId: string | null;
+    issueId: string | null;
+  }): Promise<SessionCompactionDecision> {
+    const { agent, sessionId, issueId } = input;
+    if (!sessionId) {
+      return {
+        rotate: false,
+        reason: null,
+        handoffMarkdown: null,
+        previousRunId: null,
+      };
+    }
+
+    const policy = parseSessionCompactionPolicy(agent);
+    if (!policy.enabled || !hasSessionCompactionThresholds(policy)) {
+      return {
+        rotate: false,
+        reason: null,
+        handoffMarkdown: null,
+        previousRunId: null,
+      };
+    }
+
+    const fetchLimit = Math.max(policy.maxSessionRuns > 0 ? policy.maxSessionRuns + 1 : 0, 4);
+    const runs = await db
+      .select({
+        id: heartbeatRuns.id,
+        createdAt: heartbeatRuns.createdAt,
+        usageJson: heartbeatRuns.usageJson,
+        resultJson: heartbeatRuns.resultJson,
+        error: heartbeatRuns.error,
+      })
+      .from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.agentId, agent.id), eq(heartbeatRuns.sessionIdAfter, sessionId)))
+      .orderBy(desc(heartbeatRuns.createdAt))
+      .limit(fetchLimit);
+
+    if (runs.length === 0) {
+      return {
+        rotate: false,
+        reason: null,
+        handoffMarkdown: null,
+        previousRunId: null,
+      };
+    }
+
+    const latestRun = runs[0] ?? null;
+    const oldestRun =
+      policy.maxSessionAgeHours > 0
+        ? await getOldestRunForSession(agent.id, sessionId)
+        : runs[runs.length - 1] ?? latestRun;
+    const latestRawUsage = readRawUsageTotals(latestRun?.usageJson);
+    const sessionAgeHours =
+      latestRun && oldestRun
+        ? Math.max(
+            0,
+            (new Date(latestRun.createdAt).getTime() - new Date(oldestRun.createdAt).getTime()) / (1000 * 60 * 60),
+          )
+        : 0;
+
+    let reason: string | null = null;
+    if (policy.maxSessionRuns > 0 && runs.length > policy.maxSessionRuns) {
+      reason = `session exceeded ${policy.maxSessionRuns} runs`;
+    } else if (
+      policy.maxRawInputTokens > 0 &&
+      latestRawUsage &&
+      latestRawUsage.inputTokens >= policy.maxRawInputTokens
+    ) {
+      reason =
+        `session raw input reached ${formatCount(latestRawUsage.inputTokens)} tokens ` +
+        `(threshold ${formatCount(policy.maxRawInputTokens)})`;
+    } else if (policy.maxSessionAgeHours > 0 && sessionAgeHours >= policy.maxSessionAgeHours) {
+      reason = `session age reached ${Math.floor(sessionAgeHours)} hours`;
+    }
+
+    if (!reason || !latestRun) {
+      return {
+        rotate: false,
+        reason: null,
+        handoffMarkdown: null,
+        previousRunId: latestRun?.id ?? null,
+      };
+    }
+
+    const latestSummary = summarizeHeartbeatRunResultJson(latestRun.resultJson);
+    const latestTextSummary =
+      readNonEmptyString(latestSummary?.summary) ??
+      readNonEmptyString(latestSummary?.result) ??
+      readNonEmptyString(latestSummary?.message) ??
+      readNonEmptyString(latestRun.error);
+
+    const handoffMarkdown = [
+      "Paperclip session handoff:",
+      `- Previous session: ${sessionId}`,
+      issueId ? `- Issue: ${issueId}` : "",
+      `- Rotation reason: ${reason}`,
+      latestTextSummary ? `- Last run summary: ${latestTextSummary}` : "",
+      "Continue from the current task state. Rebuild only the minimum context you need.",
+    ]
+      .filter(Boolean)
+      .join("\n");
+
+    return {
+      rotate: true,
+      reason,
+      handoffMarkdown,
+      previousRunId: latestRun.id,
+    };
+  }
+
   async function resolveSessionBeforeForWakeup(
     agent: typeof agents.$inferSelect,
     taskKey: string | null,
@@ -777,22 +994,25 @@ export function heartbeatService(db: Db) {
   ): Promise<ResolvedWorkspaceForRun> {
     const issueId = readNonEmptyString(context.issueId);
     const contextProjectId = readNonEmptyString(context.projectId);
-    const issueProjectId = issueId
+    const contextProjectWorkspaceId = readNonEmptyString(context.projectWorkspaceId);
+    const issueProjectRef = issueId
       ? await db
-          .select({ projectId: issues.projectId })
+          .select({
+            projectId: issues.projectId,
+            projectWorkspaceId: issues.projectWorkspaceId,
+          })
           .from(issues)
           .where(and(eq(issues.id, issueId), eq(issues.companyId, agent.companyId)))
-          .then((rows) => rows[0]?.projectId ?? null)
+          .then((rows) => rows[0] ?? null)
       : null;
+    const issueProjectId = issueProjectRef?.projectId ?? null;
+    const preferredProjectWorkspaceId =
+      issueProjectRef?.projectWorkspaceId ?? contextProjectWorkspaceId ?? null;
     const resolvedProjectId = issueProjectId ?? contextProjectId;
     const useProjectWorkspace = opts?.useProjectWorkspace !== false;
     const workspaceProjectId = useProjectWorkspace ? resolvedProjectId : null;
-    const configuredAgentCwdRaw = readNonEmptyString(parseObject(agent.adapterConfig).cwd);
-    const configuredAgentCwd = configuredAgentCwdRaw
-      ? resolveHomeAwarePath(configuredAgentCwdRaw)
-      : null;
 
-    const projectWorkspaceRows = workspaceProjectId
+    const unorderedProjectWorkspaceRows = workspaceProjectId
       ? await db
           .select()
           .from(projectWorkspaces)
@@ -804,6 +1024,10 @@ export function heartbeatService(db: Db) {
           )
           .orderBy(asc(projectWorkspaces.createdAt), asc(projectWorkspaces.id))
       : [];
+    const projectWorkspaceRows = prioritizeProjectWorkspaceCandidatesForRun(
+      unorderedProjectWorkspaceRows,
+      preferredProjectWorkspaceId,
+    );
 
     const workspaceHints = projectWorkspaceRows.map((workspace) => ({
       workspaceId: workspace.id,
@@ -813,12 +1037,34 @@ export function heartbeatService(db: Db) {
     }));
 
     if (projectWorkspaceRows.length > 0) {
+      const preferredWorkspace = preferredProjectWorkspaceId
+        ? projectWorkspaceRows.find((workspace) => workspace.id === preferredProjectWorkspaceId) ?? null
+        : null;
       const missingProjectCwds: string[] = [];
       let hasConfiguredProjectCwd = false;
+      let preferredWorkspaceWarning: string | null = null;
+      if (preferredProjectWorkspaceId && !preferredWorkspace) {
+        preferredWorkspaceWarning =
+          `Selected project workspace "${preferredProjectWorkspaceId}" is not available on this project.`;
+      }
       for (const workspace of projectWorkspaceRows) {
-        const projectCwd = readNonEmptyString(workspace.cwd);
+        let projectCwd = readNonEmptyString(workspace.cwd);
+        let managedWorkspaceWarning: string | null = null;
         if (!projectCwd || projectCwd === REPO_ONLY_CWD_SENTINEL) {
-          continue;
+          try {
+            const managedWorkspace = await ensureManagedProjectWorkspace({
+              companyId: agent.companyId,
+              projectId: workspaceProjectId ?? resolvedProjectId ?? workspace.projectId,
+              repoUrl: readNonEmptyString(workspace.repoUrl),
+            });
+            projectCwd = managedWorkspace.cwd;
+            managedWorkspaceWarning = managedWorkspace.warning;
+          } catch (error) {
+            if (preferredWorkspace?.id === workspace.id) {
+              preferredWorkspaceWarning = error instanceof Error ? error.message : String(error);
+            }
+            continue;
+          }
         }
         hasConfiguredProjectCwd = true;
         const projectCwdExists = await fs
@@ -834,8 +1080,14 @@ export function heartbeatService(db: Db) {
             repoUrl: workspace.repoUrl,
             repoRef: workspace.repoRef,
             workspaceHints,
-            warnings: [],
+            warnings: [preferredWorkspaceWarning, managedWorkspaceWarning].filter(
+              (value): value is string => Boolean(value),
+            ),
           };
+        }
+        if (preferredWorkspace?.id === workspace.id) {
+          preferredWorkspaceWarning =
+            `Selected project workspace path "${projectCwd}" is not available yet.`;
         }
         missingProjectCwds.push(projectCwd);
       }
@@ -843,6 +1095,9 @@ export function heartbeatService(db: Db) {
       const fallbackCwd = resolveDefaultAgentWorkspaceDir(agent.id);
       await fs.mkdir(fallbackCwd, { recursive: true });
       const warnings: string[] = [];
+      if (preferredWorkspaceWarning) {
+        warnings.push(preferredWorkspaceWarning);
+      }
       if (missingProjectCwds.length > 0) {
         const firstMissing = missingProjectCwds[0];
         const extraMissingCount = Math.max(0, missingProjectCwds.length - 1);
@@ -868,6 +1123,24 @@ export function heartbeatService(db: Db) {
       };
     }
 
+    if (workspaceProjectId) {
+      const managedWorkspace = await ensureManagedProjectWorkspace({
+        companyId: agent.companyId,
+        projectId: workspaceProjectId,
+        repoUrl: null,
+      });
+      return {
+        cwd: managedWorkspace.cwd,
+        source: "project_primary" as const,
+        projectId: resolvedProjectId,
+        workspaceId: null,
+        repoUrl: null,
+        repoRef: null,
+        workspaceHints,
+        warnings: managedWorkspace.warning ? [managedWorkspace.warning] : [],
+      };
+    }
+
     const sessionCwd = readNonEmptyString(previousSessionParams?.cwd);
     if (sessionCwd) {
       const sessionCwdExists = await fs
@@ -884,31 +1157,6 @@ export function heartbeatService(db: Db) {
           repoRef: readNonEmptyString(previousSessionParams?.repoRef),
           workspaceHints,
           warnings: [],
-        };
-      }
-    }
-
-    if (configuredAgentCwd) {
-      const configuredCwdExists = await fs
-        .stat(configuredAgentCwd)
-        .then((stats) => stats.isDirectory())
-        .catch(() => false);
-      if (configuredCwdExists) {
-        const inferredRepo = await inferRepoFromWorkingDirectory(configuredAgentCwd);
-        return {
-          cwd: resolveDefaultAgentWorkspaceDir(agent.id),
-          source: "agent_home" as const,
-          projectId: resolvedProjectId,
-          workspaceId: null,
-          repoUrl: inferredRepo?.repoUrl ?? null,
-          repoRef: inferredRepo?.repoRef ?? null,
-          workspaceHints,
-          warnings:
-            inferredRepo?.repoUrl
-              ? [
-                  `Inferred repo "${inferredRepo.repoUrl}" from configured agent cwd "${configuredAgentCwd}".`,
-                ]
-              : [],
         };
       }
     }
@@ -1084,6 +1332,9 @@ export function heartbeatService(db: Db) {
       payload?: Record<string, unknown>;
     },
   ) {
+    const sanitizedMessage = event.message ? redactCurrentUserText(event.message) : event.message;
+    const sanitizedPayload = event.payload ? redactCurrentUserValue(event.payload) : event.payload;
+
     await db.insert(heartbeatRunEvents).values({
       companyId: run.companyId,
       runId: run.id,
@@ -1093,8 +1344,8 @@ export function heartbeatService(db: Db) {
       stream: event.stream,
       level: event.level,
       color: event.color,
-      message: event.message,
-      payload: event.payload,
+      message: sanitizedMessage,
+      payload: sanitizedPayload,
     });
 
     publishLiveEvent({
@@ -1108,8 +1359,8 @@ export function heartbeatService(db: Db) {
         stream: event.stream ?? null,
         level: event.level ?? null,
         color: event.color ?? null,
-        message: event.message ?? null,
-        payload: event.payload ?? null,
+        message: sanitizedMessage ?? null,
+        payload: sanitizedPayload ?? null,
       },
     });
   }
@@ -1118,9 +1369,13 @@ export function heartbeatService(db: Db) {
     const runtimeConfig = parseObject(agent.runtimeConfig);
     const heartbeat = parseObject(runtimeConfig.heartbeat);
 
+    const rawCron = typeof heartbeat.cron === "string" ? heartbeat.cron.trim() : null;
+    const cronExpression = rawCron && validateCron(rawCron) === null ? rawCron : null;
+
     return {
       enabled: asBoolean(heartbeat.enabled, true),
       intervalSec: Math.max(0, asNumber(heartbeat.intervalSec, 0)),
+      cronExpression,
       wakeOnDemand: asBoolean(heartbeat.wakeOnDemand ?? heartbeat.wakeOnAssignment ?? heartbeat.wakeOnOnDemand ?? heartbeat.wakeOnAutomation, true),
       maxConcurrentRuns: normalizeMaxConcurrentRuns(heartbeat.maxConcurrentRuns),
     };
@@ -1136,6 +1391,26 @@ export function heartbeatService(db: Db) {
 
   async function claimQueuedRun(run: typeof heartbeatRuns.$inferSelect) {
     if (run.status !== "queued") return run;
+    const agent = await getAgent(run.agentId);
+    if (!agent) {
+      await cancelRunInternal(run.id, "Cancelled because the agent no longer exists");
+      return null;
+    }
+    if (agent.status === "paused" || agent.status === "terminated" || agent.status === "pending_approval") {
+      await cancelRunInternal(run.id, "Cancelled because the agent is not invokable");
+      return null;
+    }
+
+    const context = parseObject(run.contextSnapshot);
+    const budgetBlock = await budgets.getInvocationBlock(run.companyId, run.agentId, {
+      issueId: readNonEmptyString(context.issueId),
+      projectId: readNonEmptyString(context.projectId),
+    });
+    if (budgetBlock) {
+      await cancelRunInternal(run.id, budgetBlock.reason);
+      return null;
+    }
+
     const claimedAt = new Date();
     const claimed = await db
       .update(heartbeatRuns)
@@ -1216,59 +1491,25 @@ export function heartbeatService(db: Db) {
   }
 
   async function reapOrphanedRuns(opts?: { staleThresholdMs?: number }) {
-    const staleThresholdMs = normalizeOrphanReapStaleThresholdMs(opts?.staleThresholdMs);
+    const staleThresholdMs = opts?.staleThresholdMs ?? 0;
     const now = new Date();
 
-    // Find all runs in "queued" or "running" state
+    // Find all runs stuck in "running" state (queued runs are legitimately waiting; resumeQueuedRuns handles them)
     const activeRuns = await db
       .select()
       .from(heartbeatRuns)
-      .where(inArray(heartbeatRuns.status, ["queued", "running"]));
-
-    logger.info(
-      {
-        activeRunCount: activeRuns.length,
-        runningProcessCount: runningProcesses.size,
-        runningProcessIds: [...runningProcesses.keys()],
-        staleThresholdMs,
-      },
-      "reapOrphanedRuns: scanning for orphans",
-    );
+      .where(eq(heartbeatRuns.status, "running"));
 
     const reaped: string[] = [];
 
     for (const run of activeRuns) {
-      const ageMs = now.getTime() - (run.updatedAt ? new Date(run.updatedAt).getTime() : 0);
-      const startedAgeMs = run.startedAt ? now.getTime() - new Date(run.startedAt).getTime() : null;
+      if (runningProcesses.has(run.id) || activeRunExecutions.has(run.id)) continue;
 
-      if (runningProcesses.has(run.id)) {
-        logger.debug({ runId: run.id, status: run.status }, "reapOrphanedRuns: skipping (tracked in runningProcesses)");
-        continue;
+      // Apply staleness threshold to avoid false positives
+      if (staleThresholdMs > 0) {
+        const refTime = run.updatedAt ? new Date(run.updatedAt).getTime() : 0;
+        if (now.getTime() - refTime < staleThresholdMs) continue;
       }
-
-      if (!shouldReapRunAsOrphan(run, now, staleThresholdMs)) {
-        logger.debug(
-          { runId: run.id, status: run.status, ageMs, staleThresholdMs },
-          "reapOrphanedRuns: skipping (below staleness threshold)",
-        );
-        continue;
-      }
-
-      logger.warn(
-        {
-          runId: run.id,
-          agentId: run.agentId,
-          status: run.status,
-          invocationSource: run.invocationSource,
-          startedAt: run.startedAt,
-          updatedAt: run.updatedAt,
-          ageMs,
-          startedAgeMs,
-          hasLogRef: !!run.logRef,
-          hasLogStore: !!run.logStore,
-        },
-        "reapOrphanedRuns: reaping orphaned run (not in runningProcesses)",
-      );
 
       await setRunStatus(run.id, "failed", {
         error: "Process lost -- server may have restarted",
@@ -1296,11 +1537,21 @@ export function heartbeatService(db: Db) {
     }
 
     if (reaped.length > 0) {
-      logger.warn({ reapedCount: reaped.length, runIds: reaped }, "reapOrphanedRuns: complete");
-    } else if (activeRuns.length > 0) {
-      logger.info({ activeRunCount: activeRuns.length }, "reapOrphanedRuns: no orphans found");
+      logger.warn({ reapedCount: reaped.length, runIds: reaped }, "reaped orphaned heartbeat runs");
     }
     return { reaped: reaped.length, runIds: reaped };
+  }
+
+  async function resumeQueuedRuns() {
+    const queuedRuns = await db
+      .select({ agentId: heartbeatRuns.agentId })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.status, "queued"));
+
+    const agentIds = [...new Set(queuedRuns.map((r) => r.agentId))];
+    for (const agentId of agentIds) {
+      await startNextQueuedRunForAgent(agentId);
+    }
   }
 
   async function updateRuntimeState(
@@ -1308,14 +1559,19 @@ export function heartbeatService(db: Db) {
     run: typeof heartbeatRuns.$inferSelect,
     result: AdapterExecutionResult,
     session: { legacySessionId: string | null },
+    normalizedUsage?: UsageTotals | null,
   ) {
     await ensureRuntimeState(agent);
-    const usage = result.usage;
+    const usage = normalizedUsage ?? normalizeUsageTotals(result.usage);
     const inputTokens = usage?.inputTokens ?? 0;
     const outputTokens = usage?.outputTokens ?? 0;
     const cachedInputTokens = usage?.cachedInputTokens ?? 0;
-    const additionalCostCents = Math.max(0, Math.round((result.costUsd ?? 0) * 100));
+    const billingType = normalizeLedgerBillingType(result.billingType);
+    const additionalCostCents = normalizeBilledCostCents(result.costUsd, billingType);
     const hasTokenUsage = inputTokens > 0 || outputTokens > 0 || cachedInputTokens > 0;
+    const provider = result.provider ?? "unknown";
+    const biller = resolveLedgerBiller(result);
+    const ledgerScope = await resolveLedgerScopeForRun(db, agent.companyId, run);
 
     await db
       .update(agentRuntimeState)
@@ -1334,26 +1590,22 @@ export function heartbeatService(db: Db) {
       .where(eq(agentRuntimeState.agentId, agent.id));
 
     if (additionalCostCents > 0 || hasTokenUsage) {
-      await db.insert(costEvents).values({
-        companyId: agent.companyId,
+      const costs = costService(db, budgetHooks);
+      await costs.createEvent(agent.companyId, {
+        heartbeatRunId: run.id,
         agentId: agent.id,
-        provider: result.provider ?? "unknown",
+        issueId: ledgerScope.issueId,
+        projectId: ledgerScope.projectId,
+        provider,
+        biller,
+        billingType,
         model: result.model ?? "unknown",
         inputTokens,
+        cachedInputTokens,
         outputTokens,
         costCents: additionalCostCents,
         occurredAt: new Date(),
       });
-    }
-
-    if (additionalCostCents > 0) {
-      await db
-        .update(agents)
-        .set({
-          spentMonthlyCents: sql`${agents.spentMonthlyCents} + ${additionalCostCents}`,
-          updatedAt: new Date(),
-        })
-        .where(eq(agents.id, agent.id));
     }
   }
 
@@ -1361,6 +1613,9 @@ export function heartbeatService(db: Db) {
     return withAgentStartLock(agentId, async () => {
       const agent = await getAgent(agentId);
       if (!agent) return [];
+      if (agent.status === "paused" || agent.status === "terminated" || agent.status === "pending_approval") {
+        return [];
+      }
       const policy = parseHeartbeatPolicy(agent);
       const runningCount = await countRunningRunsForAgent(agentId);
       const availableSlots = Math.max(0, policy.maxConcurrentRuns - runningCount);
@@ -1404,6 +1659,9 @@ export function heartbeatService(db: Db) {
       run = claimed;
     }
 
+    activeRunExecutions.add(run.id);
+
+    try {
     const agent = await getAgent(run.agentId);
     if (!agent) {
       await setRunStatus(runId, "failed", {
@@ -1425,37 +1683,47 @@ export function heartbeatService(db: Db) {
     const taskKey = deriveTaskKey(context, null);
     const sessionCodec = getAdapterSessionCodec(agent.adapterType);
     const issueId = readNonEmptyString(context.issueId);
-    const issueAssigneeConfig = issueId
+    const issueContext = issueId
       ? await db
           .select({
             id: issues.id,
-            companyId: issues.companyId,
+            identifier: issues.identifier,
+            title: issues.title,
+            projectId: issues.projectId,
+            projectWorkspaceId: issues.projectWorkspaceId,
+            executionWorkspaceId: issues.executionWorkspaceId,
+            executionWorkspacePreference: issues.executionWorkspacePreference,
             assigneeAgentId: issues.assigneeAgentId,
             assigneeAdapterOverrides: issues.assigneeAdapterOverrides,
-            title: issues.title,
-            description: issues.description,
-            identifier: issues.identifier,
-            status: issues.status,
-            executionMode: issues.executionMode,
-            executionTargetId: issues.executionTargetId,
+            executionWorkspaceSettings: issues.executionWorkspaceSettings,
           })
           .from(issues)
           .where(and(eq(issues.id, issueId), eq(issues.companyId, agent.companyId)))
           .then((rows) => rows[0] ?? null)
       : null;
-    // Enrich context with issue details so adapters/prompts can reference them
-    if (issueAssigneeConfig) {
-      context.issueTitle = issueAssigneeConfig.title;
-      context.issueDescription = issueAssigneeConfig.description;
-      context.issueIdentifier = issueAssigneeConfig.identifier;
-      context.issueStatus = issueAssigneeConfig.status;
-    }
     const issueAssigneeOverrides =
-      issueAssigneeConfig && issueAssigneeConfig.assigneeAgentId === agent.id
+      issueContext && issueContext.assigneeAgentId === agent.id
         ? parseIssueAssigneeAdapterOverrides(
-            issueAssigneeConfig.assigneeAdapterOverrides,
+            issueContext.assigneeAdapterOverrides,
           )
         : null;
+    const isolatedWorkspacesEnabled = (await instanceSettings.getExperimental()).enableIsolatedWorkspaces;
+    const issueExecutionWorkspaceSettings = isolatedWorkspacesEnabled
+      ? parseIssueExecutionWorkspaceSettings(issueContext?.executionWorkspaceSettings)
+      : null;
+    const contextProjectId = readNonEmptyString(context.projectId);
+    const executionProjectId = issueContext?.projectId ?? contextProjectId;
+    const projectExecutionWorkspacePolicy = executionProjectId
+      ? await db
+          .select({ executionWorkspacePolicy: projects.executionWorkspacePolicy })
+          .from(projects)
+          .where(and(eq(projects.id, executionProjectId), eq(projects.companyId, agent.companyId)))
+          .then((rows) =>
+            gateProjectExecutionWorkspacePolicy(
+              parseProjectExecutionWorkspacePolicy(rows[0]?.executionWorkspacePolicy),
+              isolatedWorkspacesEnabled,
+            ))
+      : null;
     const taskSession = taskKey
       ? await getTaskSession(agent.companyId, agent.id, agent.adapterType, taskKey)
       : null;
@@ -1465,20 +1733,204 @@ export function heartbeatService(db: Db) {
     const previousSessionParams = normalizeSessionParams(
       sessionCodec.deserialize(taskSessionForRun?.sessionParamsJson ?? null),
     );
+    const config = parseObject(agent.adapterConfig);
+    const executionWorkspaceMode = resolveExecutionWorkspaceMode({
+      projectPolicy: projectExecutionWorkspacePolicy,
+      issueSettings: issueExecutionWorkspaceSettings,
+      legacyUseProjectWorkspace: issueAssigneeOverrides?.useProjectWorkspace ?? null,
+    });
     const resolvedWorkspace = await resolveWorkspaceForRun(
       agent,
       context,
       previousSessionParams,
-      { useProjectWorkspace: issueAssigneeOverrides?.useProjectWorkspace ?? null },
+      { useProjectWorkspace: executionWorkspaceMode !== "agent_default" },
     );
+    const workspaceManagedConfig = buildExecutionWorkspaceAdapterConfig({
+      agentConfig: config,
+      projectPolicy: projectExecutionWorkspacePolicy,
+      issueSettings: issueExecutionWorkspaceSettings,
+      mode: executionWorkspaceMode,
+      legacyUseProjectWorkspace: issueAssigneeOverrides?.useProjectWorkspace ?? null,
+    });
+    const mergedConfig = issueAssigneeOverrides?.adapterConfig
+      ? { ...workspaceManagedConfig, ...issueAssigneeOverrides.adapterConfig }
+      : workspaceManagedConfig;
+    const { config: resolvedConfig, secretKeys } = await secretsSvc.resolveAdapterConfigForRuntime(
+      agent.companyId,
+      mergedConfig,
+    );
+    const issueRef = issueContext
+      ? {
+          id: issueContext.id,
+          identifier: issueContext.identifier,
+          title: issueContext.title,
+          projectId: issueContext.projectId,
+          projectWorkspaceId: issueContext.projectWorkspaceId,
+          executionWorkspaceId: issueContext.executionWorkspaceId,
+          executionWorkspacePreference: issueContext.executionWorkspacePreference,
+        }
+      : null;
+    const existingExecutionWorkspace =
+      issueRef?.executionWorkspaceId ? await executionWorkspacesSvc.getById(issueRef.executionWorkspaceId) : null;
+    const workspaceOperationRecorder = workspaceOperationsSvc.createRecorder({
+      companyId: agent.companyId,
+      heartbeatRunId: run.id,
+      executionWorkspaceId: existingExecutionWorkspace?.id ?? null,
+    });
+    const executionWorkspace = await realizeExecutionWorkspace({
+      base: {
+        baseCwd: resolvedWorkspace.cwd,
+        source: resolvedWorkspace.source,
+        projectId: resolvedWorkspace.projectId,
+        workspaceId: resolvedWorkspace.workspaceId,
+        repoUrl: resolvedWorkspace.repoUrl,
+        repoRef: resolvedWorkspace.repoRef,
+      },
+      config: resolvedConfig,
+      issue: issueRef,
+      agent: {
+        id: agent.id,
+        name: agent.name,
+        companyId: agent.companyId,
+      },
+      recorder: workspaceOperationRecorder,
+    });
+    const resolvedProjectId = executionWorkspace.projectId ?? issueRef?.projectId ?? executionProjectId ?? null;
+    const resolvedProjectWorkspaceId = issueRef?.projectWorkspaceId ?? resolvedWorkspace.workspaceId ?? null;
+    const shouldReuseExisting =
+      issueRef?.executionWorkspacePreference === "reuse_existing" &&
+      existingExecutionWorkspace &&
+      existingExecutionWorkspace.status !== "archived";
+    let persistedExecutionWorkspace = null;
+    try {
+      persistedExecutionWorkspace = shouldReuseExisting && existingExecutionWorkspace
+        ? await executionWorkspacesSvc.update(existingExecutionWorkspace.id, {
+            cwd: executionWorkspace.cwd,
+            repoUrl: executionWorkspace.repoUrl,
+            baseRef: executionWorkspace.repoRef,
+            branchName: executionWorkspace.branchName,
+            providerType: executionWorkspace.strategy === "git_worktree" ? "git_worktree" : "local_fs",
+            providerRef: executionWorkspace.worktreePath,
+            status: "active",
+            lastUsedAt: new Date(),
+            metadata: {
+              ...(existingExecutionWorkspace.metadata ?? {}),
+              source: executionWorkspace.source,
+              createdByRuntime: executionWorkspace.created,
+            },
+          })
+        : resolvedProjectId
+          ? await executionWorkspacesSvc.create({
+              companyId: agent.companyId,
+              projectId: resolvedProjectId,
+              projectWorkspaceId: resolvedProjectWorkspaceId,
+              sourceIssueId: issueRef?.id ?? null,
+              mode:
+                executionWorkspaceMode === "isolated_workspace"
+                  ? "isolated_workspace"
+                  : executionWorkspaceMode === "operator_branch"
+                    ? "operator_branch"
+                    : executionWorkspaceMode === "agent_default"
+                      ? "adapter_managed"
+                      : "shared_workspace",
+              strategyType: executionWorkspace.strategy === "git_worktree" ? "git_worktree" : "project_primary",
+              name: executionWorkspace.branchName ?? issueRef?.identifier ?? `workspace-${agent.id.slice(0, 8)}`,
+              status: "active",
+              cwd: executionWorkspace.cwd,
+              repoUrl: executionWorkspace.repoUrl,
+              baseRef: executionWorkspace.repoRef,
+              branchName: executionWorkspace.branchName,
+              providerType: executionWorkspace.strategy === "git_worktree" ? "git_worktree" : "local_fs",
+              providerRef: executionWorkspace.worktreePath,
+              lastUsedAt: new Date(),
+              openedAt: new Date(),
+              metadata: {
+                source: executionWorkspace.source,
+                createdByRuntime: executionWorkspace.created,
+              },
+            })
+          : null;
+    } catch (error) {
+      if (executionWorkspace.created) {
+        try {
+          await cleanupExecutionWorkspaceArtifacts({
+            workspace: {
+              id: existingExecutionWorkspace?.id ?? `transient-${run.id}`,
+              cwd: executionWorkspace.cwd,
+              providerType: executionWorkspace.strategy === "git_worktree" ? "git_worktree" : "local_fs",
+              providerRef: executionWorkspace.worktreePath,
+              branchName: executionWorkspace.branchName,
+              repoUrl: executionWorkspace.repoUrl,
+              baseRef: executionWorkspace.repoRef,
+              projectId: resolvedProjectId,
+              projectWorkspaceId: resolvedProjectWorkspaceId,
+              sourceIssueId: issueRef?.id ?? null,
+              metadata: {
+                createdByRuntime: true,
+                source: executionWorkspace.source,
+              },
+            },
+            projectWorkspace: {
+              cwd: resolvedWorkspace.cwd,
+              cleanupCommand: null,
+            },
+            teardownCommand: projectExecutionWorkspacePolicy?.workspaceStrategy?.teardownCommand ?? null,
+            recorder: workspaceOperationRecorder,
+          });
+        } catch (cleanupError) {
+          logger.warn(
+            {
+              runId: run.id,
+              issueId,
+              executionWorkspaceCwd: executionWorkspace.cwd,
+              cleanupError: cleanupError instanceof Error ? cleanupError.message : String(cleanupError),
+            },
+            "Failed to cleanup realized execution workspace after persistence failure",
+          );
+        }
+      }
+      throw error;
+    }
+    await workspaceOperationRecorder.attachExecutionWorkspaceId(persistedExecutionWorkspace?.id ?? null);
+    if (
+      existingExecutionWorkspace &&
+      persistedExecutionWorkspace &&
+      existingExecutionWorkspace.id !== persistedExecutionWorkspace.id &&
+      existingExecutionWorkspace.status === "active"
+    ) {
+      await executionWorkspacesSvc.update(existingExecutionWorkspace.id, {
+        status: "idle",
+        cleanupReason: null,
+      });
+    }
+    if (issueId && persistedExecutionWorkspace && issueRef?.executionWorkspaceId !== persistedExecutionWorkspace.id) {
+      await issuesSvc.update(issueId, {
+        executionWorkspaceId: persistedExecutionWorkspace.id,
+        ...(resolvedProjectWorkspaceId ? { projectWorkspaceId: resolvedProjectWorkspaceId } : {}),
+      });
+    }
+    if (persistedExecutionWorkspace) {
+      context.executionWorkspaceId = persistedExecutionWorkspace.id;
+      await db
+        .update(heartbeatRuns)
+        .set({
+          contextSnapshot: context,
+          updatedAt: new Date(),
+        })
+        .where(eq(heartbeatRuns.id, run.id));
+    }
     const runtimeSessionResolution = resolveRuntimeSessionParamsForWorkspace({
       agentId: agent.id,
       previousSessionParams,
-      resolvedWorkspace,
+      resolvedWorkspace: {
+        ...resolvedWorkspace,
+        cwd: executionWorkspace.cwd,
+      },
     });
     const runtimeSessionParams = runtimeSessionResolution.sessionParams;
     const runtimeWorkspaceWarnings = [
       ...resolvedWorkspace.warnings,
+      ...executionWorkspace.warnings,
       ...(runtimeSessionResolution.warning ? [runtimeSessionResolution.warning] : []),
       ...(resetTaskSession && sessionResetReason
         ? [
@@ -1489,76 +1941,80 @@ export function heartbeatService(db: Db) {
         : []),
     ];
     context.paperclipWorkspace = {
-      cwd: resolvedWorkspace.cwd,
-      source: resolvedWorkspace.source,
-      projectId: resolvedWorkspace.projectId,
-      workspaceId: resolvedWorkspace.workspaceId,
-      repoUrl: resolvedWorkspace.repoUrl,
-      repoRef: resolvedWorkspace.repoRef,
+      cwd: executionWorkspace.cwd,
+      source: executionWorkspace.source,
+      mode: executionWorkspaceMode,
+      strategy: executionWorkspace.strategy,
+      projectId: executionWorkspace.projectId,
+      workspaceId: executionWorkspace.workspaceId,
+      repoUrl: executionWorkspace.repoUrl,
+      repoRef: executionWorkspace.repoRef,
+      branchName: executionWorkspace.branchName,
+      worktreePath: executionWorkspace.worktreePath,
+      agentHome: resolveDefaultAgentWorkspaceDir(agent.id),
     };
     context.paperclipWorkspaces = resolvedWorkspace.workspaceHints;
-    if (resolvedWorkspace.projectId && !readNonEmptyString(context.projectId)) {
-      context.projectId = resolvedWorkspace.projectId;
+    const runtimeServiceIntents = (() => {
+      const runtimeConfig = parseObject(resolvedConfig.workspaceRuntime);
+      return Array.isArray(runtimeConfig.services)
+        ? runtimeConfig.services.filter(
+            (value): value is Record<string, unknown> => typeof value === "object" && value !== null,
+          )
+        : [];
+    })();
+    if (runtimeServiceIntents.length > 0) {
+      context.paperclipRuntimeServiceIntents = runtimeServiceIntents;
+    } else {
+      delete context.paperclipRuntimeServiceIntents;
+    }
+    if (executionWorkspace.projectId && !readNonEmptyString(context.projectId)) {
+      context.projectId = executionWorkspace.projectId;
     }
     const runtimeSessionFallback = taskKey || resetTaskSession ? null : runtime.sessionId;
-    const previousSessionDisplayId = truncateDisplayId(
+    let previousSessionDisplayId = truncateDisplayId(
       taskSessionForRun?.sessionDisplayId ??
         (sessionCodec.getDisplayId ? sessionCodec.getDisplayId(runtimeSessionParams) : null) ??
         readNonEmptyString(runtimeSessionParams?.sessionId) ??
         runtimeSessionFallback,
     );
+    let runtimeSessionIdForAdapter =
+      readNonEmptyString(runtimeSessionParams?.sessionId) ?? runtimeSessionFallback;
+    let runtimeSessionParamsForAdapter = runtimeSessionParams;
+
+    const sessionCompaction = await evaluateSessionCompaction({
+      agent,
+      sessionId: previousSessionDisplayId ?? runtimeSessionIdForAdapter,
+      issueId,
+    });
+    if (sessionCompaction.rotate) {
+      context.paperclipSessionHandoffMarkdown = sessionCompaction.handoffMarkdown;
+      context.paperclipSessionRotationReason = sessionCompaction.reason;
+      context.paperclipPreviousSessionId = previousSessionDisplayId ?? runtimeSessionIdForAdapter;
+      runtimeSessionIdForAdapter = null;
+      runtimeSessionParamsForAdapter = null;
+      previousSessionDisplayId = null;
+      if (sessionCompaction.reason) {
+        runtimeWorkspaceWarnings.push(
+          `Starting a fresh session because ${sessionCompaction.reason}.`,
+        );
+      }
+    } else {
+      delete context.paperclipSessionHandoffMarkdown;
+      delete context.paperclipSessionRotationReason;
+      delete context.paperclipPreviousSessionId;
+    }
+
     const runtimeForAdapter = {
-      sessionId: readNonEmptyString(runtimeSessionParams?.sessionId) ?? runtimeSessionFallback,
-      sessionParams: runtimeSessionParams,
+      sessionId: runtimeSessionIdForAdapter,
+      sessionParams: runtimeSessionParamsForAdapter,
       sessionDisplayId: previousSessionDisplayId,
       taskKey,
-    };
-    const changedDocuments = await documentsSvc.listChangedRelevantDocumentsForAgent(agent.id);
-    context.paperclipDocuments = {
-      changed: changedDocuments.map((document) => ({
-        id: document.id,
-        scope: document.scope,
-        title: document.title,
-        projectId: document.projectId,
-        approvalId: document.approvalId,
-        agentId: document.agentId,
-        day: document.day,
-        latestRevisionId: document.latestRevisionId,
-        updatedAt: document.updatedAt,
-        body: document.latestRevision?.body ?? "",
-      })),
-      asOf: new Date().toISOString(),
     };
 
     let seq = 1;
     let handle: RunLogHandle | null = null;
     let stdoutExcerpt = "";
     let stderrExcerpt = "";
-    let remoteLeaseForRun: typeof remoteExecutionLeases.$inferSelect | null = null;
-    let remoteTargetForRun: {
-      host: string;
-      user: string;
-      workerPath: string;
-      metadata: Record<string, unknown> | null;
-    } | null = null;
-    let remoteRepoForRun: {
-      repoUrl: string;
-      baseRef: string;
-      worktreeName: string;
-      branchName: string;
-      commitMessage: string;
-    } | null = null;
-    let remoteGitIdentityForRun: {
-      name: string;
-      email: string;
-    } | null = null;
-    let runtimeForExecution = runtimeForAdapter;
-    let nextSessionStateBase = {
-      previousParams: previousSessionParams,
-      previousDisplayId: runtimeForAdapter.sessionDisplayId,
-      previousLegacySessionId: runtimeForAdapter.sessionId,
-    };
-
     try {
       const startedAt = run.startedAt ?? new Date();
       const runningWithSession = await db
@@ -1566,6 +2022,7 @@ export function heartbeatService(db: Db) {
         .set({
           startedAt,
           sessionIdBefore: runtimeForAdapter.sessionDisplayId ?? runtimeForAdapter.sessionId,
+          contextSnapshot: context,
           updatedAt: new Date(),
         })
         .where(eq(heartbeatRuns.id, run.id))
@@ -1616,21 +2073,23 @@ export function heartbeatService(db: Db) {
         .where(eq(heartbeatRuns.id, runId));
 
       const onLog = async (stream: "stdout" | "stderr", chunk: string) => {
-        if (stream === "stdout") stdoutExcerpt = appendExcerpt(stdoutExcerpt, chunk);
-        if (stream === "stderr") stderrExcerpt = appendExcerpt(stderrExcerpt, chunk);
+        const sanitizedChunk = redactCurrentUserText(chunk);
+        if (stream === "stdout") stdoutExcerpt = appendExcerpt(stdoutExcerpt, sanitizedChunk);
+        if (stream === "stderr") stderrExcerpt = appendExcerpt(stderrExcerpt, sanitizedChunk);
+        const ts = new Date().toISOString();
 
         if (handle) {
           await runLogStore.append(handle, {
             stream,
-            chunk,
-            ts: new Date().toISOString(),
+            chunk: sanitizedChunk,
+            ts,
           });
         }
 
         const payloadChunk =
-          chunk.length > MAX_LIVE_LOG_CHUNK_BYTES
-            ? chunk.slice(chunk.length - MAX_LIVE_LOG_CHUNK_BYTES)
-            : chunk;
+          sanitizedChunk.length > MAX_LIVE_LOG_CHUNK_BYTES
+            ? sanitizedChunk.slice(sanitizedChunk.length - MAX_LIVE_LOG_CHUNK_BYTES)
+            : sanitizedChunk;
 
         publishLiveEvent({
           companyId: run.companyId,
@@ -1638,25 +2097,72 @@ export function heartbeatService(db: Db) {
           payload: {
             runId: run.id,
             agentId: run.agentId,
+            ts,
             stream,
             chunk: payloadChunk,
-            truncated: payloadChunk.length !== chunk.length,
+            truncated: payloadChunk.length !== sanitizedChunk.length,
           },
         });
       };
       for (const warning of runtimeWorkspaceWarnings) {
-        await onLog("stderr", `[paperclip] ${warning}\n`);
+        const logEntry = formatRuntimeWorkspaceWarningLog(warning);
+        await onLog(logEntry.stream, logEntry.chunk);
       }
-
-      const config = parseObject(agent.adapterConfig);
-      const mergedConfig = issueAssigneeOverrides?.adapterConfig
-        ? { ...config, ...issueAssigneeOverrides.adapterConfig }
-        : config;
-      const resolvedConfig = await secretsSvc.resolveAdapterConfigForRuntime(
-        agent.companyId,
-        mergedConfig,
+      const adapterEnv = Object.fromEntries(
+        Object.entries(parseObject(resolvedConfig.env)).filter(
+          (entry): entry is [string, string] => typeof entry[0] === "string" && typeof entry[1] === "string",
+        ),
       );
+      const runtimeServices = await ensureRuntimeServicesForRun({
+        db,
+        runId: run.id,
+        agent: {
+          id: agent.id,
+          name: agent.name,
+          companyId: agent.companyId,
+        },
+        issue: issueRef,
+        workspace: executionWorkspace,
+        executionWorkspaceId: persistedExecutionWorkspace?.id ?? issueRef?.executionWorkspaceId ?? null,
+        config: resolvedConfig,
+        adapterEnv,
+        onLog,
+      });
+      if (runtimeServices.length > 0) {
+        context.paperclipRuntimeServices = runtimeServices;
+        context.paperclipRuntimePrimaryUrl =
+          runtimeServices.find((service) => readNonEmptyString(service.url))?.url ?? null;
+        await db
+          .update(heartbeatRuns)
+          .set({
+            contextSnapshot: context,
+            updatedAt: new Date(),
+          })
+          .where(eq(heartbeatRuns.id, run.id));
+      }
+      if (issueId && (executionWorkspace.created || runtimeServices.some((service) => !service.reused))) {
+        try {
+          await issuesSvc.addComment(
+            issueId,
+            buildWorkspaceReadyComment({
+              workspace: executionWorkspace,
+              runtimeServices,
+            }),
+            { agentId: agent.id },
+          );
+        } catch (err) {
+          await onLog(
+            "stderr",
+            `[paperclip] Failed to post workspace-ready comment: ${err instanceof Error ? err.message : String(err)}\n`,
+          );
+        }
+      }
       const onAdapterMeta = async (meta: AdapterInvocationMeta) => {
+        if (meta.env && secretKeys.size > 0) {
+          for (const key of secretKeys) {
+            if (key in meta.env) meta.env[key] = "***REDACTED***";
+          }
+        }
         await appendRunEvent(currentRun, seq++, {
           eventType: "adapter.invoke",
           stream: "system",
@@ -1681,336 +2187,87 @@ export function heartbeatService(db: Db) {
           "local agent jwt secret missing or invalid; running without injected PAPERCLIP_API_KEY",
         );
       }
-      context.paperclipTools = { ...((context.paperclipTools as Record<string, unknown> | undefined) ?? {}), telegram: { sendEndpoint: "/api/agent-tools/telegram/send", defaultAgentId: agent.id, supportsStatusFlags: true } };
-      const shouldRunRemote =
-        issueAssigneeConfig?.executionMode === "remote" &&
-        issueAssigneeConfig.executionTargetId &&
-        issueAssigneeConfig.assigneeAgentId === agent.id;
-
-      let adapterResult: AdapterExecutionResult;
-      if (shouldRunRemote) {
-        const executionTargetId = issueAssigneeConfig.executionTargetId;
-        if (!executionTargetId) {
-          throw new Error("Remote execution target is required");
-        }
-        const target = await db
-          .select()
-          .from(remoteExecutionTargets)
-          .where(
-            and(
-              eq(remoteExecutionTargets.id, executionTargetId),
-              eq(remoteExecutionTargets.companyId, agent.companyId),
-            ),
-          )
-          .then((rows) => rows[0] ?? null);
-        if (!target || target.archivedAt) {
-          throw new Error("Remote execution target is missing or archived");
-        }
-        const remoteRepoResolution = await resolveRemoteRepoForExecution({
-          resolvedWorkspace,
-          previousSessionParams,
-          runtimeSessionParams,
-          agentAdapterConfig: parseObject(agent.adapterConfig),
-        });
-        if (runtimeSessionParams && remoteRepoResolution.repoUrl && !readNonEmptyString(runtimeSessionParams.repoUrl)) {
-          runtimeSessionParams.repoUrl = remoteRepoResolution.repoUrl;
-        }
-        if (runtimeSessionParams && remoteRepoResolution.repoRef && !readNonEmptyString(runtimeSessionParams.repoRef)) {
-          runtimeSessionParams.repoRef = remoteRepoResolution.repoRef;
-        }
-        if (remoteRepoResolution.sourceCwd) {
-          await onLog(
-            "stderr",
-            `[paperclip] Inferred repo "${remoteRepoResolution.repoUrl}" from "${remoteRepoResolution.sourceCwd}" for remote execution.\n`,
-          );
-        }
-        const repoUrl = remoteRepoResolution.repoUrl;
-        if (!repoUrl) {
-          throw new Error("Remote execution requires a project workspace repo URL");
-        }
-        remoteGitIdentityForRun = await resolveGitIdentityForRemoteCommit({
-          repoRoot: remoteRepoResolution.repoRoot,
-          sourceCwd: remoteRepoResolution.sourceCwd,
-          resolvedWorkspace,
-          previousSessionParams,
-          runtimeSessionParams,
-          agentAdapterConfig: parseObject(agent.adapterConfig),
-        });
-        if (remoteGitIdentityForRun) {
-          await onLog(
-            "stderr",
-            `[paperclip] Using git identity "${remoteGitIdentityForRun.name} <${remoteGitIdentityForRun.email}>" for remote commits.\n`,
-          );
-        }
-        const baseRef = remoteRepoResolution.repoRef ?? resolvedWorkspace.repoRef ?? "main";
-        const branchName = buildRemoteBranchName({
-          issueIdentifier: issueAssigneeConfig.identifier ?? issueAssigneeConfig.id,
-          issueId: issueAssigneeConfig.id,
-          agentName: agent.name,
-        });
-        const remoteRoot = buildRemoteRoot({
-          companyId: agent.companyId,
-          issueId: issueAssigneeConfig.id,
-        });
-        remoteLeaseForRun = await remoteExecSvc.ensureActiveLease({
-          companyId: agent.companyId,
-          issueId: issueAssigneeConfig.id,
-          agentId: agent.id,
-          adapterType: agent.adapterType,
-          executionTargetId: target.id,
-          remoteRoot,
-          repoUrl,
-          baseRef,
-          branchName,
-        });
-        if (!remoteLeaseForRun) {
-          throw new Error("Failed to create remote execution lease");
-        }
-        const remoteLease = remoteLeaseForRun;
-
-        const leaseSessionParams = normalizeSessionParams(
-          sessionCodec.deserialize(remoteLease.sessionState ?? null),
-        );
-        runtimeForExecution = {
-          ...runtimeForAdapter,
-          sessionId:
-            readNonEmptyString(leaseSessionParams?.sessionId) ??
-            runtimeForAdapter.sessionId,
-          sessionParams: leaseSessionParams,
-          sessionDisplayId:
-            truncateDisplayId(
-              sessionCodec.getDisplayId
-                ? sessionCodec.getDisplayId(leaseSessionParams)
-                : readNonEmptyString(leaseSessionParams?.sessionId),
-            ) ?? runtimeForAdapter.sessionDisplayId,
-        };
-        nextSessionStateBase = {
-          previousParams: leaseSessionParams,
-          previousDisplayId: runtimeForExecution.sessionDisplayId,
-          previousLegacySessionId: runtimeForExecution.sessionId,
-        };
-        const remoteTarget = {
-          host: target.host,
-          user: target.user,
-          workerPath: target.workerPath,
-          metadata:
-            typeof target.metadata === "object" && target.metadata !== null
-              ? (target.metadata as Record<string, unknown>)
-              : null,
-        };
-        remoteTargetForRun = remoteTarget;
-        remoteRepoForRun = {
-          repoUrl: remoteLease.repoUrl,
-          baseRef: remoteLease.baseRef,
-          worktreeName: remoteLease.id,
-          branchName: remoteLease.branchName,
-          commitMessage: `paperclip: update ${issueAssigneeConfig.identifier ?? issueAssigneeConfig.id}`,
-        };
-        const remoteRepo = remoteRepoForRun;
-        let agentContextArchiveUploaded = false;
-        let remoteSetupEnsured = false;
-        const uploadedRuntimePaths = new Map<string, string>();
-
-        const remoteProcessRunner = async (
-          remoteRunId: string,
-          command: string,
-          args: string[],
-          opts: {
-            cwd: string;
-            env: Record<string, string>;
-            timeoutSec: number;
-            graceSec: number;
-            onLog: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
-            onLogError?: (err: unknown, runId: string, message: string) => void;
-            stdin?: string;
-          },
-        ) => {
-          try {
-            if (!remoteSetupEnsured) {
-              const setupScript = readRemoteSetupScript(remoteTarget.metadata);
-              if (setupScript) {
-                await onLog("stderr", "[paperclip] Running remote setup script for this lease.\n");
-                const setupWrapper =
-                  "set -eu\n" +
-                  "git_dir=\"$(git rev-parse --git-dir)\"\n" +
-                  "marker=\"$git_dir/paperclip-remote-setup-complete\"\n" +
-                  "if [ ! -f \"$marker\" ]; then\n" +
-                  setupScript
-                    .split(/\r?\n/)
-                    .map((line) => `  ${line}`)
-                    .join("\n") +
-                  "\n" +
-                  "  mkdir -p \"$(dirname \"$marker\")\"\n" +
-                  "  touch \"$marker\"\n" +
-                  "fi\n";
-                const setupProc = await runRemoteProcess({
-                  runId: `${remoteRunId}-setup`,
-                  target: remoteTarget,
-                  command: "bash",
-                  args: ["-lc", setupWrapper],
-                  cwd: undefined,
-                  repoUrl: remoteRepo.repoUrl,
-                  repoRef: remoteRepo.baseRef,
-                  worktreeName: remoteRepo.worktreeName,
-                  env: opts.env,
-                  timeoutSec: Math.max(opts.timeoutSec, 300),
-                  graceSec: opts.graceSec,
-                  onLog: opts.onLog,
-                  onMeta: onAdapterMeta,
-                });
-                if (setupProc.timedOut) {
-                  throw new Error("Remote setup script timed out");
-                }
-                if ((setupProc.exitCode ?? 0) !== 0) {
-                  const setupErrLine =
-                    setupProc.stderr
-                      .split(/\r?\n/)
-                      .map((line) => line.trim())
-                      .find(Boolean) ?? "";
-                  throw new Error(setupErrLine || `Remote setup script failed with code ${setupProc.exitCode ?? -1}`);
-                }
-              }
-              remoteSetupEnsured = true;
-            }
-
-            const runtimePathPlan = await planRemoteRuntimePathSync({
-              args,
-              remoteRoot: remoteLease.remoteRoot,
-            });
-            const materializations = [...runtimePathPlan.syncs.map((sync) => sync.materialization)];
-            for (const sync of runtimePathPlan.syncs) {
-              if (uploadedRuntimePaths.has(sync.localPath)) continue;
-              await uploadLocalPathAsRemoteArchive({
-                target: remoteTarget,
-                localPath: sync.localPath,
-                remoteArchivePath: sync.remoteArchivePath,
-                dereferenceSymlinks: sync.dereferenceSymlinks,
-                onLog: opts.onLog,
-              });
-              uploadedRuntimePaths.set(sync.localPath, sync.remoteArchivePath);
-            }
-
-            if (!agentContextArchiveUploaded) {
-              const agentContextFiles = await collectRemoteAgentContextFiles({
-                repoRoot: remoteRepoResolution.repoRoot,
-                agentAdapterConfig: parseObject(agent.adapterConfig),
-              });
-              if (agentContextFiles) {
-                try {
-                  await uploadLocalPathAsRemoteArchive({
-                    target: remoteTarget,
-                    localPath: agentContextFiles.stagingDir,
-                    remoteArchivePath: `${remoteLease.remoteRoot}/archives/agent-files.tar.gz`,
-                    onLog: opts.onLog,
-                  });
-                  materializations.push({
-                    archivePath: `${remoteLease.remoteRoot}/archives/agent-files.tar.gz`,
-                    targetKind: "worktree",
-                  });
-                  await onLog(
-                    "stderr",
-                    `[paperclip] Synced ${agentContextFiles.fileCount} agent file(s) into the remote worktree.\n`,
-                  );
-                } finally {
-                  await fs.rm(agentContextFiles.stagingDir, { recursive: true, force: true });
-                }
-              }
-              agentContextArchiveUploaded = true;
-            }
-
-            return await runRemoteProcess({
-              runId: remoteRunId,
-              target: remoteTarget,
-              command,
-              args: runtimePathPlan.args,
-              cwd: undefined,
-              repoUrl: remoteRepo.repoUrl,
-              repoRef: remoteRepo.baseRef,
-              worktreeName: remoteRepo.worktreeName,
-              materializations,
-              env: opts.env,
-              stdin: opts.stdin,
-              timeoutSec: opts.timeoutSec,
-              graceSec: opts.graceSec,
-              onLog: opts.onLog,
-              onMeta: onAdapterMeta,
-            });
-          } catch (err) {
-            opts.onLogError?.(err, remoteRunId, "remote process runner failed");
-            throw err;
-          }
-        };
-
-        if (agent.adapterType === "codex_local") {
-          adapterResult = await executeCodexWithProcessRunner(
-            {
-              runId: run.id,
-              agent,
-              runtime: runtimeForExecution,
-              config: resolvedConfig,
-              context,
-              onLog,
-              onMeta: onAdapterMeta,
-              authToken: authToken ?? undefined,
-            },
-            remoteProcessRunner,
-          );
-        } else if (agent.adapterType === "claude_local") {
-          adapterResult = await executeClaudeWithProcessRunner(
-            {
-              runId: run.id,
-              agent,
-              runtime: runtimeForExecution,
-              config: resolvedConfig,
-              context,
-              onLog,
-              onMeta: onAdapterMeta,
-              authToken: authToken ?? undefined,
-            },
-            remoteProcessRunner,
-          );
-        } else {
-          const remote = await executeRemoteRun({
-            runId: run.id,
+      context.paperclipTools = {
+        ...((context.paperclipTools as Record<string, unknown> | undefined) ?? {}),
+        telegram: {
+          sendEndpoint: "/api/agent-tools/telegram/send",
+          defaultAgentId: agent.id,
+          supportsStatusFlags: true,
+        },
+      };
+      const adapterResult = await adapter.execute({
+        runId: run.id,
+        agent,
+        runtime: runtimeForAdapter,
+        config: resolvedConfig,
+        context,
+        onLog,
+        onMeta: onAdapterMeta,
+        authToken: authToken ?? undefined,
+      });
+      const adapterManagedRuntimeServices = adapterResult.runtimeServices
+        ? await persistAdapterManagedRuntimeServices({
+            db,
             adapterType: agent.adapterType,
-            target: remoteTarget,
-            agent,
-            config: resolvedConfig,
-            runtime: {
-              sessionId: runtimeForExecution.sessionId,
-              sessionParams: runtimeForExecution.sessionParams,
+            runId: run.id,
+            agent: {
+              id: agent.id,
+              name: agent.name,
+              companyId: agent.companyId,
             },
-            onLog,
-            onMeta: onAdapterMeta,
-          });
-          adapterResult = remote.adapterResult;
+            issue: issueRef,
+            workspace: executionWorkspace,
+            reports: adapterResult.runtimeServices,
+          })
+        : [];
+      if (adapterManagedRuntimeServices.length > 0) {
+        const combinedRuntimeServices = [
+          ...runtimeServices,
+          ...adapterManagedRuntimeServices,
+        ];
+        context.paperclipRuntimeServices = combinedRuntimeServices;
+        context.paperclipRuntimePrimaryUrl =
+          combinedRuntimeServices.find((service) => readNonEmptyString(service.url))?.url ?? null;
+        await db
+          .update(heartbeatRuns)
+          .set({
+            contextSnapshot: context,
+            updatedAt: new Date(),
+          })
+          .where(eq(heartbeatRuns.id, run.id));
+        if (issueId) {
+          try {
+            await issuesSvc.addComment(
+              issueId,
+              buildWorkspaceReadyComment({
+                workspace: executionWorkspace,
+                runtimeServices: adapterManagedRuntimeServices,
+              }),
+              { agentId: agent.id },
+            );
+          } catch (err) {
+            await onLog(
+              "stderr",
+              `[paperclip] Failed to post adapter-managed runtime comment: ${err instanceof Error ? err.message : String(err)}\n`,
+            );
+          }
         }
-      } else {
-        adapterResult = await adapter.execute({
-          runId: run.id,
-          agent,
-          runtime: runtimeForExecution,
-          config: resolvedConfig,
-          context,
-          onLog,
-          onMeta: onAdapterMeta,
-          authToken: authToken ?? undefined,
-        });
-      }
-      if (changedDocuments.length > 0) {
-        await documentsSvc.markDeliveredToAgent(agent.id, changedDocuments);
       }
       const nextSessionState = resolveNextSessionState({
         codec: sessionCodec,
         adapterResult,
-        previousParams: nextSessionStateBase.previousParams,
-        previousDisplayId: nextSessionStateBase.previousDisplayId,
-        previousLegacySessionId: nextSessionStateBase.previousLegacySessionId,
+        previousParams: previousSessionParams,
+        previousDisplayId: runtimeForAdapter.sessionDisplayId,
+        previousLegacySessionId: runtimeForAdapter.sessionId,
       });
-      nextSessionState.params = mergeWorkspaceRepoIntoSessionParams(
-        nextSessionState.params,
-        resolvedWorkspace,
-      );
+      const rawUsage = normalizeUsageTotals(adapterResult.usage);
+      const sessionUsageResolution = await resolveNormalizedUsageForSession({
+        agentId: agent.id,
+        runId: run.id,
+        sessionId: nextSessionState.displayId ?? nextSessionState.legacySessionId,
+        rawUsage,
+      });
+      const normalizedUsage = sessionUsageResolution.normalizedUsage;
 
       let outcome: "succeeded" | "failed" | "cancelled" | "timed_out";
       const latestRun = await getRun(run.id);
@@ -2022,85 +2279,6 @@ export function heartbeatService(db: Db) {
         outcome = "succeeded";
       } else {
         outcome = "failed";
-      }
-
-      let remotePushError: string | null = null;
-      let remotePushSha: string | null = null;
-      if (
-        outcome === "succeeded" &&
-        remoteLeaseForRun &&
-        remoteTargetForRun &&
-        remoteRepoForRun
-      ) {
-        const pushScript =
-          "set -eu\n" +
-          "if [ -n \"$(git status --porcelain)\" ]; then\n" +
-          "  git add -A\n" +
-          "  if ! git diff --cached --quiet; then\n" +
-          "    if [ -n \"${PAPERCLIP_GIT_NAME:-}\" ] && [ -n \"${PAPERCLIP_GIT_EMAIL:-}\" ]; then\n" +
-          "      GIT_AUTHOR_NAME=\"$PAPERCLIP_GIT_NAME\" GIT_AUTHOR_EMAIL=\"$PAPERCLIP_GIT_EMAIL\" GIT_COMMITTER_NAME=\"$PAPERCLIP_GIT_NAME\" GIT_COMMITTER_EMAIL=\"$PAPERCLIP_GIT_EMAIL\" git commit -m \"$PAPERCLIP_COMMIT_MSG\"\n" +
-          "    else\n" +
-          "      git commit -m \"$PAPERCLIP_COMMIT_MSG\"\n" +
-          "    fi\n" +
-          "  fi\n" +
-          "fi\n" +
-          "sha=\"$(git rev-parse HEAD)\"\n" +
-          "git push -u origin \"HEAD:refs/heads/$PAPERCLIP_BRANCH\"\n" +
-          "printf '__PAPERCLIP_SHA__%s\\n' \"$sha\"\n";
-        const pushProc = await runRemoteProcess({
-          runId: `${run.id}-push`,
-          target: remoteTargetForRun,
-          command: "bash",
-          args: ["-lc", pushScript],
-          cwd: undefined,
-          repoUrl: remoteRepoForRun.repoUrl,
-          repoRef: remoteRepoForRun.baseRef,
-          worktreeName: remoteRepoForRun.worktreeName,
-          env: {
-            PAPERCLIP_BRANCH: remoteRepoForRun.branchName,
-            PAPERCLIP_COMMIT_MSG: remoteRepoForRun.commitMessage,
-            ...(remoteGitIdentityForRun
-              ? {
-                  PAPERCLIP_GIT_NAME: remoteGitIdentityForRun.name,
-                  PAPERCLIP_GIT_EMAIL: remoteGitIdentityForRun.email,
-                }
-              : {}),
-          },
-          timeoutSec: 120,
-          graceSec: 20,
-          onLog,
-          onMeta: onAdapterMeta,
-        });
-
-        const marker = pushProc.stdout
-          .split(/\r?\n/)
-          .map((line) => line.trim())
-          .find((line) => line.startsWith("__PAPERCLIP_SHA__"));
-        remotePushSha = marker ? marker.replace("__PAPERCLIP_SHA__", "").trim() : null;
-
-        if (pushProc.timedOut) {
-          remotePushError = "Remote branch push timed out";
-        } else if ((pushProc.exitCode ?? 0) !== 0) {
-          const pushErrLine =
-            pushProc.stderr
-              .split(/\r?\n/)
-              .map((line) => line.trim())
-              .find(Boolean) ?? "";
-          remotePushError = pushErrLine || `Remote branch push failed with code ${pushProc.exitCode ?? -1}`;
-        }
-
-        if (!remotePushError && remotePushSha) {
-          await remoteExecSvc.updateLeaseForRun(remoteLeaseForRun.id, {
-            lastPushedCommitSha: remotePushSha,
-            status: "active",
-          });
-        } else if (remotePushError) {
-          outcome = "failed";
-          await remoteExecSvc.updateLeaseForRun(remoteLeaseForRun.id, {
-            status: "error",
-          });
-          await onLog("stderr", `[paperclip] ${remotePushError}\n`);
-        }
       }
 
       let logSummary: { bytes: number; sha256?: string; compressed: boolean } | null = null;
@@ -2118,11 +2296,28 @@ export function heartbeatService(db: Db) {
               : "failed";
 
       const usageJson =
-        adapterResult.usage || adapterResult.costUsd != null
+        normalizedUsage || adapterResult.costUsd != null
           ? ({
-              ...(adapterResult.usage ?? {}),
+              ...(normalizedUsage ?? {}),
+              ...(rawUsage ? {
+                rawInputTokens: rawUsage.inputTokens,
+                rawCachedInputTokens: rawUsage.cachedInputTokens,
+                rawOutputTokens: rawUsage.outputTokens,
+              } : {}),
+              ...(sessionUsageResolution.derivedFromSessionTotals ? { usageSource: "session_delta" } : {}),
+              ...((nextSessionState.displayId ?? nextSessionState.legacySessionId)
+                ? { persistedSessionId: nextSessionState.displayId ?? nextSessionState.legacySessionId }
+                : {}),
+              sessionReused: runtimeForAdapter.sessionId != null || runtimeForAdapter.sessionDisplayId != null,
+              taskSessionReused: taskSessionForRun != null,
+              freshSession: runtimeForAdapter.sessionId == null && runtimeForAdapter.sessionDisplayId == null,
+              sessionRotated: sessionCompaction.rotate,
+              sessionRotationReason: sessionCompaction.reason,
+              provider: readNonEmptyString(adapterResult.provider) ?? "unknown",
+              biller: resolveLedgerBiller(adapterResult),
+              model: readNonEmptyString(adapterResult.model) ?? "unknown",
               ...(adapterResult.costUsd != null ? { costUsd: adapterResult.costUsd } : {}),
-              ...(adapterResult.billingType ? { billingType: adapterResult.billingType } : {}),
+              billingType: normalizeLedgerBillingType(adapterResult.billingType),
             } as Record<string, unknown>)
           : null;
 
@@ -2131,30 +2326,21 @@ export function heartbeatService(db: Db) {
         error:
           outcome === "succeeded"
             ? null
-            : remotePushError ??
-              adapterResult.errorMessage ??
-              (outcome === "timed_out" ? "Timed out" : "Adapter failed"),
+            : redactCurrentUserText(
+                adapterResult.errorMessage ?? (outcome === "timed_out" ? "Timed out" : "Adapter failed"),
+              ),
         errorCode:
           outcome === "timed_out"
             ? "timeout"
             : outcome === "cancelled"
               ? "cancelled"
               : outcome === "failed"
-                ? (remotePushError ? "remote_push_failed" : (adapterResult.errorCode ?? "adapter_failed"))
+                ? (adapterResult.errorCode ?? "adapter_failed")
                 : null,
         exitCode: adapterResult.exitCode,
         signal: adapterResult.signal,
         usageJson,
-        resultJson: {
-          ...(adapterResult.resultJson ?? {}),
-          ...(remoteLeaseForRun
-            ? {
-                remoteLeaseId: remoteLeaseForRun.id,
-                remoteBranchName: remoteRepoForRun?.branchName ?? remoteLeaseForRun.branchName,
-                remoteLastPushedCommitSha: remotePushSha,
-              }
-            : {}),
-        },
+        resultJson: adapterResult.resultJson ?? null,
         sessionIdAfter: nextSessionState.displayId ?? nextSessionState.legacySessionId,
         stdoutExcerpt,
         stderrExcerpt,
@@ -2186,14 +2372,8 @@ export function heartbeatService(db: Db) {
       if (finalizedRun) {
         await updateRuntimeState(agent, finalizedRun, adapterResult, {
           legacySessionId: nextSessionState.legacySessionId,
-        });
-        if (remoteLeaseForRun) {
-          await remoteExecSvc.updateLeaseForRun(remoteLeaseForRun.id, {
-            sessionState: nextSessionState.params,
-            lastRunId: finalizedRun.id,
-            ...(remotePushSha ? { lastPushedCommitSha: remotePushSha } : {}),
-          });
-        } else if (taskKey) {
+        }, normalizedUsage);
+        if (taskKey) {
           if (adapterResult.clearSession || (!nextSessionState.params && !nextSessionState.displayId)) {
             await clearTaskSessions(agent.companyId, agent.id, {
               taskKey,
@@ -2215,7 +2395,7 @@ export function heartbeatService(db: Db) {
       }
       await finalizeAgentStatus(agent.id, outcome);
     } catch (err) {
-      const message = err instanceof Error ? err.message : "Unknown adapter failure";
+      const message = redactCurrentUserText(err instanceof Error ? err.message : "Unknown adapter failure");
       logger.error({ err, runId }, "heartbeat execution failed");
 
       let logSummary: { bytes: number; sha256?: string; compressed: boolean } | null = null;
@@ -2257,15 +2437,10 @@ export function heartbeatService(db: Db) {
           timedOut: false,
           errorMessage: message,
         }, {
-          legacySessionId: runtimeForExecution.sessionId,
+          legacySessionId: runtimeForAdapter.sessionId,
         });
 
-        if (remoteLeaseForRun) {
-          await remoteExecSvc.updateLeaseForRun(remoteLeaseForRun.id, {
-            sessionState: nextSessionStateBase.previousParams,
-            lastRunId: failedRun.id,
-          });
-        } else if (taskKey && (previousSessionParams || previousSessionDisplayId || taskSession)) {
+        if (taskKey && (previousSessionParams || previousSessionDisplayId || taskSession)) {
           await upsertTaskSession({
             companyId: agent.companyId,
             agentId: agent.id,
@@ -2280,9 +2455,41 @@ export function heartbeatService(db: Db) {
       }
 
       await finalizeAgentStatus(agent.id, "failed");
-    } finally {
-      await startNextQueuedRunForAgent(agent.id);
     }
+    } catch (outerErr) {
+          // Setup code before adapter.execute threw (e.g. ensureRuntimeState, resolveWorkspaceForRun).
+          // The inner catch did not fire, so we must record the failure here.
+          const message = outerErr instanceof Error ? outerErr.message : "Unknown setup failure";
+          logger.error({ err: outerErr, runId }, "heartbeat execution setup failed");
+          await setRunStatus(runId, "failed", {
+            error: message,
+            errorCode: "adapter_failed",
+            finishedAt: new Date(),
+          }).catch(() => undefined);
+          await setWakeupStatus(run.wakeupRequestId, "failed", {
+            finishedAt: new Date(),
+            error: message,
+          }).catch(() => undefined);
+          const failedRun = await getRun(runId).catch(() => null);
+          if (failedRun) {
+            // Emit a run-log event so the failure is visible in the run timeline,
+            // consistent with what the inner catch block does for adapter failures.
+            await appendRunEvent(failedRun, 1, {
+              eventType: "error",
+              stream: "system",
+              level: "error",
+              message,
+            }).catch(() => undefined);
+            await releaseIssueExecutionAndPromote(failedRun).catch(() => undefined);
+          }
+          // Ensure the agent is not left stuck in "running" if the inner catch handler's
+          // DB calls threw (e.g. a transient DB error in finalizeAgentStatus).
+          await finalizeAgentStatus(run.agentId, "failed").catch(() => undefined);
+        } finally {
+          await releaseRuntimeServicesForRun(run.id).catch(() => undefined);
+          activeRunExecutions.delete(run.id);
+          await startNextQueuedRunForAgent(run.agentId);
+        }
   }
 
   async function releaseIssueExecutionAndPromote(run: typeof heartbeatRuns.$inferSelect) {
@@ -2455,10 +2662,59 @@ export function heartbeatService(db: Db) {
       triggerDetail,
       payload,
     });
-    const issueId = readNonEmptyString(enrichedContextSnapshot.issueId) ?? issueIdFromPayload;
+    let issueId = readNonEmptyString(enrichedContextSnapshot.issueId) ?? issueIdFromPayload;
+
+    // Resolve human-readable identifiers (e.g. "REF-31") to UUIDs
+    if (issueId && /^[A-Z]+-\d+$/i.test(issueId)) {
+      const resolved = await issuesSvc.getByIdentifier(issueId);
+      if (resolved) {
+        issueId = resolved.id;
+        enrichedContextSnapshot.issueId = resolved.id;
+        if (enrichedContextSnapshot.taskId === issueIdFromPayload) {
+          enrichedContextSnapshot.taskId = resolved.id;
+        }
+      }
+    }
 
     const agent = await getAgent(agentId);
     if (!agent) throw notFound("Agent not found");
+
+    const writeSkippedRequest = async (skipReason: string) => {
+      await db.insert(agentWakeupRequests).values({
+        companyId: agent.companyId,
+        agentId,
+        source,
+        triggerDetail,
+        reason: skipReason,
+        payload,
+        status: "skipped",
+        requestedByActorType: opts.requestedByActorType ?? null,
+        requestedByActorId: opts.requestedByActorId ?? null,
+        idempotencyKey: opts.idempotencyKey ?? null,
+        finishedAt: new Date(),
+      });
+    };
+
+    let projectId = readNonEmptyString(enrichedContextSnapshot.projectId);
+    if (!projectId && issueId) {
+      projectId = await db
+        .select({ projectId: issues.projectId })
+        .from(issues)
+        .where(and(eq(issues.id, issueId), eq(issues.companyId, agent.companyId)))
+        .then((rows) => rows[0]?.projectId ?? null);
+    }
+
+    const budgetBlock = await budgets.getInvocationBlock(agent.companyId, agentId, {
+      issueId,
+      projectId,
+    });
+    if (budgetBlock) {
+      await writeSkippedRequest("budget.blocked");
+      throw conflict(budgetBlock.reason, {
+        scopeType: budgetBlock.scopeType,
+        scopeId: budgetBlock.scopeId,
+      });
+    }
 
     if (
       agent.status === "paused" ||
@@ -2469,21 +2725,6 @@ export function heartbeatService(db: Db) {
     }
 
     const policy = parseHeartbeatPolicy(agent);
-    const writeSkippedRequest = async (reason: string) => {
-      await db.insert(agentWakeupRequests).values({
-        companyId: agent.companyId,
-        agentId,
-        source,
-        triggerDetail,
-        reason,
-        payload,
-        status: "skipped",
-        requestedByActorType: opts.requestedByActorType ?? null,
-        requestedByActorId: opts.requestedByActorId ?? null,
-        idempotencyKey: opts.idempotencyKey ?? null,
-        finishedAt: new Date(),
-      });
-    };
 
     if (source === "timer" && !policy.enabled) {
       await writeSkippedRequest("heartbeat.disabled");
@@ -2796,10 +3037,14 @@ export function heartbeatService(db: Db) {
     );
     const shouldQueueFollowupForCommentWake =
       Boolean(wakeCommentId) && Boolean(sameScopeRunningRun) && !sameScopeQueuedRun;
+    const shouldQueueFollowupForTelegramWake =
+      reason === "telegram_message" && Boolean(sameScopeRunningRun) && !sameScopeQueuedRun;
 
     const coalescedTargetRun =
       sameScopeQueuedRun ??
-      (shouldQueueFollowupForCommentWake ? null : sameScopeRunningRun ?? null);
+      (shouldQueueFollowupForCommentWake || shouldQueueFollowupForTelegramWake
+        ? null
+        : sameScopeRunningRun ?? null);
 
     if (coalescedTargetRun) {
       const mergedContextSnapshot = mergeCoalescedContextSnapshot(
@@ -2893,10 +3138,209 @@ export function heartbeatService(db: Db) {
     return newRun;
   }
 
+  async function listProjectScopedRunIds(companyId: string, projectId: string) {
+    const runIssueId = sql<string | null>`${heartbeatRuns.contextSnapshot} ->> 'issueId'`;
+    const effectiveProjectId = sql<string | null>`coalesce(${heartbeatRuns.contextSnapshot} ->> 'projectId', ${issues.projectId}::text)`;
+
+    const rows = await db
+      .selectDistinctOn([heartbeatRuns.id], { id: heartbeatRuns.id })
+      .from(heartbeatRuns)
+      .leftJoin(
+        issues,
+        and(
+          eq(issues.companyId, companyId),
+          sql`${issues.id}::text = ${runIssueId}`,
+        ),
+      )
+      .where(
+        and(
+          eq(heartbeatRuns.companyId, companyId),
+          inArray(heartbeatRuns.status, ["queued", "running"]),
+          sql`${effectiveProjectId} = ${projectId}`,
+        ),
+      );
+
+    return rows.map((row) => row.id);
+  }
+
+  async function listProjectScopedWakeupIds(companyId: string, projectId: string) {
+    const wakeIssueId = sql<string | null>`${agentWakeupRequests.payload} ->> 'issueId'`;
+    const effectiveProjectId = sql<string | null>`coalesce(${agentWakeupRequests.payload} ->> 'projectId', ${issues.projectId}::text)`;
+
+    const rows = await db
+      .selectDistinctOn([agentWakeupRequests.id], { id: agentWakeupRequests.id })
+      .from(agentWakeupRequests)
+      .leftJoin(
+        issues,
+        and(
+          eq(issues.companyId, companyId),
+          sql`${issues.id}::text = ${wakeIssueId}`,
+        ),
+      )
+      .where(
+        and(
+          eq(agentWakeupRequests.companyId, companyId),
+          inArray(agentWakeupRequests.status, ["queued", "deferred_issue_execution"]),
+          sql`${agentWakeupRequests.runId} is null`,
+          sql`${effectiveProjectId} = ${projectId}`,
+        ),
+      );
+
+    return rows.map((row) => row.id);
+  }
+
+  async function cancelPendingWakeupsForBudgetScope(scope: BudgetEnforcementScope) {
+    const now = new Date();
+    let wakeupIds: string[] = [];
+
+    if (scope.scopeType === "company") {
+      wakeupIds = await db
+        .select({ id: agentWakeupRequests.id })
+        .from(agentWakeupRequests)
+        .where(
+          and(
+            eq(agentWakeupRequests.companyId, scope.companyId),
+            inArray(agentWakeupRequests.status, ["queued", "deferred_issue_execution"]),
+            sql`${agentWakeupRequests.runId} is null`,
+          ),
+        )
+        .then((rows) => rows.map((row) => row.id));
+    } else if (scope.scopeType === "agent") {
+      wakeupIds = await db
+        .select({ id: agentWakeupRequests.id })
+        .from(agentWakeupRequests)
+        .where(
+          and(
+            eq(agentWakeupRequests.companyId, scope.companyId),
+            eq(agentWakeupRequests.agentId, scope.scopeId),
+            inArray(agentWakeupRequests.status, ["queued", "deferred_issue_execution"]),
+            sql`${agentWakeupRequests.runId} is null`,
+          ),
+        )
+        .then((rows) => rows.map((row) => row.id));
+    } else {
+      wakeupIds = await listProjectScopedWakeupIds(scope.companyId, scope.scopeId);
+    }
+
+    if (wakeupIds.length === 0) return 0;
+
+    await db
+      .update(agentWakeupRequests)
+      .set({
+        status: "cancelled",
+        finishedAt: now,
+        error: "Cancelled due to budget pause",
+        updatedAt: now,
+      })
+      .where(inArray(agentWakeupRequests.id, wakeupIds));
+
+    return wakeupIds.length;
+  }
+
+  async function cancelRunInternal(runId: string, reason = "Cancelled by control plane") {
+    const run = await getRun(runId);
+    if (!run) throw notFound("Heartbeat run not found");
+    if (run.status !== "running" && run.status !== "queued") return run;
+
+    const running = runningProcesses.get(run.id);
+    if (running) {
+      running.child.kill("SIGTERM");
+      const graceMs = Math.max(1, running.graceSec) * 1000;
+      setTimeout(() => {
+        if (!running.child.killed) {
+          running.child.kill("SIGKILL");
+        }
+      }, graceMs);
+    }
+
+    const cancelled = await setRunStatus(run.id, "cancelled", {
+      finishedAt: new Date(),
+      error: reason,
+      errorCode: "cancelled",
+    });
+
+    await setWakeupStatus(run.wakeupRequestId, "cancelled", {
+      finishedAt: new Date(),
+      error: reason,
+    });
+
+    if (cancelled) {
+      await appendRunEvent(cancelled, 1, {
+        eventType: "lifecycle",
+        stream: "system",
+        level: "warn",
+        message: "run cancelled",
+      });
+      await releaseIssueExecutionAndPromote(cancelled);
+    }
+
+    runningProcesses.delete(run.id);
+    await finalizeAgentStatus(run.agentId, "cancelled");
+    await startNextQueuedRunForAgent(run.agentId);
+    return cancelled;
+  }
+
+  async function cancelActiveForAgentInternal(agentId: string, reason = "Cancelled due to agent pause") {
+    const runs = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.agentId, agentId), inArray(heartbeatRuns.status, ["queued", "running"])));
+
+    for (const run of runs) {
+      await setRunStatus(run.id, "cancelled", {
+        finishedAt: new Date(),
+        error: reason,
+        errorCode: "cancelled",
+      });
+
+      await setWakeupStatus(run.wakeupRequestId, "cancelled", {
+        finishedAt: new Date(),
+        error: reason,
+      });
+
+      const running = runningProcesses.get(run.id);
+      if (running) {
+        running.child.kill("SIGTERM");
+        runningProcesses.delete(run.id);
+      }
+      await releaseIssueExecutionAndPromote(run);
+    }
+
+    return runs.length;
+  }
+
+  async function cancelBudgetScopeWork(scope: BudgetEnforcementScope) {
+    if (scope.scopeType === "agent") {
+      await cancelActiveForAgentInternal(scope.scopeId, "Cancelled due to budget pause");
+      await cancelPendingWakeupsForBudgetScope(scope);
+      return;
+    }
+
+    const runIds =
+      scope.scopeType === "company"
+        ? await db
+          .select({ id: heartbeatRuns.id })
+          .from(heartbeatRuns)
+          .where(
+            and(
+              eq(heartbeatRuns.companyId, scope.companyId),
+              inArray(heartbeatRuns.status, ["queued", "running"]),
+            ),
+          )
+          .then((rows) => rows.map((row) => row.id))
+        : await listProjectScopedRunIds(scope.companyId, scope.scopeId);
+
+    for (const runId of runIds) {
+      await cancelRunInternal(runId, "Cancelled due to budget pause");
+    }
+
+    await cancelPendingWakeupsForBudgetScope(scope);
+  }
+
   return {
-    list: (companyId: string, agentId?: string, limit?: number) => {
+    list: async (companyId: string, agentId?: string, limit?: number) => {
       const query = db
-        .select()
+        .select(heartbeatRunListColumns)
         .from(heartbeatRuns)
         .where(
           agentId
@@ -2905,10 +3349,11 @@ export function heartbeatService(db: Db) {
         )
         .orderBy(desc(heartbeatRuns.createdAt));
 
-      if (limit) {
-        return query.limit(limit);
-      }
-      return query;
+      const rows = limit ? await query.limit(limit) : await query;
+      return rows.map((row) => ({
+        ...row,
+        resultJson: summarizeHeartbeatRunResultJson(row.resultJson),
+      }));
     },
 
     getRun,
@@ -3004,6 +3449,7 @@ export function heartbeatService(db: Db) {
         store: run.logStore,
         logRef: run.logRef,
         ...result,
+        content: redactCurrentUserText(result.content),
       };
     },
 
@@ -3026,21 +3472,47 @@ export function heartbeatService(db: Db) {
 
     reapOrphanedRuns,
 
+    resumeQueuedRuns,
+
     tickTimers: async (now = new Date()) => {
       const allAgents = await db.select().from(agents);
       let checked = 0;
       let enqueued = 0;
       let skipped = 0;
+      let scheduledIssuesProcessed = 0;
 
       for (const agent of allAgents) {
         if (agent.status === "paused" || agent.status === "terminated" || agent.status === "pending_approval") continue;
         const policy = parseHeartbeatPolicy(agent);
-        if (!policy.enabled || policy.intervalSec <= 0) continue;
+        if (!policy.enabled) continue;
+
+        const hasCron = !!policy.cronExpression;
+        const hasInterval = policy.intervalSec > 0;
+        if (!hasCron && !hasInterval) continue;
 
         checked += 1;
-        const baseline = new Date(agent.lastHeartbeatAt ?? agent.createdAt).getTime();
-        const elapsedMs = now.getTime() - baseline;
-        if (elapsedMs < policy.intervalSec * 1000) continue;
+        const baseline = new Date(agent.lastHeartbeatAt ?? agent.createdAt);
+
+        let shouldWake = false;
+        let reason = "interval_elapsed";
+
+        if (hasCron) {
+          // Cron-based: check if there's a cron tick between baseline and now
+          const nextTick = nextCronTickFromExpression(policy.cronExpression!, baseline);
+          if (nextTick && nextTick.getTime() <= now.getTime()) {
+            shouldWake = true;
+            reason = "cron_schedule";
+          }
+        } else if (hasInterval) {
+          // Legacy interval-based: simple elapsed time check
+          const elapsedMs = now.getTime() - baseline.getTime();
+          if (elapsedMs >= policy.intervalSec * 1000) {
+            shouldWake = true;
+            reason = "interval_elapsed";
+          }
+        }
+
+        if (!shouldWake) continue;
 
         const run = await enqueueWakeup(agent.id, {
           source: "timer",
@@ -3050,7 +3522,8 @@ export function heartbeatService(db: Db) {
           requestedByActorId: "heartbeat_scheduler",
           contextSnapshot: {
             source: "scheduler",
-            reason: "interval_elapsed",
+            reason,
+            ...(hasCron ? { cronExpression: policy.cronExpression } : {}),
             now: now.toISOString(),
           },
         });
@@ -3058,80 +3531,88 @@ export function heartbeatService(db: Db) {
         else skipped += 1;
       }
 
-      return { checked, enqueued, skipped };
-    },
+      const scheduledIssues = await db
+        .select({
+          id: issues.id,
+          assigneeAgentId: issues.assigneeAgentId,
+        })
+        .from(issues)
+        .where(
+          and(
+            lte(issues.scheduledAt, now),
+            isNotNull(issues.scheduledAt),
+            notInArray(issues.status, ["done", "cancelled"]),
+            isNotNull(issues.assigneeAgentId),
+          ),
+        );
 
-    cancelRun: async (runId: string) => {
-      const run = await getRun(runId);
-      if (!run) throw notFound("Heartbeat run not found");
-      if (run.status !== "running" && run.status !== "queued") return run;
+      if (scheduledIssues.length > 0) {
+        logger.info(
+          { scheduledIssueCount: scheduledIssues.length, now: now.toISOString() },
+          "tickTimers: processing scheduled issues",
+        );
+      }
 
-      const running = runningProcesses.get(run.id);
-      if (running) {
-        running.child.kill("SIGTERM");
-        const graceMs = Math.max(1, running.graceSec) * 1000;
-        setTimeout(() => {
-          if (!running.child.killed) {
-            running.child.kill("SIGKILL");
+      for (const issue of scheduledIssues) {
+        try {
+          const assigneeAgentId = issue.assigneeAgentId;
+          if (!assigneeAgentId) {
+            logger.warn({ issueId: issue.id }, "tickTimers: scheduled issue missing assignee");
+            continue;
           }
-        }, graceMs);
-      }
 
-      const cancelled = await setRunStatus(run.id, "cancelled", {
-        finishedAt: new Date(),
-        error: "Cancelled by control plane",
-        errorCode: "cancelled",
-      });
+          logger.info(
+            { issueId: issue.id, assigneeAgentId, now: now.toISOString() },
+            "tickTimers: waking agent for scheduled issue",
+          );
 
-      await setWakeupStatus(run.wakeupRequestId, "cancelled", {
-        finishedAt: new Date(),
-        error: "Cancelled by control plane",
-      });
+          const run = await enqueueWakeup(assigneeAgentId, {
+            source: "automation",
+            triggerDetail: "system",
+            reason: "scheduled_issue_ready",
+            contextSnapshot: {
+              issueId: issue.id,
+              wakeReason: "scheduled_issue_ready",
+            },
+            requestedByActorType: "system",
+            requestedByActorId: "scheduled_issue_scheduler",
+          });
 
-      if (cancelled) {
-        await appendRunEvent(cancelled, 1, {
-          eventType: "lifecycle",
-          stream: "system",
-          level: "warn",
-          message: "run cancelled",
-        });
-        await releaseIssueExecutionAndPromote(cancelled);
-      }
+          if (!run) {
+            logger.warn(
+              { issueId: issue.id, assigneeAgentId },
+              "tickTimers: scheduled issue wakeup skipped",
+            );
+            continue;
+          }
 
-      runningProcesses.delete(run.id);
-      await finalizeAgentStatus(run.agentId, "cancelled");
-      await startNextQueuedRunForAgent(run.agentId);
-      return cancelled;
-    },
+          await db
+            .update(issues)
+            .set({ scheduledAt: null })
+            .where(eq(issues.id, issue.id));
 
-    cancelActiveForAgent: async (agentId: string) => {
-      const runs = await db
-        .select()
-        .from(heartbeatRuns)
-        .where(and(eq(heartbeatRuns.agentId, agentId), inArray(heartbeatRuns.status, ["queued", "running"])));
+          scheduledIssuesProcessed += 1;
 
-      for (const run of runs) {
-        await setRunStatus(run.id, "cancelled", {
-          finishedAt: new Date(),
-          error: "Cancelled due to agent pause",
-          errorCode: "cancelled",
-        });
-
-        await setWakeupStatus(run.wakeupRequestId, "cancelled", {
-          finishedAt: new Date(),
-          error: "Cancelled due to agent pause",
-        });
-
-        const running = runningProcesses.get(run.id);
-        if (running) {
-          running.child.kill("SIGTERM");
-          runningProcesses.delete(run.id);
+          logger.info(
+            { issueId: issue.id, assigneeAgentId, runId: run.id },
+            "tickTimers: scheduled issue processed",
+          );
+        } catch (err) {
+          logger.error(
+            { err, issueId: issue.id, assigneeAgentId: issue.assigneeAgentId },
+            "tickTimers: scheduled issue processing failed",
+          );
         }
-        await releaseIssueExecutionAndPromote(run);
       }
 
-      return runs.length;
+      return { checked, enqueued, skipped, scheduledIssuesProcessed };
     },
+
+    cancelRun: (runId: string) => cancelRunInternal(runId),
+
+    cancelActiveForAgent: (agentId: string) => cancelActiveForAgentInternal(agentId),
+
+    cancelBudgetScopeWork,
 
     getActiveRunForAgent: async (agentId: string) => {
       const [run] = await db

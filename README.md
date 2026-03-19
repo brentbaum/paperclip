@@ -218,7 +218,8 @@ By default, agents run on scheduled heartbeats and event-based triggers (task as
 ## Development
 
 ```bash
-pnpm dev              # Full dev (API + UI)
+pnpm dev              # Full dev (API + UI, watch mode)
+pnpm dev:once         # Full dev without file watching
 pnpm dev:server       # Server only
 pnpm build            # Build all
 pnpm typecheck        # Type checking
@@ -238,7 +239,7 @@ See [doc/DEVELOPING.md](doc/DEVELOPING.md) for the full development guide.
 - ⚪ ClipMart - buy and sell entire agent companies
 - ⚪ Easy agent configurations / easier to understand
 - ⚪ Better support for harness engineering
-- ⚪ Plugin system (e.g. if you want to add a knowledgebase, custom tracing, queues, etc)
+- 🟢 Plugin system (e.g. if you want to add a knowledgebase, custom tracing, queues, etc)
 - ⚪ Better docs
 
 <br/>
@@ -246,8 +247,6 @@ See [doc/DEVELOPING.md](doc/DEVELOPING.md) for the full development guide.
 ## Contributing
 
 We welcome contributions. See the [contributing guide](CONTRIBUTING.md) for details.
-
-<!-- TODO: add CONTRIBUTING.md -->
 
 <br/>
 

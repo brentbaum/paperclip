@@ -1,9 +1,11 @@
 export type HealthStatus = {
   status: "ok";
+  version?: string;
   deploymentMode?: "local_trusted" | "authenticated";
   deploymentExposure?: "private" | "public";
   authReady?: boolean;
   bootstrapStatus?: "ready" | "bootstrap_pending";
+  bootstrapInviteActive?: boolean;
   features?: {
     companyDeletionEnabled?: boolean;
   };

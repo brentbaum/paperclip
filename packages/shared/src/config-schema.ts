@@ -56,6 +56,7 @@ export const serverConfigSchema = z.object({
 export const authConfigSchema = z.object({
   baseUrlMode: z.enum(AUTH_BASE_URL_MODES).default("auto"),
   publicBaseUrl: z.string().url().optional(),
+  disableSignUp: z.boolean().default(false),
 });
 
 export const storageLocalDiskConfigSchema = z.object({
@@ -95,6 +96,17 @@ export const secretsConfigSchema = z.object({
   }),
 });
 
+export const sttConfigSchema = z.object({
+  provider: z.enum(["local_sherpa", "nvidia_parakeet"]).default("local_sherpa"),
+  // Local sherpa-onnx config
+  modelDir: z.string().optional(),
+  numThreads: z.number().int().min(1).default(2),
+  // NVIDIA cloud API config (legacy)
+  nvidiaApiKey: z.string().min(1).optional(),
+  nvidiaModel: z.string().default("nvidia/parakeet-tdt-0.6b-v2"),
+  nvidiaBaseUrl: z.string().url().default("https://integrate.api.nvidia.com/v1"),
+});
+
 export const telegramConfigSchema = z.object({
   botToken: z.string().min(1).optional(),
   chatId: z.string().min(1).optional(),
@@ -112,6 +124,7 @@ export const paperclipConfigSchema = z
     server: serverConfigSchema,
     auth: authConfigSchema.default({
       baseUrlMode: "auto",
+      disableSignUp: false,
     }),
     storage: storageConfigSchema.default({
       provider: "local_disk",
@@ -133,6 +146,7 @@ export const paperclipConfigSchema = z
       },
     }),
     telegram: telegramConfigSchema.optional(),
+    stt: sttConfigSchema.optional(),
   })
   .superRefine((value, ctx) => {
     if (value.server.deploymentMode === "local_trusted") {
@@ -184,4 +198,5 @@ export type SecretsLocalEncryptedConfig = z.infer<typeof secretsLocalEncryptedCo
 export type AuthConfig = z.infer<typeof authConfigSchema>;
 export type ConfigMeta = z.infer<typeof configMetaSchema>;
 export type TelegramConfig = z.infer<typeof telegramConfigSchema>;
+export type SttConfig = z.infer<typeof sttConfigSchema>;
 export type DatabaseBackupConfig = z.infer<typeof databaseBackupConfigSchema>;

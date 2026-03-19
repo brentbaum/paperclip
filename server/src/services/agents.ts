@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
-import { and, desc, eq, inArray, ne } from "drizzle-orm";
+import { and, desc, eq, gte, inArray, lt, ne, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   agents,
@@ -8,6 +8,7 @@ import {
   agentRuntimeState,
   agentTaskSessions,
   agentWakeupRequests,
+  costEvents,
   heartbeatRunEvents,
   heartbeatRuns,
 } from "@paperclipai/db";
@@ -49,6 +50,16 @@ interface RevisionMetadata {
 
 interface UpdateAgentOptions {
   recordRevision?: RevisionMetadata;
+}
+
+interface AgentShortnameRow {
+  id: string;
+  name: string;
+  status: string;
+}
+
+interface AgentShortnameCollisionOptions {
+  excludeAgentId?: string | null;
 }
 
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
@@ -140,7 +151,47 @@ function configPatchFromSnapshot(snapshot: unknown): Partial<typeof agents.$infe
   };
 }
 
+export function hasAgentShortnameCollision(
+  candidateName: string,
+  existingAgents: AgentShortnameRow[],
+  options?: AgentShortnameCollisionOptions,
+): boolean {
+  const candidateShortname = normalizeAgentUrlKey(candidateName);
+  if (!candidateShortname) return false;
+
+  return existingAgents.some((agent) => {
+    if (agent.status === "terminated") return false;
+    if (options?.excludeAgentId && agent.id === options.excludeAgentId) return false;
+    return normalizeAgentUrlKey(agent.name) === candidateShortname;
+  });
+}
+
+export function deduplicateAgentName(
+  candidateName: string,
+  existingAgents: AgentShortnameRow[],
+): string {
+  if (!hasAgentShortnameCollision(candidateName, existingAgents)) {
+    return candidateName;
+  }
+  for (let i = 2; i <= 100; i++) {
+    const suffixed = `${candidateName} ${i}`;
+    if (!hasAgentShortnameCollision(suffixed, existingAgents)) {
+      return suffixed;
+    }
+  }
+  return `${candidateName} ${Date.now()}`;
+}
+
 export function agentService(db: Db) {
+  function currentUtcMonthWindow(now = new Date()) {
+    const year = now.getUTCFullYear();
+    const month = now.getUTCMonth();
+    return {
+      start: new Date(Date.UTC(year, month, 1, 0, 0, 0, 0)),
+      end: new Date(Date.UTC(year, month + 1, 1, 0, 0, 0, 0)),
+    };
+  }
+
   function withUrlKey<T extends { id: string; name: string }>(row: T) {
     return {
       ...row,
@@ -155,13 +206,47 @@ export function agentService(db: Db) {
     });
   }
 
+  async function getMonthlySpendByAgentIds(companyId: string, agentIds: string[]) {
+    if (agentIds.length === 0) return new Map<string, number>();
+    const { start, end } = currentUtcMonthWindow();
+    const rows = await db
+      .select({
+        agentId: costEvents.agentId,
+        spentMonthlyCents: sql<number>`coalesce(sum(${costEvents.costCents}), 0)::int`,
+      })
+      .from(costEvents)
+      .where(
+        and(
+          eq(costEvents.companyId, companyId),
+          inArray(costEvents.agentId, agentIds),
+          gte(costEvents.occurredAt, start),
+          lt(costEvents.occurredAt, end),
+        ),
+      )
+      .groupBy(costEvents.agentId);
+    return new Map(rows.map((row) => [row.agentId, Number(row.spentMonthlyCents ?? 0)]));
+  }
+
+  async function hydrateAgentSpend<T extends { id: string; companyId: string; spentMonthlyCents: number }>(rows: T[]) {
+    const agentIds = rows.map((row) => row.id);
+    const companyId = rows[0]?.companyId;
+    if (!companyId || agentIds.length === 0) return rows;
+    const spendByAgentId = await getMonthlySpendByAgentIds(companyId, agentIds);
+    return rows.map((row) => ({
+      ...row,
+      spentMonthlyCents: spendByAgentId.get(row.id) ?? 0,
+    }));
+  }
+
   async function getById(id: string) {
     const row = await db
       .select()
       .from(agents)
       .where(eq(agents.id, id))
       .then((rows) => rows[0] ?? null);
-    return row ? normalizeAgentRow(row) : null;
+    if (!row) return null;
+    const [hydrated] = await hydrateAgentSpend([row]);
+    return normalizeAgentRow(hydrated);
   }
 
   async function ensureManager(companyId: string, managerId: string) {
@@ -182,6 +267,31 @@ export function agentService(db: Db) {
       if (cursor === agentId) throw unprocessable("Reporting relationship would create cycle");
       const next = await getById(cursor);
       cursor = next?.reportsTo ?? null;
+    }
+  }
+
+  async function assertCompanyShortnameAvailable(
+    companyId: string,
+    candidateName: string,
+    options?: AgentShortnameCollisionOptions,
+  ) {
+    const candidateShortname = normalizeAgentUrlKey(candidateName);
+    if (!candidateShortname) return;
+
+    const existingAgents = await db
+      .select({
+        id: agents.id,
+        name: agents.name,
+        status: agents.status,
+      })
+      .from(agents)
+      .where(eq(agents.companyId, companyId));
+
+    const hasCollision = hasAgentShortnameCollision(candidateName, existingAgents, options);
+    if (hasCollision) {
+      throw conflict(
+        `Agent shortname '${candidateShortname}' is already in use in this company`,
+      );
     }
   }
 
@@ -210,6 +320,14 @@ export function agentService(db: Db) {
         await ensureManager(existing.companyId, data.reportsTo);
       }
       await assertNoCycle(id, data.reportsTo);
+    }
+
+    if (data.name !== undefined) {
+      const previousShortname = normalizeAgentUrlKey(existing.name);
+      const nextShortname = normalizeAgentUrlKey(data.name);
+      if (previousShortname !== nextShortname) {
+        await assertCompanyShortnameAvailable(existing.companyId, data.name, { excludeAgentId: id });
+      }
     }
 
     const normalizedPatch = { ...data } as Partial<typeof agents.$inferInsert>;
@@ -257,7 +375,8 @@ export function agentService(db: Db) {
         conditions.push(ne(agents.status, "terminated"));
       }
       const rows = await db.select().from(agents).where(and(...conditions));
-      return rows.map(normalizeAgentRow);
+      const hydrated = await hydrateAgentSpend(rows);
+      return hydrated.map(normalizeAgentRow);
     },
 
     getById,
@@ -267,11 +386,17 @@ export function agentService(db: Db) {
         await ensureManager(companyId, data.reportsTo);
       }
 
+      const existingAgents = await db
+        .select({ id: agents.id, name: agents.name, status: agents.status })
+        .from(agents)
+        .where(eq(agents.companyId, companyId));
+      const uniqueName = deduplicateAgentName(data.name, existingAgents);
+
       const role = data.role ?? "general";
       const normalizedPermissions = normalizeAgentPermissions(data.permissions, role);
       const created = await db
         .insert(agents)
-        .values({ ...data, companyId, role, permissions: normalizedPermissions })
+        .values({ ...data, name: uniqueName, companyId, role, permissions: normalizedPermissions })
         .returning()
         .then((rows) => rows[0]);
 
@@ -280,14 +405,19 @@ export function agentService(db: Db) {
 
     update: updateAgent,
 
-    pause: async (id: string) => {
+    pause: async (id: string, reason: "manual" | "budget" | "system" = "manual") => {
       const existing = await getById(id);
       if (!existing) return null;
       if (existing.status === "terminated") throw conflict("Cannot pause terminated agent");
 
       const updated = await db
         .update(agents)
-        .set({ status: "paused", updatedAt: new Date() })
+        .set({
+          status: "paused",
+          pauseReason: reason,
+          pausedAt: new Date(),
+          updatedAt: new Date(),
+        })
         .where(eq(agents.id, id))
         .returning()
         .then((rows) => rows[0] ?? null);
@@ -304,7 +434,12 @@ export function agentService(db: Db) {
 
       const updated = await db
         .update(agents)
-        .set({ status: "idle", updatedAt: new Date() })
+        .set({
+          status: "idle",
+          pauseReason: null,
+          pausedAt: null,
+          updatedAt: new Date(),
+        })
         .where(eq(agents.id, id))
         .returning()
         .then((rows) => rows[0] ?? null);
@@ -317,7 +452,12 @@ export function agentService(db: Db) {
 
       await db
         .update(agents)
-        .set({ status: "terminated", updatedAt: new Date() })
+        .set({
+          status: "terminated",
+          pauseReason: null,
+          pausedAt: null,
+          updatedAt: new Date(),
+        })
         .where(eq(agents.id, id));
 
       await db

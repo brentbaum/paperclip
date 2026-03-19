@@ -10,7 +10,13 @@ import {
 import { isUuidLike } from "@paperclipai/shared";
 import { forbidden } from "../errors.js";
 import { validate } from "../middleware/validate.js";
-import { accessService, companyPortabilityService, companyService, logActivity } from "../services/index.js";
+import {
+  accessService,
+  budgetService,
+  companyPortabilityService,
+  companyService,
+  logActivity,
+} from "../services/index.js";
 import { assertBoard, assertCompanyAccess, getActorInfo } from "./authz.js";
 
 export function companyRoutes(db: Db) {
@@ -18,6 +24,7 @@ export function companyRoutes(db: Db) {
   const svc = companyService(db);
   const portability = companyPortabilityService(db);
   const access = accessService(db);
+  const budgets = budgetService(db);
 
   // Infer companyId from bearer token when agents drop it from the URL
   router.param("companyId", (req, res, next, rawId) => {
@@ -53,6 +60,13 @@ export function companyRoutes(db: Db) {
     }
     const filtered = Object.fromEntries(Object.entries(stats).filter(([companyId]) => allowed.has(companyId)));
     res.json(filtered);
+  });
+
+  // Common malformed path when companyId is empty in "/api/companies/{companyId}/issues".
+  router.get("/issues", (_req, res) => {
+    res.status(400).json({
+      error: "Missing companyId in path. Use /api/companies/{companyId}/issues.",
+    });
   });
 
   router.get("/:companyId", async (req, res) => {
@@ -127,6 +141,18 @@ export function companyRoutes(db: Db) {
       entityId: company.id,
       details: { name: company.name },
     });
+    if (company.budgetMonthlyCents > 0) {
+      await budgets.upsertPolicy(
+        company.id,
+        {
+          scopeType: "company",
+          scopeId: company.id,
+          amount: company.budgetMonthlyCents,
+          windowKind: "calendar_month_utc",
+        },
+        req.actor.userId ?? "board",
+      );
+    }
     res.status(201).json(company);
   });
 

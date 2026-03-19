@@ -4,10 +4,14 @@ import type { Db } from "@paperclipai/db";
 import {
   addIssueCommentSchema,
   createIssueAttachmentMetadataSchema,
+  createIssueWorkProductSchema,
   createIssueLabelSchema,
   checkoutIssueSchema,
   createIssueSchema,
   linkIssueApprovalSchema,
+  issueDocumentKeySchema,
+  updateIssueWorkProductSchema,
+  upsertIssueDocumentSchema,
   updateIssueSchema,
 } from "@paperclipai/shared";
 import type { StorageService } from "../storage/types.js";
@@ -15,25 +19,23 @@ import { validate } from "../middleware/validate.js";
 import {
   accessService,
   agentService,
+  executionWorkspaceService,
   goalService,
   heartbeatService,
   issueApprovalService,
   issueService,
+  documentService,
   logActivity,
   projectService,
+  workProductService,
 } from "../services/index.js";
 import { logger } from "../middleware/logger.js";
 import { forbidden, HttpError, unauthorized } from "../errors.js";
 import { assertCompanyAccess, getActorInfo } from "./authz.js";
+import { shouldWakeAssigneeOnCheckout } from "./issues-checkout-wakeup.js";
+import { isAllowedContentType, MAX_ATTACHMENT_BYTES } from "../attachment-types.js";
 
-const MAX_ATTACHMENT_BYTES = Number(process.env.PAPERCLIP_ATTACHMENT_MAX_BYTES) || 10 * 1024 * 1024;
-const ALLOWED_ATTACHMENT_CONTENT_TYPES = new Set([
-  "image/png",
-  "image/jpeg",
-  "image/jpg",
-  "image/webp",
-  "image/gif",
-]);
+const MAX_ISSUE_COMMENT_LIMIT = 500;
 
 export function issueRoutes(db: Db, storage: StorageService) {
   const router = Router();
@@ -44,6 +46,9 @@ export function issueRoutes(db: Db, storage: StorageService) {
   const projectsSvc = projectService(db);
   const goalsSvc = goalService(db);
   const issueApprovalsSvc = issueApprovalService(db);
+  const executionWorkspacesSvc = executionWorkspaceService(db);
+  const workProductsSvc = workProductService(db);
+  const documentsSvc = documentService(db);
   const upload = multer({
     storage: multer.memoryStorage(),
     limits: { fileSize: MAX_ATTACHMENT_BYTES, files: 1 },
@@ -183,29 +188,42 @@ export function issueRoutes(db: Db, storage: StorageService) {
     }
   });
 
-  // Alias: agents often call GET /issues/ without the company prefix.
-  // Redirect to the company-scoped route using the actor's companyId.
-  router.get("/issues", async (req, res) => {
-    const companyId = req.actor?.companyId ?? req.actor?.companyIds?.[0];
-    if (!companyId) {
-      res.status(400).json({ error: "Cannot infer company. Use GET /api/companies/{companyId}/issues instead." });
-      return;
-    }
-    const qs = new URL(req.originalUrl, "http://localhost").search;
-    res.redirect(307, `/api/companies/${companyId}/issues${qs}`);
+  // Common malformed path when companyId is empty in "/api/companies/{companyId}/issues".
+  router.get("/issues", (_req, res) => {
+    res.status(400).json({
+      error: "Missing companyId in path. Use /api/companies/{companyId}/issues.",
+    });
   });
 
   router.get("/companies/:companyId/issues", async (req, res) => {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
     const assigneeUserFilterRaw = req.query.assigneeUserId as string | undefined;
+    const touchedByUserFilterRaw = req.query.touchedByUserId as string | undefined;
+    const unreadForUserFilterRaw = req.query.unreadForUserId as string | undefined;
     const assigneeUserId =
       assigneeUserFilterRaw === "me" && req.actor.type === "board"
         ? req.actor.userId
         : assigneeUserFilterRaw;
+    const touchedByUserId =
+      touchedByUserFilterRaw === "me" && req.actor.type === "board"
+        ? req.actor.userId
+        : touchedByUserFilterRaw;
+    const unreadForUserId =
+      unreadForUserFilterRaw === "me" && req.actor.type === "board"
+        ? req.actor.userId
+        : unreadForUserFilterRaw;
 
     if (assigneeUserFilterRaw === "me" && (!assigneeUserId || req.actor.type !== "board")) {
       res.status(403).json({ error: "assigneeUserId=me requires board authentication" });
+      return;
+    }
+    if (touchedByUserFilterRaw === "me" && (!touchedByUserId || req.actor.type !== "board")) {
+      res.status(403).json({ error: "touchedByUserId=me requires board authentication" });
+      return;
+    }
+    if (unreadForUserFilterRaw === "me" && (!unreadForUserId || req.actor.type !== "board")) {
+      res.status(403).json({ error: "unreadForUserId=me requires board authentication" });
       return;
     }
 
@@ -213,7 +231,10 @@ export function issueRoutes(db: Db, storage: StorageService) {
       status: req.query.status as string | undefined,
       assigneeAgentId: req.query.assigneeAgentId as string | undefined,
       assigneeUserId,
+      touchedByUserId,
+      unreadForUserId,
       projectId: req.query.projectId as string | undefined,
+      parentId: req.query.parentId as string | undefined,
       labelId: req.query.labelId as string | undefined,
       q: req.query.q as string | undefined,
     });
@@ -282,16 +303,379 @@ export function issueRoutes(db: Db, storage: StorageService) {
       return;
     }
     assertCompanyAccess(req, issue.companyId);
-    const [ancestors, project, goal, mentionedProjectIds] = await Promise.all([
+    const [ancestors, project, goal, mentionedProjectIds, documentPayload] = await Promise.all([
       svc.getAncestors(issue.id),
       issue.projectId ? projectsSvc.getById(issue.projectId) : null,
-      issue.goalId ? goalsSvc.getById(issue.goalId) : null,
+      issue.goalId
+        ? goalsSvc.getById(issue.goalId)
+        : !issue.projectId
+          ? goalsSvc.getDefaultCompanyGoal(issue.companyId)
+          : null,
       svc.findMentionedProjectIds(issue.id),
+      documentsSvc.getIssueDocumentPayload(issue),
     ]);
     const mentionedProjects = mentionedProjectIds.length > 0
       ? await projectsSvc.listByIds(issue.companyId, mentionedProjectIds)
       : [];
-    res.json({ ...issue, ancestors, project: project ?? null, goal: goal ?? null, mentionedProjects });
+    const currentExecutionWorkspace = issue.executionWorkspaceId
+      ? await executionWorkspacesSvc.getById(issue.executionWorkspaceId)
+      : null;
+    const workProducts = await workProductsSvc.listForIssue(issue.id);
+    res.json({
+      ...issue,
+      goalId: goal?.id ?? issue.goalId,
+      ancestors,
+      ...documentPayload,
+      project: project ?? null,
+      goal: goal ?? null,
+      mentionedProjects,
+      currentExecutionWorkspace,
+      workProducts,
+    });
+  });
+
+  router.get("/issues/:id/heartbeat-context", async (req, res) => {
+    const id = req.params.id as string;
+    const issue = await svc.getById(id);
+    if (!issue) {
+      res.status(404).json({ error: "Issue not found" });
+      return;
+    }
+    assertCompanyAccess(req, issue.companyId);
+
+    const wakeCommentId =
+      typeof req.query.wakeCommentId === "string" && req.query.wakeCommentId.trim().length > 0
+        ? req.query.wakeCommentId.trim()
+        : null;
+
+    const [ancestors, project, goal, commentCursor, wakeComment] = await Promise.all([
+      svc.getAncestors(issue.id),
+      issue.projectId ? projectsSvc.getById(issue.projectId) : null,
+      issue.goalId
+        ? goalsSvc.getById(issue.goalId)
+        : !issue.projectId
+          ? goalsSvc.getDefaultCompanyGoal(issue.companyId)
+          : null,
+      svc.getCommentCursor(issue.id),
+      wakeCommentId ? svc.getComment(wakeCommentId) : null,
+    ]);
+
+    res.json({
+      issue: {
+        id: issue.id,
+        identifier: issue.identifier,
+        title: issue.title,
+        description: issue.description,
+        status: issue.status,
+        priority: issue.priority,
+        projectId: issue.projectId,
+        goalId: goal?.id ?? issue.goalId,
+        parentId: issue.parentId,
+        assigneeAgentId: issue.assigneeAgentId,
+        assigneeUserId: issue.assigneeUserId,
+        updatedAt: issue.updatedAt,
+      },
+      ancestors: ancestors.map((ancestor) => ({
+        id: ancestor.id,
+        identifier: ancestor.identifier,
+        title: ancestor.title,
+        status: ancestor.status,
+        priority: ancestor.priority,
+      })),
+      project: project
+        ? {
+            id: project.id,
+            name: project.name,
+            status: project.status,
+            targetDate: project.targetDate,
+          }
+        : null,
+      goal: goal
+        ? {
+            id: goal.id,
+            title: goal.title,
+            status: goal.status,
+            level: goal.level,
+            parentId: goal.parentId,
+          }
+        : null,
+      commentCursor,
+      wakeComment:
+        wakeComment && wakeComment.issueId === issue.id
+          ? wakeComment
+          : null,
+    });
+  });
+
+  router.get("/issues/:id/work-products", async (req, res) => {
+    const id = req.params.id as string;
+    const issue = await svc.getById(id);
+    if (!issue) {
+      res.status(404).json({ error: "Issue not found" });
+      return;
+    }
+    assertCompanyAccess(req, issue.companyId);
+    const workProducts = await workProductsSvc.listForIssue(issue.id);
+    res.json(workProducts);
+  });
+
+  router.get("/issues/:id/documents", async (req, res) => {
+    const id = req.params.id as string;
+    const issue = await svc.getById(id);
+    if (!issue) {
+      res.status(404).json({ error: "Issue not found" });
+      return;
+    }
+    assertCompanyAccess(req, issue.companyId);
+    const docs = await documentsSvc.listIssueDocuments(issue.id);
+    res.json(docs);
+  });
+
+  router.get("/issues/:id/documents/:key", async (req, res) => {
+    const id = req.params.id as string;
+    const issue = await svc.getById(id);
+    if (!issue) {
+      res.status(404).json({ error: "Issue not found" });
+      return;
+    }
+    assertCompanyAccess(req, issue.companyId);
+    const keyParsed = issueDocumentKeySchema.safeParse(String(req.params.key ?? "").trim().toLowerCase());
+    if (!keyParsed.success) {
+      res.status(400).json({ error: "Invalid document key", details: keyParsed.error.issues });
+      return;
+    }
+    const doc = await documentsSvc.getIssueDocumentByKey(issue.id, keyParsed.data);
+    if (!doc) {
+      res.status(404).json({ error: "Document not found" });
+      return;
+    }
+    res.json(doc);
+  });
+
+  router.put("/issues/:id/documents/:key", validate(upsertIssueDocumentSchema), async (req, res) => {
+    const id = req.params.id as string;
+    const issue = await svc.getById(id);
+    if (!issue) {
+      res.status(404).json({ error: "Issue not found" });
+      return;
+    }
+    assertCompanyAccess(req, issue.companyId);
+    const keyParsed = issueDocumentKeySchema.safeParse(String(req.params.key ?? "").trim().toLowerCase());
+    if (!keyParsed.success) {
+      res.status(400).json({ error: "Invalid document key", details: keyParsed.error.issues });
+      return;
+    }
+
+    const actor = getActorInfo(req);
+    const result = await documentsSvc.upsertIssueDocument({
+      issueId: issue.id,
+      key: keyParsed.data,
+      title: req.body.title ?? null,
+      format: req.body.format,
+      body: req.body.body,
+      changeSummary: req.body.changeSummary ?? null,
+      baseRevisionId: req.body.baseRevisionId ?? null,
+      createdByAgentId: actor.agentId ?? null,
+      createdByUserId: actor.actorType === "user" ? actor.actorId : null,
+    });
+    const doc = result.document;
+
+    await logActivity(db, {
+      companyId: issue.companyId,
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      agentId: actor.agentId,
+      runId: actor.runId,
+      action: result.created ? "issue.document_created" : "issue.document_updated",
+      entityType: "issue",
+      entityId: issue.id,
+      details: {
+        key: doc.key,
+        documentId: doc.id,
+        title: doc.title,
+        format: doc.format,
+        revisionNumber: doc.latestRevisionNumber,
+      },
+    });
+
+    res.status(result.created ? 201 : 200).json(doc);
+  });
+
+  router.get("/issues/:id/documents/:key/revisions", async (req, res) => {
+    const id = req.params.id as string;
+    const issue = await svc.getById(id);
+    if (!issue) {
+      res.status(404).json({ error: "Issue not found" });
+      return;
+    }
+    assertCompanyAccess(req, issue.companyId);
+    const keyParsed = issueDocumentKeySchema.safeParse(String(req.params.key ?? "").trim().toLowerCase());
+    if (!keyParsed.success) {
+      res.status(400).json({ error: "Invalid document key", details: keyParsed.error.issues });
+      return;
+    }
+    const revisions = await documentsSvc.listIssueDocumentRevisions(issue.id, keyParsed.data);
+    res.json(revisions);
+  });
+
+  router.delete("/issues/:id/documents/:key", async (req, res) => {
+    const id = req.params.id as string;
+    const issue = await svc.getById(id);
+    if (!issue) {
+      res.status(404).json({ error: "Issue not found" });
+      return;
+    }
+    assertCompanyAccess(req, issue.companyId);
+    if (req.actor.type !== "board") {
+      res.status(403).json({ error: "Board authentication required" });
+      return;
+    }
+    const keyParsed = issueDocumentKeySchema.safeParse(String(req.params.key ?? "").trim().toLowerCase());
+    if (!keyParsed.success) {
+      res.status(400).json({ error: "Invalid document key", details: keyParsed.error.issues });
+      return;
+    }
+    const removed = await documentsSvc.deleteIssueDocument(issue.id, keyParsed.data);
+    if (!removed) {
+      res.status(404).json({ error: "Document not found" });
+      return;
+    }
+    const actor = getActorInfo(req);
+    await logActivity(db, {
+      companyId: issue.companyId,
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      agentId: actor.agentId,
+      runId: actor.runId,
+      action: "issue.document_deleted",
+      entityType: "issue",
+      entityId: issue.id,
+      details: {
+        key: removed.key,
+        documentId: removed.id,
+        title: removed.title,
+      },
+    });
+    res.json({ ok: true });
+  });
+
+  router.post("/issues/:id/work-products", validate(createIssueWorkProductSchema), async (req, res) => {
+    const id = req.params.id as string;
+    const issue = await svc.getById(id);
+    if (!issue) {
+      res.status(404).json({ error: "Issue not found" });
+      return;
+    }
+    assertCompanyAccess(req, issue.companyId);
+    const product = await workProductsSvc.createForIssue(issue.id, issue.companyId, {
+      ...req.body,
+      projectId: req.body.projectId ?? issue.projectId ?? null,
+    });
+    if (!product) {
+      res.status(422).json({ error: "Invalid work product payload" });
+      return;
+    }
+    const actor = getActorInfo(req);
+    await logActivity(db, {
+      companyId: issue.companyId,
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      agentId: actor.agentId,
+      runId: actor.runId,
+      action: "issue.work_product_created",
+      entityType: "issue",
+      entityId: issue.id,
+      details: { workProductId: product.id, type: product.type, provider: product.provider },
+    });
+    res.status(201).json(product);
+  });
+
+  router.patch("/work-products/:id", validate(updateIssueWorkProductSchema), async (req, res) => {
+    const id = req.params.id as string;
+    const existing = await workProductsSvc.getById(id);
+    if (!existing) {
+      res.status(404).json({ error: "Work product not found" });
+      return;
+    }
+    assertCompanyAccess(req, existing.companyId);
+    const product = await workProductsSvc.update(id, req.body);
+    if (!product) {
+      res.status(404).json({ error: "Work product not found" });
+      return;
+    }
+    const actor = getActorInfo(req);
+    await logActivity(db, {
+      companyId: existing.companyId,
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      agentId: actor.agentId,
+      runId: actor.runId,
+      action: "issue.work_product_updated",
+      entityType: "issue",
+      entityId: existing.issueId,
+      details: { workProductId: product.id, changedKeys: Object.keys(req.body).sort() },
+    });
+    res.json(product);
+  });
+
+  router.delete("/work-products/:id", async (req, res) => {
+    const id = req.params.id as string;
+    const existing = await workProductsSvc.getById(id);
+    if (!existing) {
+      res.status(404).json({ error: "Work product not found" });
+      return;
+    }
+    assertCompanyAccess(req, existing.companyId);
+    const removed = await workProductsSvc.remove(id);
+    if (!removed) {
+      res.status(404).json({ error: "Work product not found" });
+      return;
+    }
+    const actor = getActorInfo(req);
+    await logActivity(db, {
+      companyId: existing.companyId,
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      agentId: actor.agentId,
+      runId: actor.runId,
+      action: "issue.work_product_deleted",
+      entityType: "issue",
+      entityId: existing.issueId,
+      details: { workProductId: removed.id, type: removed.type },
+    });
+    res.json(removed);
+  });
+
+  router.post("/issues/:id/read", async (req, res) => {
+    const id = req.params.id as string;
+    const issue = await svc.getById(id);
+    if (!issue) {
+      res.status(404).json({ error: "Issue not found" });
+      return;
+    }
+    assertCompanyAccess(req, issue.companyId);
+    if (req.actor.type !== "board") {
+      res.status(403).json({ error: "Board authentication required" });
+      return;
+    }
+    if (!req.actor.userId) {
+      res.status(403).json({ error: "Board user context required" });
+      return;
+    }
+    const readState = await svc.markRead(issue.companyId, issue.id, req.actor.userId, new Date());
+    const actor = getActorInfo(req);
+    await logActivity(db, {
+      companyId: issue.companyId,
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      agentId: actor.agentId,
+      runId: actor.runId,
+      action: "issue.read_marked",
+      entityType: "issue",
+      entityId: issue.id,
+      details: { userId: req.actor.userId, lastReadAt: readState.lastReadAt },
+    });
+    res.json(readState);
   });
 
   router.get("/issues/:id/approvals", async (req, res) => {
@@ -373,8 +757,10 @@ export function issueRoutes(db: Db, storage: StorageService) {
     }
 
     const actor = getActorInfo(req);
+    const { scheduledAt: scheduledAtRaw, ...createFields } = req.body;
     const issue = await svc.create(companyId, {
-      ...req.body,
+      ...createFields,
+      ...(scheduledAtRaw !== undefined ? { scheduledAt: scheduledAtRaw ? new Date(scheduledAtRaw) : null } : {}),
       createdByAgentId: actor.agentId,
       createdByUserId: actor.actorType === "user" ? actor.actorId : null,
     });
@@ -391,7 +777,7 @@ export function issueRoutes(db: Db, storage: StorageService) {
       details: { title: issue.title, identifier: issue.identifier },
     });
 
-    if (issue.assigneeAgentId) {
+    if (issue.assigneeAgentId && issue.status !== "backlog") {
       void heartbeat
         .wakeup(issue.assigneeAgentId, {
           source: "assignment",
@@ -436,9 +822,12 @@ export function issueRoutes(db: Db, storage: StorageService) {
     }
     if (!(await assertAgentRunCheckoutOwnership(req, res, existing))) return;
 
-    const { comment: commentBody, hiddenAt: hiddenAtRaw, ...updateFields } = req.body;
+    const { comment: commentBody, hiddenAt: hiddenAtRaw, scheduledAt: scheduledAtRaw, ...updateFields } = req.body;
     if (hiddenAtRaw !== undefined) {
       updateFields.hiddenAt = hiddenAtRaw ? new Date(hiddenAtRaw) : null;
+    }
+    if (scheduledAtRaw !== undefined) {
+      updateFields.scheduledAt = scheduledAtRaw ? new Date(scheduledAtRaw) : null;
     }
     let issue;
     try {
@@ -481,6 +870,7 @@ export function issueRoutes(db: Db, storage: StorageService) {
     }
 
     const actor = getActorInfo(req);
+    const hasFieldChanges = Object.keys(previous).length > 0;
     await logActivity(db, {
       companyId: issue.companyId,
       actorType: actor.actorType,
@@ -490,7 +880,12 @@ export function issueRoutes(db: Db, storage: StorageService) {
       action: "issue.updated",
       entityType: "issue",
       entityId: issue.id,
-      details: { ...updateFields, identifier: issue.identifier, _previous: Object.keys(previous).length > 0 ? previous : undefined },
+      details: {
+        ...updateFields,
+        identifier: issue.identifier,
+        ...(commentBody ? { source: "comment" } : {}),
+        _previous: hasFieldChanges ? previous : undefined,
+      },
     });
 
     let comment = null;
@@ -514,18 +909,26 @@ export function issueRoutes(db: Db, storage: StorageService) {
           bodySnippet: comment.body.slice(0, 120),
           identifier: issue.identifier,
           issueTitle: issue.title,
+          ...(hasFieldChanges ? { updated: true } : {}),
         },
       });
 
     }
 
     const assigneeChanged = assigneeWillChange;
+    const statusChangedFromBacklog =
+      existing.status === "backlog" &&
+      issue.status !== "backlog" &&
+      req.body.status !== undefined;
+    const wasReopened =
+      (existing.status === "done" || existing.status === "cancelled") &&
+      issue.status === "todo";
 
     // Merge all wakeups from this update into one enqueue per agent to avoid duplicate runs.
     void (async () => {
       const wakeups = new Map<string, Parameters<typeof heartbeat.wakeup>[1]>();
 
-      if (assigneeChanged && issue.assigneeAgentId) {
+      if (assigneeChanged && issue.assigneeAgentId && issue.status !== "backlog") {
         wakeups.set(issue.assigneeAgentId, {
           source: "assignment",
           triggerDetail: "system",
@@ -534,6 +937,35 @@ export function issueRoutes(db: Db, storage: StorageService) {
           requestedByActorType: actor.actorType,
           requestedByActorId: actor.actorId,
           contextSnapshot: { issueId: issue.id, source: "issue.update" },
+        });
+      } else if (wasReopened && issue.assigneeAgentId && issue.assigneeAgentId !== actor.agentId) {
+        wakeups.set(issue.assigneeAgentId, {
+          source: "automation",
+          triggerDetail: "system",
+          reason: "issue_reopened",
+          payload: { issueId: issue.id, mutation: "update", reopenedFrom: existing.status },
+          requestedByActorType: actor.actorType,
+          requestedByActorId: actor.actorId,
+          contextSnapshot: {
+            issueId: issue.id,
+            taskId: issue.id,
+            source: "issue.update.reopen",
+            wakeReason: "issue_reopened",
+            reopenedFrom: existing.status,
+            ...(comment ? { commentId: comment.id, wakeCommentId: comment.id } : {}),
+          },
+        });
+      }
+
+      if (!assigneeChanged && statusChangedFromBacklog && issue.assigneeAgentId) {
+        wakeups.set(issue.assigneeAgentId, {
+          source: "automation",
+          triggerDetail: "system",
+          reason: "issue_status_changed",
+          payload: { issueId: issue.id, mutation: "update" },
+          requestedByActorType: actor.actorType,
+          requestedByActorId: actor.actorId,
+          contextSnapshot: { issueId: issue.id, source: "issue.status_change" },
         });
       }
 
@@ -547,7 +979,7 @@ export function issueRoutes(db: Db, storage: StorageService) {
 
         for (const mentionedId of mentionedIds) {
           if (wakeups.has(mentionedId)) continue;
-          if (mentionedId === actor.agentId) continue;
+          if (actor.actorType === "agent" && actor.actorId === mentionedId) continue;
           wakeups.set(mentionedId, {
             source: "automation",
             triggerDetail: "system",
@@ -625,6 +1057,19 @@ export function issueRoutes(db: Db, storage: StorageService) {
     }
     assertCompanyAccess(req, issue.companyId);
 
+    if (issue.projectId) {
+      const project = await projectsSvc.getById(issue.projectId);
+      if (project?.pausedAt) {
+        res.status(409).json({
+          error:
+            project.pauseReason === "budget"
+              ? "Project is paused because its budget hard-stop was reached"
+              : "Project is paused",
+        });
+        return;
+      }
+    }
+
     if (req.actor.type === "agent" && req.actor.agentId !== req.body.agentId) {
       res.status(403).json({ error: "Agent can only checkout as itself" });
       return;
@@ -647,17 +1092,26 @@ export function issueRoutes(db: Db, storage: StorageService) {
       details: { agentId: req.body.agentId },
     });
 
-    void heartbeat
-      .wakeup(req.body.agentId, {
-        source: "assignment",
-        triggerDetail: "system",
-        reason: "issue_checked_out",
-        payload: { issueId: issue.id, mutation: "checkout" },
-        requestedByActorType: actor.actorType,
-        requestedByActorId: actor.actorId,
-        contextSnapshot: { issueId: issue.id, source: "issue.checkout" },
+    if (
+      shouldWakeAssigneeOnCheckout({
+        actorType: req.actor.type,
+        actorAgentId: req.actor.type === "agent" ? req.actor.agentId ?? null : null,
+        checkoutAgentId: req.body.agentId,
+        checkoutRunId,
       })
-      .catch((err) => logger.warn({ err, issueId: issue.id }, "failed to wake assignee on issue checkout"));
+    ) {
+      void heartbeat
+        .wakeup(req.body.agentId, {
+          source: "assignment",
+          triggerDetail: "system",
+          reason: "issue_checked_out",
+          payload: { issueId: issue.id, mutation: "checkout" },
+          requestedByActorType: actor.actorType,
+          requestedByActorId: actor.actorId,
+          contextSnapshot: { issueId: issue.id, source: "issue.checkout" },
+        })
+        .catch((err) => logger.warn({ err, issueId: issue.id }, "failed to wake assignee on issue checkout"));
+    }
 
     res.json(updated);
   });
@@ -699,22 +1153,6 @@ export function issueRoutes(db: Db, storage: StorageService) {
     res.json(released);
   });
 
-  router.post("/issues/:id/view", async (req, res) => {
-    const id = req.params.id as string;
-    const issue = await svc.getById(id);
-    if (!issue) {
-      res.status(404).json({ error: "Issue not found" });
-      return;
-    }
-    assertCompanyAccess(req, issue.companyId);
-    const updated = await svc.markViewed(id);
-    if (!updated) {
-      res.status(404).json({ error: "Issue not found" });
-      return;
-    }
-    res.json(updated);
-  });
-
   router.get("/issues/:id/comments", async (req, res) => {
     const id = req.params.id as string;
     const issue = await svc.getById(id);
@@ -723,7 +1161,29 @@ export function issueRoutes(db: Db, storage: StorageService) {
       return;
     }
     assertCompanyAccess(req, issue.companyId);
-    const comments = await svc.listComments(id);
+    const afterCommentId =
+      typeof req.query.after === "string" && req.query.after.trim().length > 0
+        ? req.query.after.trim()
+        : typeof req.query.afterCommentId === "string" && req.query.afterCommentId.trim().length > 0
+          ? req.query.afterCommentId.trim()
+          : null;
+    const order =
+      typeof req.query.order === "string" && req.query.order.trim().toLowerCase() === "asc"
+        ? "asc"
+        : "desc";
+    const limitRaw =
+      typeof req.query.limit === "string" && req.query.limit.trim().length > 0
+        ? Number(req.query.limit)
+        : null;
+    const limit =
+      limitRaw && Number.isFinite(limitRaw) && limitRaw > 0
+        ? Math.min(Math.floor(limitRaw), MAX_ISSUE_COMMENT_LIMIT)
+        : null;
+    const comments = await svc.listComments(id, {
+      afterCommentId,
+      order,
+      limit,
+    });
     res.json(comments);
   });
 
@@ -843,6 +1303,7 @@ export function issueRoutes(db: Db, storage: StorageService) {
       userId: actor.actorType === "user" ? actor.actorId : undefined,
     });
 
+
     await logActivity(db, {
       companyId: currentIssue.companyId,
       actorType: actor.actorType,
@@ -865,10 +1326,11 @@ export function issueRoutes(db: Db, storage: StorageService) {
     // Merge all wakeups from this comment into one enqueue per agent to avoid duplicate runs.
     void (async () => {
       const wakeups = new Map<string, Parameters<typeof heartbeat.wakeup>[1]>();
-      // Skip waking the assignee if the comment author is the same agent
-      const actorAgentId = actor.agentId;
       const assigneeId = currentIssue.assigneeAgentId;
-      if (assigneeId && assigneeId !== actorAgentId) {
+      const actorIsAgent = actor.actorType === "agent";
+      const selfComment = actorIsAgent && actor.actorId === assigneeId;
+      const skipWake = selfComment || isClosed;
+      if (assigneeId && (reopened || !skipWake)) {
         if (reopened) {
           wakeups.set(assigneeId, {
             source: "automation",
@@ -927,7 +1389,7 @@ export function issueRoutes(db: Db, storage: StorageService) {
 
       for (const mentionedId of mentionedIds) {
         if (wakeups.has(mentionedId)) continue;
-        if (mentionedId === actorAgentId) continue;
+        if (actorIsAgent && actor.actorId === mentionedId) continue;
         wakeups.set(mentionedId, {
           source: "automation",
           triggerDetail: "system",
@@ -1002,7 +1464,7 @@ export function issueRoutes(db: Db, storage: StorageService) {
       return;
     }
     const contentType = (file.mimetype || "").toLowerCase();
-    if (!ALLOWED_ATTACHMENT_CONTENT_TYPES.has(contentType)) {
+    if (!isAllowedContentType(contentType)) {
       res.status(422).json({ error: `Unsupported attachment type: ${contentType || "unknown"}` });
       return;
     }
@@ -1117,6 +1579,18 @@ export function issueRoutes(db: Db, storage: StorageService) {
       },
     });
 
+    res.json({ ok: true });
+  });
+
+  router.post("/issues/:id/view", async (req, res) => {
+    const id = req.params.id as string;
+    const issue = await svc.getById(id);
+    if (!issue) {
+      res.status(404).json({ error: "Issue not found" });
+      return;
+    }
+    assertCompanyAccess(req, issue.companyId);
+    await svc.update(id, { viewedAt: new Date() });
     res.json({ ok: true });
   });
 

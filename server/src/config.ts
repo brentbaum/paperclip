@@ -1,5 +1,6 @@
 import { readConfigFile } from "./config-file.js";
-import { existsSync } from "node:fs";
+import { existsSync, realpathSync } from "node:fs";
+import { resolve } from "node:path";
 import { config as loadDotenv } from "dotenv";
 import { resolvePaperclipEnvPath } from "./paths.js";
 import {
@@ -27,6 +28,14 @@ if (existsSync(PAPERCLIP_ENV_FILE_PATH)) {
   loadDotenv({ path: PAPERCLIP_ENV_FILE_PATH, override: false, quiet: true });
 }
 
+const CWD_ENV_PATH = resolve(process.cwd(), ".env");
+const isSameFile = existsSync(CWD_ENV_PATH) && existsSync(PAPERCLIP_ENV_FILE_PATH)
+  ? realpathSync(CWD_ENV_PATH) === realpathSync(PAPERCLIP_ENV_FILE_PATH)
+  : CWD_ENV_PATH === PAPERCLIP_ENV_FILE_PATH;
+if (!isSameFile && existsSync(CWD_ENV_PATH)) {
+  loadDotenv({ path: CWD_ENV_PATH, override: false, quiet: true });
+}
+
 type DatabaseMode = "embedded-postgres" | "postgres";
 
 export interface Config {
@@ -37,6 +46,7 @@ export interface Config {
   allowedHostnames: string[];
   authBaseUrlMode: AuthBaseUrlMode;
   authPublicBaseUrl: string | undefined;
+  authDisableSignUp: boolean;
   databaseMode: DatabaseMode;
   databaseUrl: string | undefined;
   embeddedPostgresDataDir: string;
@@ -62,6 +72,12 @@ export interface Config {
   telegramTopicMapping: Record<string, number>;
   telegramStatusTopicId: number | undefined;
   telegramApprovalsTopicId: number | undefined;
+  sttProvider: "local_sherpa" | "nvidia_parakeet";
+  sttModelDir: string | undefined;
+  sttNumThreads: number;
+  sttNvidiaApiKey: string | undefined;
+  sttNvidiaModel: string;
+  sttNvidiaBaseUrl: string;
   tailscaleServe: boolean;
   heartbeatSchedulerEnabled: boolean;
   heartbeatSchedulerIntervalMs: number;
@@ -81,6 +97,7 @@ export function loadConfig(): Config {
   const fileSecrets = fileConfig?.secrets;
   const fileStorage = fileConfig?.storage;
   const fileTelegram = fileConfig?.telegram;
+  const fileStt = fileConfig?.stt;
   const strictModeFromEnv = process.env.PAPERCLIP_SECRETS_STRICT_MODE;
   const secretsStrictMode =
     strictModeFromEnv !== undefined
@@ -137,15 +154,23 @@ export function loadConfig(): Config {
     AUTH_BASE_URL_MODES.includes(authBaseUrlModeFromEnvRaw as AuthBaseUrlMode)
       ? (authBaseUrlModeFromEnvRaw as AuthBaseUrlMode)
       : null;
+  const publicUrlFromEnv = process.env.PAPERCLIP_PUBLIC_URL;
   const authPublicBaseUrlRaw =
     process.env.PAPERCLIP_AUTH_PUBLIC_BASE_URL ??
     process.env.BETTER_AUTH_URL ??
+    process.env.BETTER_AUTH_BASE_URL ??
+    publicUrlFromEnv ??
     fileConfig?.auth?.publicBaseUrl;
   const authPublicBaseUrl = authPublicBaseUrlRaw?.trim() || undefined;
   const authBaseUrlMode: AuthBaseUrlMode =
     authBaseUrlModeFromEnv ??
     fileConfig?.auth?.baseUrlMode ??
     (authPublicBaseUrl ? "explicit" : "auto");
+  const disableSignUpFromEnv = process.env.PAPERCLIP_AUTH_DISABLE_SIGN_UP;
+  const authDisableSignUp: boolean =
+    disableSignUpFromEnv !== undefined
+      ? disableSignUpFromEnv === "true"
+      : (fileConfig?.auth?.disableSignUp ?? false);
   const allowedHostnamesFromEnvRaw = process.env.PAPERCLIP_ALLOWED_HOSTNAMES;
   const allowedHostnamesFromEnv = allowedHostnamesFromEnvRaw
     ? allowedHostnamesFromEnvRaw
@@ -153,8 +178,24 @@ export function loadConfig(): Config {
       .map((value) => value.trim().toLowerCase())
       .filter((value) => value.length > 0)
     : null;
+  const publicUrlHostname = authPublicBaseUrl
+    ? (() => {
+      try {
+        return new URL(authPublicBaseUrl).hostname.trim().toLowerCase();
+      } catch {
+        return null;
+      }
+    })()
+    : null;
   const allowedHostnames = Array.from(
-    new Set((allowedHostnamesFromEnv ?? fileConfig?.server.allowedHostnames ?? []).map((value) => value.trim().toLowerCase()).filter(Boolean)),
+    new Set(
+      [
+        ...(allowedHostnamesFromEnv ?? fileConfig?.server.allowedHostnames ?? []),
+        ...(publicUrlHostname ? [publicUrlHostname] : []),
+      ]
+        .map((value) => value.trim().toLowerCase())
+        .filter(Boolean),
+    ),
   );
   const companyDeletionEnvRaw = process.env.PAPERCLIP_ENABLE_COMPANY_DELETION;
   const companyDeletionEnabled =
@@ -208,6 +249,7 @@ export function loadConfig(): Config {
     allowedHostnames,
     authBaseUrlMode,
     authPublicBaseUrl,
+    authDisableSignUp,
     databaseMode: fileDatabaseMode,
     databaseUrl: process.env.DATABASE_URL ?? fileDbUrl,
     embeddedPostgresDataDir: resolveHomeAwarePath(
@@ -243,6 +285,12 @@ export function loadConfig(): Config {
     telegramTopicMapping: fileTelegram?.topicMapping ?? {},
     telegramStatusTopicId: telegramStatusTopicIdFromEnv ?? fileTelegram?.statusTopicId ?? undefined,
     telegramApprovalsTopicId: telegramApprovalsTopicIdFromEnv ?? fileTelegram?.approvalsTopicId ?? undefined,
+    sttProvider: (process.env.STT_PROVIDER ?? fileStt?.provider ?? "local_sherpa") as "local_sherpa" | "nvidia_parakeet",
+    sttModelDir: process.env.STT_MODEL_DIR ?? fileStt?.modelDir ?? undefined,
+    sttNumThreads: Number(process.env.STT_NUM_THREADS) || (fileStt?.numThreads ?? 2),
+    sttNvidiaApiKey: process.env.NVIDIA_API_KEY ?? fileStt?.nvidiaApiKey ?? undefined,
+    sttNvidiaModel: process.env.NVIDIA_STT_MODEL ?? fileStt?.nvidiaModel ?? "nvidia/parakeet-tdt-0.6b-v2",
+    sttNvidiaBaseUrl: process.env.NVIDIA_STT_BASE_URL ?? fileStt?.nvidiaBaseUrl ?? "https://integrate.api.nvidia.com/v1",
     tailscaleServe,
     heartbeatSchedulerEnabled: process.env.HEARTBEAT_SCHEDULER_ENABLED !== "false",
     heartbeatSchedulerIntervalMs: Math.max(10000, Number(process.env.HEARTBEAT_SCHEDULER_INTERVAL_MS) || 30000),

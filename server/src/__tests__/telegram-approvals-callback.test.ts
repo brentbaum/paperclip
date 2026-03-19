@@ -58,8 +58,8 @@ function createDeps(fakeBot: FakeBot, overrides?: Partial<Parameters<typeof tele
       wakeup: vi.fn(async () => null),
     },
     approvals: {
-      approve: vi.fn(async () => ({ id: "approval-1", status: "approved" })),
-      reject: vi.fn(async () => ({ id: "approval-1", status: "rejected" })),
+      approve: vi.fn(async () => ({ approval: { id: "approval-1", status: "approved" }, applied: true })),
+      reject: vi.fn(async () => ({ approval: { id: "approval-1", status: "rejected" }, applied: true })),
       getById: vi.fn(async () => null),
     },
     issues: {
@@ -84,13 +84,13 @@ async function flushAsync() {
 describe("telegram approval callbacks", () => {
   it("approves using inline callback", async () => {
     const fakeBot = new FakeBot();
-    const approve = vi.fn(async () => ({ id: "approval-1", status: "approved" }));
+    const approve = vi.fn(async () => ({ approval: { id: "approval-1", status: "approved" }, applied: true }));
     const svc = telegramService(
       {} as any,
       createDeps(fakeBot, {
         approvals: {
           approve,
-          reject: vi.fn(async () => ({ id: "approval-1", status: "rejected" })),
+          reject: vi.fn(async () => ({ approval: { id: "approval-1", status: "rejected" }, applied: true })),
           getById: vi.fn(async () => null),
         },
       }),
@@ -119,12 +119,12 @@ describe("telegram approval callbacks", () => {
 
   it("rejects using inline callback", async () => {
     const fakeBot = new FakeBot();
-    const reject = vi.fn(async () => ({ id: "approval-1", status: "rejected" }));
+    const reject = vi.fn(async () => ({ approval: { id: "approval-1", status: "rejected" }, applied: true }));
     const svc = telegramService(
       {} as any,
       createDeps(fakeBot, {
         approvals: {
-          approve: vi.fn(async () => ({ id: "approval-1", status: "approved" })),
+          approve: vi.fn(async () => ({ approval: { id: "approval-1", status: "approved" }, applied: true })),
           reject,
           getById: vi.fn(async () => null),
         },
@@ -163,7 +163,7 @@ describe("telegram approval callbacks", () => {
       createDeps(fakeBot, {
         approvals: {
           approve,
-          reject: vi.fn(async () => ({ id: "approval-1", status: "rejected" })),
+          reject: vi.fn(async () => ({ approval: { id: "approval-1", status: "rejected" }, applied: true })),
           getById,
         },
       }),

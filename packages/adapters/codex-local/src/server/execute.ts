@@ -1,30 +1,29 @@
 import fs from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import type { AdapterExecutionContext, AdapterExecutionResult } from "@paperclipai/adapter-utils";
+import { inferOpenAiCompatibleBiller, type AdapterExecutionContext, type AdapterExecutionResult } from "@paperclipai/adapter-utils";
 import {
   asString,
   asNumber,
   asBoolean,
   asStringArray,
-  DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
   parseObject,
   buildPaperclipEnv,
   redactEnvForLogs,
   ensureAbsoluteDirectory,
   ensureCommandResolvable,
+  ensurePaperclipSkillSymlink,
   ensurePathInEnv,
+  listPaperclipSkillEntries,
+  removeMaintainerOnlySkillSymlinks,
   renderTemplate,
+  joinPromptSections,
   runChildProcess,
 } from "@paperclipai/adapter-utils/server-utils";
 import { parseCodexJsonl, isCodexUnknownSessionError } from "./parse.js";
+import { pathExists, prepareWorktreeCodexHome, resolveCodexHomeDir } from "./codex-home.js";
 
 const __moduleDir = path.dirname(fileURLToPath(import.meta.url));
-const PAPERCLIP_SKILLS_CANDIDATES = [
-  path.resolve(__moduleDir, "../../skills"),         // published: <pkg>/dist/server/ -> <pkg>/skills/
-  path.resolve(__moduleDir, "../../../../../skills"), // dev: src/server/ -> repo root/skills/
-];
 const CODEX_ROLLOUT_NOISE_RE =
   /^\d{4}-\d{2}-\d{2}T[^\s]+\s+ERROR\s+codex_core::rollout::list:\s+state db missing rollout path for thread\s+[a-z0-9-]+$/i;
 
@@ -63,13 +62,17 @@ function buildTelegramWakePrompt(context: Record<string, unknown>, agentId: stri
     topicId > 0 ? `topic ${topicId}` : null,
   ].filter(Boolean).join(", ");
 
+  const replyPayload: Record<string, unknown> = { agentId, text: "your reply" };
+  if (chatId.length > 0) replyPayload.chatId = chatId;
+  if (topicId > 0) replyPayload.topicId = topicId;
+
   return [
     "Telegram wake context:",
     `- From: ${senderLabel}${location ? ` in ${location}` : ""}`,
     `- Message: ${JSON.stringify(messageText)}`,
     "",
     "Before you end this run, you must send a reply back to Telegram.",
-    `Use POST ${sendEndpoint} with JSON like {\"agentId\":\"${agentId}\",\"text\":\"your reply\"}.`,
+    `Use POST ${sendEndpoint} with JSON body: ${JSON.stringify(replyPayload)}`,
     "If no issue work is required, send a concise acknowledgement and stop. Do not only write an internal status update.",
     "",
   ].join("\n");
@@ -94,39 +97,101 @@ function resolveCodexBillingType(env: Record<string, string>): "api" | "subscrip
   return hasNonEmptyEnvValue(env, "OPENAI_API_KEY") ? "api" : "subscription";
 }
 
-function codexHomeDir(): string {
-  const fromEnv = process.env.CODEX_HOME;
-  if (typeof fromEnv === "string" && fromEnv.trim().length > 0) return fromEnv.trim();
-  return path.join(os.homedir(), ".codex");
+function resolveCodexBiller(env: Record<string, string>, billingType: "api" | "subscription"): string {
+  const openAiCompatibleBiller = inferOpenAiCompatibleBiller(env, "openai");
+  if (openAiCompatibleBiller === "openrouter") return "openrouter";
+  return billingType === "subscription" ? "chatgpt" : openAiCompatibleBiller ?? "openai";
 }
 
-async function resolvePaperclipSkillsDir(): Promise<string | null> {
-  for (const candidate of PAPERCLIP_SKILLS_CANDIDATES) {
-    const isDir = await fs.stat(candidate).then((s) => s.isDirectory()).catch(() => false);
-    if (isDir) return candidate;
+async function isLikelyPaperclipRepoRoot(candidate: string): Promise<boolean> {
+  const [hasWorkspace, hasPackageJson, hasServerDir, hasAdapterUtilsDir] = await Promise.all([
+    pathExists(path.join(candidate, "pnpm-workspace.yaml")),
+    pathExists(path.join(candidate, "package.json")),
+    pathExists(path.join(candidate, "server")),
+    pathExists(path.join(candidate, "packages", "adapter-utils")),
+  ]);
+
+  return hasWorkspace && hasPackageJson && hasServerDir && hasAdapterUtilsDir;
+}
+
+async function isLikelyPaperclipRuntimeSkillSource(candidate: string, skillName: string): Promise<boolean> {
+  if (path.basename(candidate) !== skillName) return false;
+  const skillsRoot = path.dirname(candidate);
+  if (path.basename(skillsRoot) !== "skills") return false;
+  if (!(await pathExists(path.join(candidate, "SKILL.md")))) return false;
+
+  let cursor = path.dirname(skillsRoot);
+  for (let depth = 0; depth < 6; depth += 1) {
+    if (await isLikelyPaperclipRepoRoot(cursor)) return true;
+    const parent = path.dirname(cursor);
+    if (parent === cursor) break;
+    cursor = parent;
   }
-  return null;
+
+  return false;
 }
 
-async function ensureCodexSkillsInjected(onLog: AdapterExecutionContext["onLog"]) {
-  const skillsDir = await resolvePaperclipSkillsDir();
-  if (!skillsDir) return;
+type EnsureCodexSkillsInjectedOptions = {
+  skillsHome?: string;
+  skillsEntries?: Awaited<ReturnType<typeof listPaperclipSkillEntries>>;
+  linkSkill?: (source: string, target: string) => Promise<void>;
+};
 
-  const skillsHome = path.join(codexHomeDir(), "skills");
+export async function ensureCodexSkillsInjected(
+  onLog: AdapterExecutionContext["onLog"],
+  options: EnsureCodexSkillsInjectedOptions = {},
+) {
+  const skillsEntries = options.skillsEntries ?? await listPaperclipSkillEntries(__moduleDir);
+  if (skillsEntries.length === 0) return;
+
+  const skillsHome = options.skillsHome ?? path.join(resolveCodexHomeDir(process.env), "skills");
   await fs.mkdir(skillsHome, { recursive: true });
-  const entries = await fs.readdir(skillsDir, { withFileTypes: true });
-  for (const entry of entries) {
-    if (!entry.isDirectory()) continue;
-    const source = path.join(skillsDir, entry.name);
+  const removedSkills = await removeMaintainerOnlySkillSymlinks(
+    skillsHome,
+    skillsEntries.map((entry) => entry.name),
+  );
+  for (const skillName of removedSkills) {
+    await onLog(
+      "stdout",
+      `[paperclip] Removed maintainer-only Codex skill "${skillName}" from ${skillsHome}\n`,
+    );
+  }
+  const linkSkill = options.linkSkill;
+  for (const entry of skillsEntries) {
     const target = path.join(skillsHome, entry.name);
-    const existing = await fs.lstat(target).catch(() => null);
-    if (existing) continue;
 
     try {
-      await fs.symlink(source, target);
+      const existing = await fs.lstat(target).catch(() => null);
+      if (existing?.isSymbolicLink()) {
+        const linkedPath = await fs.readlink(target).catch(() => null);
+        const resolvedLinkedPath = linkedPath
+          ? path.resolve(path.dirname(target), linkedPath)
+          : null;
+        if (
+          resolvedLinkedPath &&
+          resolvedLinkedPath !== entry.source &&
+          (await isLikelyPaperclipRuntimeSkillSource(resolvedLinkedPath, entry.name))
+        ) {
+          await fs.unlink(target);
+          if (linkSkill) {
+            await linkSkill(entry.source, target);
+          } else {
+            await fs.symlink(entry.source, target);
+          }
+          await onLog(
+            "stdout",
+            `[paperclip] Repaired Codex skill "${entry.name}" into ${skillsHome}\n`,
+          );
+          continue;
+        }
+      }
+
+      const result = await ensurePaperclipSkillSymlink(entry.source, target, linkSkill);
+      if (result === "skipped") continue;
+
       await onLog(
-        "stderr",
-        `[paperclip] Injected Codex skill "${entry.name}" into ${skillsHome}\n`,
+        "stdout",
+        `[paperclip] ${result === "repaired" ? "Repaired" : "Injected"} Codex skill "${entry.name}" into ${skillsHome}\n`,
       );
     } catch (err) {
       await onLog(
@@ -137,17 +202,12 @@ async function ensureCodexSkillsInjected(onLog: AdapterExecutionContext["onLog"]
   }
 }
 
-type ProcessRunner = typeof runChildProcess;
-
-export async function executeWithProcessRunner(
-  ctx: AdapterExecutionContext,
-  processRunner: ProcessRunner,
-): Promise<AdapterExecutionResult> {
+export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
   const { runId, agent, runtime, config, context, onLog, onMeta, authToken } = ctx;
 
   const promptTemplate = asString(
     config.promptTemplate,
-    DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
+    "You are agent {{agent.id}} ({{agent.name}}). Continue your Paperclip work.",
   );
   const command = asString(config.command, "codex");
   const model = asString(config.model, "");
@@ -162,27 +222,54 @@ export async function executeWithProcessRunner(
   );
 
   const workspaceContext = parseObject(context.paperclipWorkspace);
-  const telegramContext = parseObject(context.paperclipTelegram);
   const workspaceCwd = asString(workspaceContext.cwd, "");
   const workspaceSource = asString(workspaceContext.source, "");
+  const workspaceStrategy = asString(workspaceContext.strategy, "");
   const workspaceId = asString(workspaceContext.workspaceId, "");
   const workspaceRepoUrl = asString(workspaceContext.repoUrl, "");
   const workspaceRepoRef = asString(workspaceContext.repoRef, "");
+  const workspaceBranch = asString(workspaceContext.branchName, "");
+  const workspaceWorktreePath = asString(workspaceContext.worktreePath, "");
+  const agentHome = asString(workspaceContext.agentHome, "");
   const workspaceHints = Array.isArray(context.paperclipWorkspaces)
     ? context.paperclipWorkspaces.filter(
         (value): value is Record<string, unknown> => typeof value === "object" && value !== null,
       )
     : [];
+  const runtimeServiceIntents = Array.isArray(context.paperclipRuntimeServiceIntents)
+    ? context.paperclipRuntimeServiceIntents.filter(
+        (value): value is Record<string, unknown> => typeof value === "object" && value !== null,
+      )
+    : [];
+  const runtimeServices = Array.isArray(context.paperclipRuntimeServices)
+    ? context.paperclipRuntimeServices.filter(
+        (value): value is Record<string, unknown> => typeof value === "object" && value !== null,
+      )
+    : [];
+  const runtimePrimaryUrl = asString(context.paperclipRuntimePrimaryUrl, "");
   const configuredCwd = asString(config.cwd, "");
   const useConfiguredInsteadOfAgentHome = workspaceSource === "agent_home" && configuredCwd.length > 0;
   const effectiveWorkspaceCwd = useConfiguredInsteadOfAgentHome ? "" : workspaceCwd;
   const cwd = effectiveWorkspaceCwd || configuredCwd || process.cwd();
-  await ensureAbsoluteDirectory(cwd, { createIfMissing: true });
-  await ensureCodexSkillsInjected(onLog);
   const envConfig = parseObject(config.env);
+  const configuredCodexHome =
+    typeof envConfig.CODEX_HOME === "string" && envConfig.CODEX_HOME.trim().length > 0
+      ? path.resolve(envConfig.CODEX_HOME.trim())
+      : null;
+  await ensureAbsoluteDirectory(cwd, { createIfMissing: true });
+  const preparedWorktreeCodexHome =
+    configuredCodexHome ? null : await prepareWorktreeCodexHome(process.env, onLog);
+  const effectiveCodexHome = configuredCodexHome ?? preparedWorktreeCodexHome;
+  await ensureCodexSkillsInjected(
+    onLog,
+    effectiveCodexHome ? { skillsHome: path.join(effectiveCodexHome, "skills") } : {},
+  );
   const hasExplicitApiKey =
     typeof envConfig.PAPERCLIP_API_KEY === "string" && envConfig.PAPERCLIP_API_KEY.trim().length > 0;
   const env: Record<string, string> = { ...buildPaperclipEnv(agent) };
+  if (effectiveCodexHome) {
+    env.CODEX_HOME = effectiveCodexHome;
+  }
   env.PAPERCLIP_RUN_ID = runId;
   const wakeTaskId =
     (typeof context.taskId === "string" && context.taskId.trim().length > 0 && context.taskId.trim()) ||
@@ -207,6 +294,11 @@ export async function executeWithProcessRunner(
   const linkedIssueIds = Array.isArray(context.issueIds)
     ? context.issueIds.filter((value): value is string => typeof value === "string" && value.trim().length > 0)
     : [];
+  const wakeMessage =
+    typeof context.wakeMessage === "string" && context.wakeMessage.trim().length > 0
+      ? context.wakeMessage.trim()
+      : null;
+  const telegramContext = parseObject(context.paperclipTelegram);
   const telegramMessageText = asString(telegramContext.messageText, "");
   const telegramChatId = asString(telegramContext.chatId, "");
   const telegramTopicId = Math.floor(asNumber(telegramContext.topicId, 0));
@@ -222,14 +314,8 @@ export async function executeWithProcessRunner(
   if (wakeCommentId) {
     env.PAPERCLIP_WAKE_COMMENT_ID = wakeCommentId;
   }
-  if (approvalId) {
-    env.PAPERCLIP_APPROVAL_ID = approvalId;
-  }
-  if (approvalStatus) {
-    env.PAPERCLIP_APPROVAL_STATUS = approvalStatus;
-  }
-  if (linkedIssueIds.length > 0) {
-    env.PAPERCLIP_LINKED_ISSUE_IDS = linkedIssueIds.join(",");
+  if (wakeMessage) {
+    env.PAPERCLIP_WAKE_MESSAGE = wakeMessage;
   }
   if (telegramMessageText) {
     env.PAPERCLIP_TELEGRAM_MESSAGE_TEXT = telegramMessageText;
@@ -249,11 +335,23 @@ export async function executeWithProcessRunner(
   if (telegramUsername) {
     env.PAPERCLIP_TELEGRAM_USERNAME = telegramUsername;
   }
+  if (approvalId) {
+    env.PAPERCLIP_APPROVAL_ID = approvalId;
+  }
+  if (approvalStatus) {
+    env.PAPERCLIP_APPROVAL_STATUS = approvalStatus;
+  }
+  if (linkedIssueIds.length > 0) {
+    env.PAPERCLIP_LINKED_ISSUE_IDS = linkedIssueIds.join(",");
+  }
   if (effectiveWorkspaceCwd) {
     env.PAPERCLIP_WORKSPACE_CWD = effectiveWorkspaceCwd;
   }
   if (workspaceSource) {
     env.PAPERCLIP_WORKSPACE_SOURCE = workspaceSource;
+  }
+  if (workspaceStrategy) {
+    env.PAPERCLIP_WORKSPACE_STRATEGY = workspaceStrategy;
   }
   if (workspaceId) {
     env.PAPERCLIP_WORKSPACE_ID = workspaceId;
@@ -264,8 +362,26 @@ export async function executeWithProcessRunner(
   if (workspaceRepoRef) {
     env.PAPERCLIP_WORKSPACE_REPO_REF = workspaceRepoRef;
   }
+  if (workspaceBranch) {
+    env.PAPERCLIP_WORKSPACE_BRANCH = workspaceBranch;
+  }
+  if (workspaceWorktreePath) {
+    env.PAPERCLIP_WORKSPACE_WORKTREE_PATH = workspaceWorktreePath;
+  }
+  if (agentHome) {
+    env.AGENT_HOME = agentHome;
+  }
   if (workspaceHints.length > 0) {
     env.PAPERCLIP_WORKSPACES_JSON = JSON.stringify(workspaceHints);
+  }
+  if (runtimeServiceIntents.length > 0) {
+    env.PAPERCLIP_RUNTIME_SERVICE_INTENTS_JSON = JSON.stringify(runtimeServiceIntents);
+  }
+  if (runtimeServices.length > 0) {
+    env.PAPERCLIP_RUNTIME_SERVICES_JSON = JSON.stringify(runtimeServices);
+  }
+  if (runtimePrimaryUrl) {
+    env.PAPERCLIP_RUNTIME_PRIMARY_URL = runtimePrimaryUrl;
   }
   for (const [k, v] of Object.entries(envConfig)) {
     if (typeof v === "string") env[k] = v;
@@ -273,8 +389,13 @@ export async function executeWithProcessRunner(
   if (!hasExplicitApiKey && authToken) {
     env.PAPERCLIP_API_KEY = authToken;
   }
-  const billingType = resolveCodexBillingType(env);
-  const runtimeEnv = ensurePathInEnv({ ...process.env, ...env });
+  const effectiveEnv = Object.fromEntries(
+    Object.entries({ ...process.env, ...env }).filter(
+      (entry): entry is [string, string] => typeof entry[1] === "string",
+    ),
+  );
+  const billingType = resolveCodexBillingType(effectiveEnv);
+  const runtimeEnv = ensurePathInEnv(effectiveEnv);
   await ensureCommandResolvable(command, cwd, runtimeEnv);
 
   const timeoutSec = asNumber(config.timeoutSec, 0);
@@ -301,6 +422,7 @@ export async function executeWithProcessRunner(
   const instructionsFilePath = asString(config.instructionsFilePath, "").trim();
   const instructionsDir = instructionsFilePath ? `${path.dirname(instructionsFilePath)}/` : "";
   let instructionsPrefix = "";
+  let instructionsChars = 0;
   if (instructionsFilePath) {
     try {
       const instructionsContents = await fs.readFile(instructionsFilePath, "utf8");
@@ -308,8 +430,9 @@ export async function executeWithProcessRunner(
         `${instructionsContents}\n\n` +
         `The above agent instructions were loaded from ${instructionsFilePath}. ` +
         `Resolve any relative file references from ${instructionsDir}.\n\n`;
+      instructionsChars = instructionsPrefix.length;
       await onLog(
-        "stderr",
+        "stdout",
         `[paperclip] Loaded agent instructions file: ${instructionsFilePath}\n`,
       );
     } catch (err) {
@@ -332,7 +455,8 @@ export async function executeWithProcessRunner(
       `Configured instructionsFilePath ${instructionsFilePath}, but file could not be read; continuing without injected instructions.`,
     ];
   })();
-  const renderedPrompt = renderTemplate(promptTemplate, {
+  const bootstrapPromptTemplate = asString(config.bootstrapPromptTemplate, "");
+  const templateData = {
     agentId: agent.id,
     companyId: agent.companyId,
     runId,
@@ -340,9 +464,28 @@ export async function executeWithProcessRunner(
     agent,
     run: { id: runId, source: "on_demand" },
     context,
-  });
+  };
+  const renderedPrompt = renderTemplate(promptTemplate, templateData);
+  const renderedBootstrapPrompt =
+    !sessionId && bootstrapPromptTemplate.trim().length > 0
+      ? renderTemplate(bootstrapPromptTemplate, templateData).trim()
+      : "";
+  const sessionHandoffNote = asString(context.paperclipSessionHandoffMarkdown, "").trim();
   const telegramWakePrompt = buildTelegramWakePrompt(context, agent.id);
-  const prompt = `${instructionsPrefix}${telegramWakePrompt}${renderedPrompt}`;
+  const prompt = joinPromptSections([
+    telegramWakePrompt,
+    instructionsPrefix,
+    renderedBootstrapPrompt,
+    sessionHandoffNote,
+    renderedPrompt,
+  ]);
+  const promptMetrics = {
+    promptChars: prompt.length,
+    instructionsChars,
+    bootstrapPromptChars: renderedBootstrapPrompt.length,
+    sessionHandoffChars: sessionHandoffNote.length,
+    heartbeatPromptChars: renderedPrompt.length,
+  };
 
   const buildArgs = (resumeSessionId: string | null) => {
     const args = ["exec", "--json"];
@@ -370,11 +513,12 @@ export async function executeWithProcessRunner(
         }),
         env: redactEnvForLogs(env),
         prompt,
+        promptMetrics,
         context,
       });
     }
 
-    const proc = await processRunner(runId, command, args, {
+    const proc = await runChildProcess(runId, command, args, {
       cwd,
       env,
       stdin: prompt,
@@ -445,6 +589,7 @@ export async function executeWithProcessRunner(
       sessionParams: resolvedSessionParams,
       sessionDisplayId: resolvedSessionId,
       provider: "openai",
+      biller: resolveCodexBiller(effectiveEnv, billingType),
       model,
       billingType,
       costUsd: null,
@@ -473,8 +618,4 @@ export async function executeWithProcessRunner(
   }
 
   return toResult(initial);
-}
-
-export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
-  return executeWithProcessRunner(ctx, runChildProcess);
 }

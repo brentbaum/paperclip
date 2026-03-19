@@ -1,9 +1,8 @@
 import fs from "node:fs/promises";
-import type { Dirent } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import type { AdapterExecutionContext, AdapterExecutionResult } from "@paperclipai/adapter-utils";
+import { inferOpenAiCompatibleBiller, type AdapterExecutionContext, type AdapterExecutionResult } from "@paperclipai/adapter-utils";
 import {
   asString,
   asNumber,
@@ -13,8 +12,12 @@ import {
   redactEnvForLogs,
   ensureAbsoluteDirectory,
   ensureCommandResolvable,
+  ensurePaperclipSkillSymlink,
   ensurePathInEnv,
+  listPaperclipSkillEntries,
+  removeMaintainerOnlySkillSymlinks,
   renderTemplate,
+  joinPromptSections,
   runChildProcess,
 } from "@paperclipai/adapter-utils/server-utils";
 import { DEFAULT_CURSOR_LOCAL_MODEL } from "../index.js";
@@ -23,10 +26,42 @@ import { normalizeCursorStreamLine } from "../shared/stream.js";
 import { hasCursorTrustBypassArg } from "../shared/trust.js";
 
 const __moduleDir = path.dirname(fileURLToPath(import.meta.url));
-const PAPERCLIP_SKILLS_CANDIDATES = [
-  path.resolve(__moduleDir, "../../skills"),
-  path.resolve(__moduleDir, "../../../../../skills"),
-];
+
+function buildTelegramWakePrompt(context: Record<string, unknown>, agentId: string) {
+  const wakeReason = asString(context.wakeReason, "").trim();
+  const telegramContext = parseObject(context.paperclipTelegram);
+  const tools = parseObject(context.paperclipTools);
+  const telegramTool = parseObject(tools.telegram);
+  const messageText = asString(telegramContext.messageText, "").trim();
+  if (wakeReason !== "telegram_message" || messageText.length === 0) return "";
+
+  const chatId = asString(telegramContext.chatId, "").trim();
+  const topicId = Math.floor(asNumber(telegramContext.topicId, 0));
+  const username = asString(telegramContext.username, "").trim();
+  const userId = Math.floor(asNumber(telegramContext.userId, 0));
+  const sendEndpoint = asString(telegramTool.sendEndpoint, "/api/agent-tools/telegram/send").trim();
+  const senderLabel =
+    username.length > 0 ? `@${username}` : userId > 0 ? `user ${userId}` : "the operator";
+  const location = [
+    chatId.length > 0 ? `chat ${chatId}` : null,
+    topicId > 0 ? `topic ${topicId}` : null,
+  ].filter(Boolean).join(", ");
+
+  const replyPayload: Record<string, unknown> = { agentId, text: "your reply" };
+  if (chatId.length > 0) replyPayload.chatId = chatId;
+  if (topicId > 0) replyPayload.topicId = topicId;
+
+  return [
+    "Telegram wake context:",
+    `- From: ${senderLabel}${location ? ` in ${location}` : ""}`,
+    `- Message: ${JSON.stringify(messageText)}`,
+    "",
+    "Before you end this run, you must send a reply back to Telegram.",
+    `Use POST ${sendEndpoint} with JSON body: ${JSON.stringify(replyPayload)}`,
+    "If no issue work is required, send a concise acknowledgement and stop. Do not only write an internal status update.",
+    "",
+  ].join("\n");
+}
 
 function firstNonEmptyLine(text: string): string {
   return (
@@ -46,6 +81,17 @@ function resolveCursorBillingType(env: Record<string, string>): "api" | "subscri
   return hasNonEmptyEnvValue(env, "CURSOR_API_KEY") || hasNonEmptyEnvValue(env, "OPENAI_API_KEY")
     ? "api"
     : "subscription";
+}
+
+function resolveCursorBiller(
+  env: Record<string, string>,
+  billingType: "api" | "subscription",
+  provider: string | null,
+): string {
+  const openAiCompatibleBiller = inferOpenAiCompatibleBiller(env, null);
+  if (openAiCompatibleBiller === "openrouter") return "openrouter";
+  if (billingType === "subscription") return "cursor";
+  return provider ?? "cursor";
 }
 
 function resolveProviderFromModel(model: string): string | null {
@@ -82,16 +128,9 @@ function cursorSkillsHome(): string {
   return path.join(os.homedir(), ".cursor", "skills");
 }
 
-async function resolvePaperclipSkillsDir(): Promise<string | null> {
-  for (const candidate of PAPERCLIP_SKILLS_CANDIDATES) {
-    const isDir = await fs.stat(candidate).then((s) => s.isDirectory()).catch(() => false);
-    if (isDir) return candidate;
-  }
-  return null;
-}
-
 type EnsureCursorSkillsInjectedOptions = {
   skillsDir?: string | null;
+  skillsEntries?: Array<{ name: string; source: string }>;
   skillsHome?: string;
   linkSkill?: (source: string, target: string) => Promise<void>;
 };
@@ -100,8 +139,13 @@ export async function ensureCursorSkillsInjected(
   onLog: AdapterExecutionContext["onLog"],
   options: EnsureCursorSkillsInjectedOptions = {},
 ) {
-  const skillsDir = options.skillsDir ?? await resolvePaperclipSkillsDir();
-  if (!skillsDir) return;
+  const skillsEntries = options.skillsEntries
+    ?? (options.skillsDir
+      ? (await fs.readdir(options.skillsDir, { withFileTypes: true }))
+          .filter((entry) => entry.isDirectory())
+          .map((entry) => ({ name: entry.name, source: path.join(options.skillsDir!, entry.name) }))
+      : await listPaperclipSkillEntries(__moduleDir));
+  if (skillsEntries.length === 0) return;
 
   const skillsHome = options.skillsHome ?? cursorSkillsHome();
   try {
@@ -113,31 +157,26 @@ export async function ensureCursorSkillsInjected(
     );
     return;
   }
-
-  let entries: Dirent[];
-  try {
-    entries = await fs.readdir(skillsDir, { withFileTypes: true });
-  } catch (err) {
+  const removedSkills = await removeMaintainerOnlySkillSymlinks(
+    skillsHome,
+    skillsEntries.map((entry) => entry.name),
+  );
+  for (const skillName of removedSkills) {
     await onLog(
       "stderr",
-      `[paperclip] Failed to read Paperclip skills from ${skillsDir}: ${err instanceof Error ? err.message : String(err)}\n`,
+      `[paperclip] Removed maintainer-only Cursor skill "${skillName}" from ${skillsHome}\n`,
     );
-    return;
   }
-
   const linkSkill = options.linkSkill ?? ((source: string, target: string) => fs.symlink(source, target));
-  for (const entry of entries) {
-    if (!entry.isDirectory()) continue;
-    const source = path.join(skillsDir, entry.name);
+  for (const entry of skillsEntries) {
     const target = path.join(skillsHome, entry.name);
-    const existing = await fs.lstat(target).catch(() => null);
-    if (existing) continue;
-
     try {
-      await linkSkill(source, target);
+      const result = await ensurePaperclipSkillSymlink(entry.source, target, linkSkill);
+      if (result === "skipped") continue;
+
       await onLog(
         "stderr",
-        `[paperclip] Injected Cursor skill "${entry.name}" into ${skillsHome}\n`,
+        `[paperclip] ${result === "repaired" ? "Repaired" : "Injected"} Cursor skill "${entry.name}" into ${skillsHome}\n`,
       );
     } catch (err) {
       await onLog(
@@ -165,6 +204,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const workspaceId = asString(workspaceContext.workspaceId, "");
   const workspaceRepoUrl = asString(workspaceContext.repoUrl, "");
   const workspaceRepoRef = asString(workspaceContext.repoRef, "");
+  const agentHome = asString(workspaceContext.agentHome, "");
   const workspaceHints = Array.isArray(context.paperclipWorkspaces)
     ? context.paperclipWorkspaces.filter(
         (value): value is Record<string, unknown> => typeof value === "object" && value !== null,
@@ -205,6 +245,17 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const linkedIssueIds = Array.isArray(context.issueIds)
     ? context.issueIds.filter((value): value is string => typeof value === "string" && value.trim().length > 0)
     : [];
+  const wakeMessage =
+    typeof context.wakeMessage === "string" && context.wakeMessage.trim().length > 0
+      ? context.wakeMessage.trim()
+      : null;
+  const telegramContext = parseObject(context.paperclipTelegram);
+  const telegramMessageText = asString(telegramContext.messageText, "");
+  const telegramChatId = asString(telegramContext.chatId, "");
+  const telegramTopicId = Math.floor(asNumber(telegramContext.topicId, 0));
+  const telegramMessageId = Math.floor(asNumber(telegramContext.messageId, 0));
+  const telegramUserId = Math.floor(asNumber(telegramContext.userId, 0));
+  const telegramUsername = asString(telegramContext.username, "");
   if (wakeTaskId) {
     env.PAPERCLIP_TASK_ID = wakeTaskId;
   }
@@ -213,6 +264,27 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   }
   if (wakeCommentId) {
     env.PAPERCLIP_WAKE_COMMENT_ID = wakeCommentId;
+  }
+  if (wakeMessage) {
+    env.PAPERCLIP_WAKE_MESSAGE = wakeMessage;
+  }
+  if (telegramMessageText) {
+    env.PAPERCLIP_TELEGRAM_MESSAGE_TEXT = telegramMessageText;
+  }
+  if (telegramChatId) {
+    env.PAPERCLIP_TELEGRAM_CHAT_ID = telegramChatId;
+  }
+  if (telegramTopicId > 0) {
+    env.PAPERCLIP_TELEGRAM_TOPIC_ID = String(telegramTopicId);
+  }
+  if (telegramMessageId > 0) {
+    env.PAPERCLIP_TELEGRAM_MESSAGE_ID = String(telegramMessageId);
+  }
+  if (telegramUserId > 0) {
+    env.PAPERCLIP_TELEGRAM_USER_ID = String(telegramUserId);
+  }
+  if (telegramUsername) {
+    env.PAPERCLIP_TELEGRAM_USERNAME = telegramUsername;
   }
   if (approvalId) {
     env.PAPERCLIP_APPROVAL_ID = approvalId;
@@ -238,6 +310,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   if (workspaceRepoRef) {
     env.PAPERCLIP_WORKSPACE_REPO_REF = workspaceRepoRef;
   }
+  if (agentHome) {
+    env.AGENT_HOME = agentHome;
+  }
   if (workspaceHints.length > 0) {
     env.PAPERCLIP_WORKSPACES_JSON = JSON.stringify(workspaceHints);
   }
@@ -247,8 +322,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   if (!hasExplicitApiKey && authToken) {
     env.PAPERCLIP_API_KEY = authToken;
   }
-  const billingType = resolveCursorBillingType(env);
-  const runtimeEnv = ensurePathInEnv({ ...process.env, ...env });
+  const effectiveEnv = Object.fromEntries(
+    Object.entries({ ...process.env, ...env }).filter(
+      (entry): entry is [string, string] => typeof entry[1] === "string",
+    ),
+  );
+  const billingType = resolveCursorBillingType(effectiveEnv);
+  const runtimeEnv = ensurePathInEnv(effectiveEnv);
   await ensureCommandResolvable(command, cwd, runtimeEnv);
 
   const timeoutSec = asNumber(config.timeoutSec, 0);
@@ -277,6 +357,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const instructionsFilePath = asString(config.instructionsFilePath, "").trim();
   const instructionsDir = instructionsFilePath ? `${path.dirname(instructionsFilePath)}/` : "";
   let instructionsPrefix = "";
+  let instructionsChars = 0;
   if (instructionsFilePath) {
     try {
       const instructionsContents = await fs.readFile(instructionsFilePath, "utf8");
@@ -284,6 +365,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         `${instructionsContents}\n\n` +
         `The above agent instructions were loaded from ${instructionsFilePath}. ` +
         `Resolve any relative file references from ${instructionsDir}.\n\n`;
+      instructionsChars = instructionsPrefix.length;
       await onLog(
         "stderr",
         `[paperclip] Loaded agent instructions file: ${instructionsFilePath}\n`,
@@ -316,7 +398,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     return notes;
   })();
 
-  const renderedPrompt = renderTemplate(promptTemplate, {
+  const bootstrapPromptTemplate = asString(config.bootstrapPromptTemplate, "");
+  const templateData = {
     agentId: agent.id,
     companyId: agent.companyId,
     runId,
@@ -324,9 +407,31 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     agent,
     run: { id: runId, source: "on_demand" },
     context,
-  });
+  };
+  const renderedPrompt = renderTemplate(promptTemplate, templateData);
+  const renderedBootstrapPrompt =
+    !sessionId && bootstrapPromptTemplate.trim().length > 0
+      ? renderTemplate(bootstrapPromptTemplate, templateData).trim()
+      : "";
+  const sessionHandoffNote = asString(context.paperclipSessionHandoffMarkdown, "").trim();
+  const telegramWakePrompt = buildTelegramWakePrompt(context, agent.id);
   const paperclipEnvNote = renderPaperclipEnvNote(env);
-  const prompt = `${instructionsPrefix}${paperclipEnvNote}${renderedPrompt}`;
+  const prompt = joinPromptSections([
+    telegramWakePrompt,
+    instructionsPrefix,
+    renderedBootstrapPrompt,
+    sessionHandoffNote,
+    paperclipEnvNote,
+    renderedPrompt,
+  ]);
+  const promptMetrics = {
+    promptChars: prompt.length,
+    instructionsChars,
+    bootstrapPromptChars: renderedBootstrapPrompt.length,
+    sessionHandoffChars: sessionHandoffNote.length,
+    runtimeNoteChars: paperclipEnvNote.length,
+    heartbeatPromptChars: renderedPrompt.length,
+  };
 
   const buildArgs = (resumeSessionId: string | null) => {
     const args = ["-p", "--output-format", "stream-json", "--workspace", cwd];
@@ -349,6 +454,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         commandArgs: args,
         env: redactEnvForLogs(env),
         prompt,
+        promptMetrics,
         context,
       });
     }
@@ -454,6 +560,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       sessionParams: resolvedSessionParams,
       sessionDisplayId: resolvedSessionId,
       provider: providerFromModel,
+      biller: resolveCursorBiller(effectiveEnv, billingType, providerFromModel),
       model,
       billingType,
       costUsd: attempt.parsed.costUsd,

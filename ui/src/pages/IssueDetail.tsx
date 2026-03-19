@@ -1,5 +1,5 @@
-import { useEffect, useMemo, useRef, useState, type ChangeEvent } from "react";
-import { useParams, Link, useNavigate } from "react-router-dom";
+import { useEffect, useMemo, useRef, useState, type ChangeEvent, type DragEvent } from "react";
+import { Link, useLocation, useNavigate, useParams } from "@/lib/router";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { issuesApi } from "../api/issues";
 import { activityApi } from "../api/activity";
@@ -7,28 +7,30 @@ import { heartbeatsApi } from "../api/heartbeats";
 import { agentsApi } from "../api/agents";
 import { authApi } from "../api/auth";
 import { projectsApi } from "../api/projects";
-import { remoteExecutionApi } from "../api/remoteExecution";
+import { documentsApi } from "../api/documents";
 import { useCompany } from "../context/CompanyContext";
-import { useSidebar } from "../context/SidebarContext";
-import { useToast } from "../context/ToastContext";
 import { usePanel } from "../context/PanelContext";
+import { useToast } from "../context/ToastContext";
 import { useBreadcrumbs } from "../context/BreadcrumbContext";
 import { queryKeys } from "../lib/queryKeys";
+import { readIssueDetailBreadcrumb } from "../lib/issueDetailBreadcrumb";
 import { useProjectOrder } from "../hooks/useProjectOrder";
-import { isTypingTarget } from "../lib/keyboard";
-import { relativeTime, cn, formatTokens } from "../lib/utils";
+import { relativeTime, cn, formatTokens, visibleRunCostUsd } from "../lib/utils";
 import { InlineEditor } from "../components/InlineEditor";
 import { CommentThread } from "../components/CommentThread";
-import { IssueAssigneePicker } from "../components/IssueAssigneePicker";
+import { IssueDocumentsSection } from "../components/IssueDocumentsSection";
 import { IssueProperties } from "../components/IssueProperties";
-import { IssueRunRail, type RailRun } from "../components/IssueRunRail";
 import { IssuePlanRail } from "../components/IssuePlanRail";
-import { documentsApi } from "../api/documents";
+import { LiveRunWidget } from "../components/LiveRunWidget";
+import { isTypingTarget } from "../lib/keyboard";
 import type { MentionOption } from "../components/MarkdownEditor";
+import { ScrollToBottom } from "../components/ScrollToBottom";
 import { StatusIcon } from "../components/StatusIcon";
 import { PriorityIcon } from "../components/PriorityIcon";
 import { StatusBadge } from "../components/StatusBadge";
 import { Identity } from "../components/Identity";
+import { PluginSlotMount, PluginSlotOutlet, usePluginSlots } from "@/plugins/slots";
+import { PluginLauncherOutlet } from "@/plugins/launchers";
 import { Separator } from "@/components/ui/separator";
 import { Popover, PopoverTrigger, PopoverContent } from "@/components/ui/popover";
 import { Button } from "@/components/ui/button";
@@ -38,8 +40,10 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
   Activity as ActivityIcon,
+  Check,
   ChevronDown,
   ChevronRight,
+  Copy,
   EyeOff,
   Hexagon,
   ListTree,
@@ -52,11 +56,9 @@ import {
 import type { ActivityEvent } from "@paperclipai/shared";
 import type { Agent, IssueAttachment } from "@paperclipai/shared";
 
-type CommentIssueUpdate = {
+type CommentReassignment = {
   assigneeAgentId: string | null;
   assigneeUserId: string | null;
-  executionMode?: "default" | "remote";
-  executionTargetId?: string | null;
 };
 
 const ACTION_LABELS: Record<string, string> = {
@@ -67,6 +69,9 @@ const ACTION_LABELS: Record<string, string> = {
   "issue.comment_added": "added a comment",
   "issue.attachment_added": "added an attachment",
   "issue.attachment_removed": "removed an attachment",
+  "issue.document_created": "created a document",
+  "issue.document_updated": "updated a document",
+  "issue.document_deleted": "deleted a document",
   "issue.deleted": "deleted the issue",
   "agent.created": "created an agent",
   "agent.updated": "updated the agent",
@@ -104,6 +109,36 @@ function truncate(text: string, max: number): string {
   return text.slice(0, max - 1) + "\u2026";
 }
 
+function isMarkdownFile(file: File) {
+  const name = file.name.toLowerCase();
+  return (
+    name.endsWith(".md") ||
+    name.endsWith(".markdown") ||
+    file.type === "text/markdown"
+  );
+}
+
+function fileBaseName(filename: string) {
+  return filename.replace(/\.[^.]+$/, "");
+}
+
+function slugifyDocumentKey(input: string) {
+  const slug = input
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  return slug || "document";
+}
+
+function titleizeFilename(input: string) {
+  return input
+    .split(/[-_ ]+/g)
+    .filter(Boolean)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(" ");
+}
+
 function formatAction(action: string, details?: Record<string, unknown> | null): string {
   if (action === "issue.updated" && details) {
     const previous = (details._previous ?? {}) as Record<string, unknown>;
@@ -137,6 +172,14 @@ function formatAction(action: string, details?: Record<string, unknown> | null):
 
     if (parts.length > 0) return parts.join(", ");
   }
+  if (
+    (action === "issue.document_created" || action === "issue.document_updated" || action === "issue.document_deleted") &&
+    details
+  ) {
+    const key = typeof details.key === "string" ? details.key : "document";
+    const title = typeof details.title === "string" && details.title ? ` (${details.title})` : "";
+    return `${ACTION_LABELS[action] ?? action} ${key}${title}`;
+  }
   return ACTION_LABELS[action] ?? action.replace(/[._]/g, " ");
 }
 
@@ -154,31 +197,34 @@ function ActorIdentity({ evt, agentMap }: { evt: ActivityEvent; agentMap: Map<st
 export function IssueDetail() {
   const { issueId } = useParams<{ issueId: string }>();
   const { selectedCompanyId } = useCompany();
-  const { isMobile } = useSidebar();
-  const { pushToast } = useToast();
   const { openPanel, closePanel, panelVisible, setPanelVisible } = usePanel();
   const { setBreadcrumbs } = useBreadcrumbs();
   const queryClient = useQueryClient();
   const navigate = useNavigate();
+  const location = useLocation();
+  const { pushToast } = useToast();
   const [moreOpen, setMoreOpen] = useState(false);
+  const [copied, setCopied] = useState(false);
   const [mobilePropsOpen, setMobilePropsOpen] = useState(false);
-  const [statusPickerOpen, setStatusPickerOpen] = useState(false);
-  const [priorityPickerOpen, setPriorityPickerOpen] = useState(false);
-  const [assigneePickerOpen, setAssigneePickerOpen] = useState(false);
   const [detailTab, setDetailTab] = useState("comments");
   const [secondaryOpen, setSecondaryOpen] = useState({
     approvals: false,
     cost: false,
   });
   const [attachmentError, setAttachmentError] = useState<string | null>(null);
-  const [pinnedRun, setPinnedRun] = useState<RailRun | null>(null);
+  const [attachmentDragActive, setAttachmentDragActive] = useState(false);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const lastMarkedReadIssueIdRef = useRef<string | null>(null);
+  const [retryingRunId, setRetryingRunId] = useState<string | null>(null);
+  const [statusPickerOpen, setStatusPickerOpen] = useState(false);
+  const [priorityPickerOpen, setPriorityPickerOpen] = useState(false);
 
   const { data: issue, isLoading, error } = useQuery({
     queryKey: queryKeys.issues.detail(issueId!),
     queryFn: () => issuesApi.get(issueId!),
     enabled: !!issueId,
   });
+  const resolvedCompanyId = issue?.companyId ?? selectedCompanyId;
 
   const { data: comments } = useQuery({
     queryKey: queryKeys.issues.comments(issueId!),
@@ -233,9 +279,10 @@ export function IssueDetail() {
 
   const hasPlan = !!(planDoc?.latestRevision?.body?.trim());
   const hasLiveRuns = (liveRuns ?? []).length > 0 || !!activeRun;
-  const hasRunsToShow = hasLiveRuns || !!pinnedRun;
-  const showDesktopRightRail = (hasRunsToShow || hasPlan) && !isMobile;
-  const showDesktopRunRail = hasRunsToShow && !isMobile;
+  const sourceBreadcrumb = useMemo(
+    () => readIssueDetailBreadcrumb(location.state) ?? { label: "Issues", href: "/issues" },
+    [location.state],
+  );
 
   // Filter out runs already shown by the live widget to avoid duplication
   const timelineRuns = useMemo(() => {
@@ -257,11 +304,6 @@ export function IssueDetail() {
     queryFn: () => agentsApi.list(selectedCompanyId!),
     enabled: !!selectedCompanyId,
   });
-  const { data: remoteExecutionTargets } = useQuery({
-    queryKey: queryKeys.remoteExecution.targets(selectedCompanyId!),
-    queryFn: () => remoteExecutionApi.listTargets(selectedCompanyId!),
-    enabled: !!selectedCompanyId,
-  });
 
   const { data: session } = useQuery({
     queryKey: queryKeys.auth.session,
@@ -279,6 +321,21 @@ export function IssueDetail() {
     companyId: selectedCompanyId,
     userId: currentUserId,
   });
+  const { slots: issuePluginDetailSlots } = usePluginSlots({
+    slotTypes: ["detailTab"],
+    entityType: "issue",
+    companyId: resolvedCompanyId,
+    enabled: !!resolvedCompanyId,
+  });
+  const issuePluginTabItems = useMemo(
+    () => issuePluginDetailSlots.map((slot) => ({
+      value: `plugin:${slot.pluginKey}:${slot.id}`,
+      label: slot.displayName,
+      slot,
+    })),
+    [issuePluginDetailSlots],
+  );
+  const activePluginTab = issuePluginTabItems.find((item) => item.value === detailTab) ?? null;
 
   const agentMap = useMemo(() => {
     const map = new Map<string, Agent>();
@@ -326,8 +383,7 @@ export function IssueDetail() {
       options.push({ id: `agent:${agent.id}`, label: agent.name });
     }
     if (currentUserId) {
-      const label = currentUserId === "local-board" ? "Board" : "Me (Board)";
-      options.push({ id: `user:${currentUserId}`, label });
+      options.push({ id: `user:${currentUserId}`, label: "Me" });
     }
     return options;
   }, [agents, currentUserId]);
@@ -337,11 +393,6 @@ export function IssueDetail() {
     if (issue?.assigneeUserId) return `user:${issue.assigneeUserId}`;
     return "";
   }, [issue?.assigneeAgentId, issue?.assigneeUserId]);
-  const remoteExecutionContextReady =
-    !!issue &&
-    agents !== undefined &&
-    projects !== undefined &&
-    remoteExecutionTargets !== undefined;
 
   const commentsWithRunMeta = useMemo(() => {
     const runMetaByCommentId = new Map<string, { runId: string; runAgentId: string | null }>();
@@ -384,9 +435,7 @@ export function IssueDetail() {
         "cached_input_tokens",
         "cache_read_input_tokens",
       );
-      const runCost =
-        usageNumber(usage, "costUsd", "cost_usd", "total_cost_usd") ||
-        usageNumber(result, "total_cost_usd", "cost_usd", "costUsd");
+      const runCost = visibleRunCostUsd(usage, result);
       if (runCost > 0) hasCost = true;
       if (runInput + runOutput + runCached > 0) hasTokens = true;
       input += runInput;
@@ -412,74 +461,74 @@ export function IssueDetail() {
     queryClient.invalidateQueries({ queryKey: queryKeys.issues.runs(issueId!) });
     queryClient.invalidateQueries({ queryKey: queryKeys.issues.approvals(issueId!) });
     queryClient.invalidateQueries({ queryKey: queryKeys.issues.attachments(issueId!) });
+    queryClient.invalidateQueries({ queryKey: queryKeys.issues.documents(issueId!) });
     queryClient.invalidateQueries({ queryKey: queryKeys.issues.liveRuns(issueId!) });
     queryClient.invalidateQueries({ queryKey: queryKeys.issues.activeRun(issueId!) });
     if (selectedCompanyId) {
       queryClient.invalidateQueries({ queryKey: queryKeys.issues.list(selectedCompanyId) });
+      queryClient.invalidateQueries({ queryKey: queryKeys.issues.listTouchedByMe(selectedCompanyId) });
+      queryClient.invalidateQueries({ queryKey: queryKeys.issues.listUnreadTouchedByMe(selectedCompanyId) });
+      queryClient.invalidateQueries({ queryKey: queryKeys.sidebarBadges(selectedCompanyId) });
     }
   };
 
-  const updateIssue = useMutation({
-    mutationFn: (data: Record<string, unknown>) => issuesApi.update(issueId!, data),
-    onSuccess: (updated) => {
-      invalidateIssue();
-      const issueRef = updated.identifier ?? `Issue ${updated.id.slice(0, 8)}`;
-      pushToast({
-        dedupeKey: `activity:issue.updated:${updated.id}`,
-        title: `${issueRef} updated`,
-        body: truncate(updated.title, 96),
-        tone: "success",
-        action: { label: `View ${issueRef}`, href: `/issues/${updated.identifier ?? updated.id}` },
-      });
+  const markIssueRead = useMutation({
+    mutationFn: (id: string) => issuesApi.markRead(id),
+    onSuccess: () => {
+      if (selectedCompanyId) {
+        queryClient.invalidateQueries({ queryKey: queryKeys.issues.listTouchedByMe(selectedCompanyId) });
+        queryClient.invalidateQueries({ queryKey: queryKeys.issues.listUnreadTouchedByMe(selectedCompanyId) });
+        queryClient.invalidateQueries({ queryKey: queryKeys.sidebarBadges(selectedCompanyId) });
+      }
     },
   });
+
+  const updateIssue = useMutation({
+    mutationFn: (data: Record<string, unknown>) => issuesApi.update(issueId!, data),
+    onSuccess: () => {
+      invalidateIssue();
+    },
+  });
+
+  const retryRun = async (run: { runId: string; agentId: string }) => {
+    setRetryingRunId(run.runId);
+    try {
+      await agentsApi.wakeup(run.agentId, { source: "on_demand", triggerDetail: "manual", payload: { issueId: issue!.id } });
+      invalidateIssue();
+      queryClient.invalidateQueries({ queryKey: queryKeys.issues.runs(issueId!) });
+    } finally {
+      setRetryingRunId(null);
+    }
+  };
 
   const addComment = useMutation({
     mutationFn: ({ body, reopen }: { body: string; reopen?: boolean }) =>
       issuesApi.addComment(issueId!, body, reopen),
-    onSuccess: (comment) => {
+    onSuccess: () => {
       invalidateIssue();
       queryClient.invalidateQueries({ queryKey: queryKeys.issues.comments(issueId!) });
-      const issueRef = issue?.identifier ?? (issueId ? `Issue ${issueId.slice(0, 8)}` : "Issue");
-      pushToast({
-        dedupeKey: `activity:issue.comment_added:${issueId}:${comment.id}`,
-        title: `Comment posted on ${issueRef}`,
-        body: issue?.title ? truncate(issue.title, 96) : undefined,
-        tone: "success",
-        action: issueId ? { label: `View ${issueRef}`, href: `/issues/${issue?.identifier ?? issueId}` } : undefined,
-      });
     },
   });
 
-  const addCommentAndUpdateIssue = useMutation({
+  const addCommentAndReassign = useMutation({
     mutationFn: ({
       body,
       reopen,
-      issueUpdate,
+      reassignment,
     }: {
       body: string;
       reopen?: boolean;
-      issueUpdate: CommentIssueUpdate;
+      reassignment: CommentReassignment;
     }) =>
       issuesApi.update(issueId!, {
         comment: body,
-        assigneeAgentId: issueUpdate.assigneeAgentId,
-        assigneeUserId: issueUpdate.assigneeUserId,
-        ...(issueUpdate.executionMode ? { executionMode: issueUpdate.executionMode } : {}),
-        ...(issueUpdate.executionTargetId !== undefined ? { executionTargetId: issueUpdate.executionTargetId } : {}),
+        assigneeAgentId: reassignment.assigneeAgentId,
+        assigneeUserId: reassignment.assigneeUserId,
         ...(reopen ? { status: "todo" } : {}),
       }),
-    onSuccess: (updated) => {
+    onSuccess: () => {
       invalidateIssue();
       queryClient.invalidateQueries({ queryKey: queryKeys.issues.comments(issueId!) });
-      const issueRef = updated.identifier ?? (issueId ? `Issue ${issueId.slice(0, 8)}` : "Issue");
-      pushToast({
-        dedupeKey: `activity:issue.reassigned:${updated.id}`,
-        title: `${issueRef} reassigned`,
-        body: issue?.title ? truncate(issue.title, 96) : undefined,
-        tone: "success",
-        action: issueId ? { label: `View ${issueRef}`, href: `/issues/${issue?.identifier ?? issueId}` } : undefined,
-      });
     },
   });
 
@@ -498,6 +547,30 @@ export function IssueDetail() {
     },
   });
 
+  const importMarkdownDocument = useMutation({
+    mutationFn: async (file: File) => {
+      const baseName = fileBaseName(file.name);
+      const key = slugifyDocumentKey(baseName);
+      const existing = (issue?.documentSummaries ?? []).find((doc) => doc.key === key) ?? null;
+      const body = await file.text();
+      const inferredTitle = titleizeFilename(baseName);
+      const nextTitle = existing?.title ?? inferredTitle ?? null;
+      return issuesApi.upsertDocument(issueId!, key, {
+        title: key === "plan" ? null : nextTitle,
+        format: "markdown",
+        body,
+        baseRevisionId: existing?.latestRevisionId ?? null,
+      });
+    },
+    onSuccess: () => {
+      setAttachmentError(null);
+      invalidateIssue();
+    },
+    onError: (err) => {
+      setAttachmentError(err instanceof Error ? err.message : "Document import failed");
+    },
+  });
+
   const deleteAttachment = useMutation({
     mutationFn: (attachmentId: string) => issuesApi.deleteAttachment(attachmentId),
     onSuccess: () => {
@@ -510,63 +583,49 @@ export function IssueDetail() {
     },
   });
 
-  const retryRun = useMutation({
-    mutationFn: async (run: { runId: string; agentId: string }) => {
-      const payload: Record<string, unknown> = {};
-      if (issueId) payload.issueId = issueId;
-      const result = await agentsApi.wakeup(run.agentId, {
-        source: "on_demand",
-        triggerDetail: "manual",
-        reason: "retry_failed_run",
-        payload,
-      });
-      if (!("id" in result)) {
-        throw new Error("Retry was skipped because the agent is not currently invokable.");
-      }
-      return result;
-    },
-    onSuccess: () => {
-      if (issueId) {
-        queryClient.invalidateQueries({ queryKey: queryKeys.issues.liveRuns(issueId) });
-        queryClient.invalidateQueries({ queryKey: queryKeys.issues.activeRun(issueId) });
-        queryClient.invalidateQueries({ queryKey: queryKeys.issues.runs(issueId!) });
-      }
-    },
-  });
-
-  const markViewedMutation = useMutation({
-    mutationFn: (id: string) => issuesApi.markViewed(id),
-    onSuccess: () => {
-      if (selectedCompanyId) {
-        queryClient.invalidateQueries({ queryKey: queryKeys.issues.list(selectedCompanyId) });
-        queryClient.invalidateQueries({ queryKey: queryKeys.issues.listAssignedToMe(selectedCompanyId) });
-        queryClient.invalidateQueries({ queryKey: queryKeys.sidebarBadges(selectedCompanyId) });
-      }
-    },
-  });
-
   useEffect(() => {
+    const titleLabel = issue?.title ?? issueId ?? "Issue";
     setBreadcrumbs([
-      { label: "Issues", href: "/issues" },
-      { label: issue?.title ?? issueId ?? "Issue" },
+      sourceBreadcrumb,
+      { label: hasLiveRuns ? `🔵 ${titleLabel}` : titleLabel },
     ]);
-  }, [setBreadcrumbs, issue, issueId]);
-
-  // Mark issue as viewed when detail page loads
-  const viewedRef = useRef<string | null>(null);
-  useEffect(() => {
-    if (issue?.id && viewedRef.current !== issue.id) {
-      viewedRef.current = issue.id;
-      markViewedMutation.mutate(issue.id);
-    }
-  }, [issue?.id]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [setBreadcrumbs, sourceBreadcrumb, issue, issueId, hasLiveRuns]);
 
   // Redirect to identifier-based URL if navigated via UUID
   useEffect(() => {
     if (issue?.identifier && issueId !== issue.identifier) {
-      navigate(`/issues/${issue.identifier}`, { replace: true });
+      navigate(`/issues/${issue.identifier}`, { replace: true, state: location.state });
     }
-  }, [issue, issueId, navigate]);
+  }, [issue, issueId, navigate, location.state]);
+
+  useEffect(() => {
+    if (!issue?.id) return;
+    if (lastMarkedReadIssueIdRef.current === issue.id) return;
+    lastMarkedReadIssueIdRef.current = issue.id;
+    markIssueRead.mutate(issue.id);
+  }, [issue?.id]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Keyboard shortcuts: s = status, p = priority
+  useEffect(() => {
+    function handleKeyDown(event: KeyboardEvent) {
+      if (event.metaKey || event.ctrlKey || event.altKey) return;
+      if (isTypingTarget(event.target)) return;
+
+      const key = event.key.toLowerCase();
+      if (key === "s") {
+        event.preventDefault();
+        setPriorityPickerOpen(false);
+        setStatusPickerOpen(true);
+      } else if (key === "p") {
+        event.preventDefault();
+        setStatusPickerOpen(false);
+        setPriorityPickerOpen(true);
+      }
+    }
+
+    document.addEventListener("keydown", handleKeyDown);
+    return () => document.removeEventListener("keydown", handleKeyDown);
+  }, []);
 
   useEffect(() => {
     if (issue) {
@@ -577,33 +636,21 @@ export function IssueDetail() {
     return () => closePanel();
   }, [issue]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  useEffect(() => {
-    function handleKeyDown(event: KeyboardEvent) {
-      if (event.metaKey || event.ctrlKey || event.altKey) return;
-      if (isTypingTarget(event.target)) return;
-
-      const key = event.key.toLowerCase();
-      if (key === "s") {
-        event.preventDefault();
-        setPriorityPickerOpen(false);
-        setAssigneePickerOpen(false);
-        setStatusPickerOpen(true);
-      } else if (key === "p") {
-        event.preventDefault();
-        setStatusPickerOpen(false);
-        setAssigneePickerOpen(false);
-        setPriorityPickerOpen(true);
-      } else if (key === "a") {
-        event.preventDefault();
-        setStatusPickerOpen(false);
-        setPriorityPickerOpen(false);
-        setAssigneePickerOpen(true);
-      }
-    }
-
-    document.addEventListener("keydown", handleKeyDown);
-    return () => document.removeEventListener("keydown", handleKeyDown);
-  }, []);
+  const copyIssueToClipboard = async () => {
+    if (!issue) return;
+    const decodeEntities = (text: string) => {
+      const el = document.createElement("textarea");
+      el.innerHTML = text;
+      return el.value;
+    };
+    const title = decodeEntities(issue.title);
+    const body = decodeEntities(issue.description ?? "");
+    const md = `# ${issue.identifier}: ${title}\n\n${body}`.trimEnd();
+    await navigator.clipboard.writeText(md);
+    setCopied(true);
+    pushToast({ title: "Copied to clipboard", tone: "success" });
+    setTimeout(() => setCopied(false), 2000);
+  };
 
   if (isLoading) return <p className="text-sm text-muted-foreground">Loading...</p>;
   if (error) return <p className="text-sm text-destructive">{error.message}</p>;
@@ -611,20 +658,73 @@ export function IssueDetail() {
 
   // Ancestors are returned oldest-first from the server (root at end, immediate parent at start)
   const ancestors = issue.ancestors ?? [];
-
   const handleFilePicked = async (evt: ChangeEvent<HTMLInputElement>) => {
-    const file = evt.target.files?.[0];
-    if (!file) return;
-    await uploadAttachment.mutateAsync(file);
+    const files = evt.target.files;
+    if (!files || files.length === 0) return;
+    for (const file of Array.from(files)) {
+      if (isMarkdownFile(file)) {
+        await importMarkdownDocument.mutateAsync(file);
+      } else {
+        await uploadAttachment.mutateAsync(file);
+      }
+    }
     if (fileInputRef.current) {
       fileInputRef.current.value = "";
     }
   };
 
+  const handleAttachmentDrop = async (evt: DragEvent<HTMLDivElement>) => {
+    evt.preventDefault();
+    setAttachmentDragActive(false);
+    const files = evt.dataTransfer.files;
+    if (!files || files.length === 0) return;
+    for (const file of Array.from(files)) {
+      if (isMarkdownFile(file)) {
+        await importMarkdownDocument.mutateAsync(file);
+      } else {
+        await uploadAttachment.mutateAsync(file);
+      }
+    }
+  };
+
   const isImageAttachment = (attachment: IssueAttachment) => attachment.contentType.startsWith("image/");
+  const attachmentList = attachments ?? [];
+  const hasAttachments = attachmentList.length > 0;
+  const attachmentUploadButton = (
+    <>
+      <input
+        ref={fileInputRef}
+        type="file"
+        accept="image/*,application/pdf,text/plain,text/markdown,application/json,text/csv,text/html,.md,.markdown"
+        className="hidden"
+        onChange={handleFilePicked}
+        multiple
+      />
+      <Button
+        variant="outline"
+        size="sm"
+        onClick={() => fileInputRef.current?.click()}
+        disabled={uploadAttachment.isPending || importMarkdownDocument.isPending}
+        className={cn(
+          "shadow-none",
+          attachmentDragActive && "border-primary bg-primary/5",
+        )}
+      >
+        <Paperclip className="h-3.5 w-3.5 mr-1.5" />
+        {uploadAttachment.isPending || importMarkdownDocument.isPending ? "Uploading..." : "Upload attachment"}
+      </Button>
+    </>
+  );
+
+  const showRail = hasPlan;
 
   return (
-    <div className={cn("space-y-6", showDesktopRightRail ? "max-w-6xl" : "max-w-2xl")}>
+    <div className={cn(
+      showRail
+        ? "grid gap-6 xl:grid-cols-[minmax(0,1fr)_26rem]"
+        : "max-w-2xl",
+    )}>
+    <div className="space-y-6">
       {/* Parent chain breadcrumb */}
       {ancestors.length > 0 && (
         <nav className="flex items-center gap-1 text-xs text-muted-foreground flex-wrap">
@@ -633,6 +733,7 @@ export function IssueDetail() {
               {i > 0 && <ChevronRight className="h-3 w-3 shrink-0" />}
               <Link
                 to={`/issues/${ancestor.identifier ?? ancestor.id}`}
+                state={location.state}
                 className="hover:text-foreground transition-colors truncate max-w-[200px]"
                 title={ancestor.title}
               >
@@ -652,238 +753,281 @@ export function IssueDetail() {
         </div>
       )}
 
-      <div className={cn(showDesktopRightRail && "grid gap-6 xl:grid-cols-[minmax(0,1fr)_26rem] xl:items-start")}>
-        <div className="min-w-0 space-y-6">
-          <div className="space-y-3">
-            <div className="flex items-center gap-2 min-w-0 flex-wrap">
-              <StatusIcon
-                status={issue.status}
-                open={statusPickerOpen}
-                onOpenChange={setStatusPickerOpen}
-                onChange={(status) => updateIssue.mutate({ status })}
-              />
-              <PriorityIcon
-                priority={issue.priority}
-                open={priorityPickerOpen}
-                onOpenChange={setPriorityPickerOpen}
-                onChange={(priority) => updateIssue.mutate({ priority })}
-              />
-              <IssueAssigneePicker
-                issue={issue}
-                agents={agents}
-                currentUserId={currentUserId}
-                open={assigneePickerOpen}
-                onOpenChange={setAssigneePickerOpen}
-                compact
-                onChange={(assigneeAgentId, assigneeUserId) => updateIssue.mutate({ assigneeAgentId, assigneeUserId })}
-              />
-              <span className="text-sm font-mono text-muted-foreground shrink-0">{issue.identifier ?? issue.id.slice(0, 8)}</span>
+      <div className="space-y-3">
+        <div className="flex items-center gap-2 min-w-0 flex-wrap">
+          <StatusIcon
+            status={issue.status}
+            open={statusPickerOpen}
+            onOpenChange={setStatusPickerOpen}
+            onChange={(status) => updateIssue.mutate({ status })}
+          />
+          <PriorityIcon
+            priority={issue.priority}
+            open={priorityPickerOpen}
+            onOpenChange={setPriorityPickerOpen}
+            onChange={(priority) => updateIssue.mutate({ priority })}
+          />
+          <span className="text-sm font-mono text-muted-foreground shrink-0">{issue.identifier ?? issue.id.slice(0, 8)}</span>
 
-              {hasLiveRuns && (
-                <span className="inline-flex items-center gap-1.5 rounded-full bg-cyan-500/10 border border-cyan-500/30 px-2 py-0.5 text-[10px] font-medium text-cyan-600 dark:text-cyan-400 shrink-0">
-                  <span className="relative flex h-1.5 w-1.5">
-                    <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-cyan-400 opacity-75" />
-                    <span className="relative inline-flex rounded-full h-1.5 w-1.5 bg-cyan-400" />
-                  </span>
-                  Live
-                </span>
-              )}
+          {hasLiveRuns && (
+            <span className="inline-flex items-center gap-1.5 rounded-full bg-cyan-500/10 border border-cyan-500/30 px-2 py-0.5 text-[10px] font-medium text-cyan-600 dark:text-cyan-400 shrink-0">
+              <span className="relative flex h-1.5 w-1.5">
+                <span className="animate-pulse absolute inline-flex h-full w-full rounded-full bg-cyan-400 opacity-75" />
+                <span className="relative inline-flex rounded-full h-1.5 w-1.5 bg-cyan-400" />
+              </span>
+              Live
+            </span>
+          )}
 
-              {issue.projectId ? (
-                <Link
-                  to={`/projects/${issue.projectId}`}
-                  className="inline-flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground transition-colors rounded px-1 -mx-1 py-0.5 min-w-0"
-                >
-                  <Hexagon className="h-3 w-3 shrink-0" />
-                  <span className="truncate">{(projects ?? []).find((p) => p.id === issue.projectId)?.name ?? issue.projectId.slice(0, 8)}</span>
-                </Link>
-              ) : (
-                <span className="inline-flex items-center gap-1 text-xs text-muted-foreground opacity-50 px-1 -mx-1 py-0.5">
-                  <Hexagon className="h-3 w-3 shrink-0" />
-                  No project
-                </span>
-              )}
-
-              {(issue.labels ?? []).length > 0 && (
-                <div className="hidden sm:flex items-center gap-1">
-                  {(issue.labels ?? []).slice(0, 4).map((label) => (
-                    <span
-                      key={label.id}
-                      className="inline-flex items-center rounded-full border px-2 py-0.5 text-[10px] font-medium"
-                      style={{
-                        borderColor: label.color,
-                        color: label.color,
-                        backgroundColor: `${label.color}1f`,
-                      }}
-                    >
-                      {label.name}
-                    </span>
-                  ))}
-                  {(issue.labels ?? []).length > 4 && (
-                    <span className="text-[10px] text-muted-foreground">+{(issue.labels ?? []).length - 4}</span>
-                  )}
-                </div>
-              )}
-
-              <Button
-                variant="ghost"
-                size="icon-xs"
-                className="ml-auto md:hidden shrink-0"
-                onClick={() => setMobilePropsOpen(true)}
-                title="Properties"
-              >
-                <SlidersHorizontal className="h-4 w-4" />
-              </Button>
-
-              <div className="hidden md:flex items-center md:ml-auto shrink-0">
-                <Button
-                  variant="ghost"
-                  size="icon-xs"
-                  className={cn(
-                    "shrink-0 transition-opacity duration-200",
-                    panelVisible ? "opacity-0 pointer-events-none w-0 overflow-hidden" : "opacity-100",
-                  )}
-                  onClick={() => setPanelVisible(true)}
-                  title="Show properties"
-                >
-                  <SlidersHorizontal className="h-4 w-4" />
-                </Button>
-
-                <Popover open={moreOpen} onOpenChange={setMoreOpen}>
-                  <PopoverTrigger asChild>
-                    <Button variant="ghost" size="icon-xs" className="shrink-0">
-                      <MoreHorizontal className="h-4 w-4" />
-                    </Button>
-                  </PopoverTrigger>
-                  <PopoverContent className="w-44 p-1" align="end">
-                    <button
-                      className="flex items-center gap-2 w-full px-2 py-1.5 text-xs rounded hover:bg-accent/50 text-destructive"
-                      onClick={() => {
-                        updateIssue.mutate(
-                          { hiddenAt: new Date().toISOString() },
-                          { onSuccess: () => navigate("/issues/all") },
-                        );
-                        setMoreOpen(false);
-                      }}
-                    >
-                      <EyeOff className="h-3 w-3" />
-                      Hide this Issue
-                    </button>
-                  </PopoverContent>
-                </Popover>
-              </div>
-            </div>
-
-            <InlineEditor
-              value={issue.title}
-              onSave={(title) => updateIssue.mutate({ title })}
-              as="h2"
-              className="text-xl font-bold"
-            />
-
-            <InlineEditor
-              value={issue.description ?? ""}
-              onSave={(description) => updateIssue.mutate({ description })}
-              as="p"
-              className="text-sm text-muted-foreground"
-              placeholder="Add a description..."
-              multiline
-              mentions={mentionOptions}
-              imageUploadHandler={async (file) => {
-                const attachment = await uploadAttachment.mutateAsync(file);
-                return attachment.contentPath;
-              }}
-            />
-          </div>
-
-          {hasPlan && isMobile ? (
-            <IssuePlanRail
-              issueId={issueId!}
-              onApprove={(body) => {
-                addComment.mutate({ body: `**Plan approved.**\n\n${body.length > 200 ? body.slice(0, 200) + "..." : ""}` });
-              }}
-              onRequestChanges={(feedback) => {
-                addComment.mutate({ body: `**Changes requested on plan:**\n\n${feedback}` });
-              }}
-            />
-          ) : null}
-          {hasRunsToShow && isMobile ? <IssueRunRail issueId={issueId!} companyId={issue.companyId} pinnedRun={pinnedRun} /> : null}
-
-          <div className="space-y-3">
-        <div className="flex items-center justify-between gap-2">
-          <h3 className="text-sm font-medium text-muted-foreground">Attachments</h3>
-          <div className="flex items-center gap-2">
-            <input
-              ref={fileInputRef}
-              type="file"
-              accept="image/png,image/jpeg,image/webp,image/gif"
-              className="hidden"
-              onChange={handleFilePicked}
-            />
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() => fileInputRef.current?.click()}
-              disabled={uploadAttachment.isPending}
+          {issue.projectId ? (
+            <Link
+              to={`/projects/${issue.projectId}`}
+              className="inline-flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground transition-colors rounded px-1 -mx-1 py-0.5 min-w-0"
             >
-              <Paperclip className="h-3.5 w-3.5 mr-1.5" />
-              {uploadAttachment.isPending ? "Uploading..." : "Upload image"}
+              <Hexagon className="h-3 w-3 shrink-0" />
+              <span className="truncate">{(projects ?? []).find((p) => p.id === issue.projectId)?.name ?? issue.projectId.slice(0, 8)}</span>
+            </Link>
+          ) : (
+            <span className="inline-flex items-center gap-1 text-xs text-muted-foreground opacity-50 px-1 -mx-1 py-0.5">
+              <Hexagon className="h-3 w-3 shrink-0" />
+              No project
+            </span>
+          )}
+
+          {(issue.labels ?? []).length > 0 && (
+            <div className="hidden sm:flex items-center gap-1">
+              {(issue.labels ?? []).slice(0, 4).map((label) => (
+                <span
+                  key={label.id}
+                  className="inline-flex items-center rounded-full border px-2 py-0.5 text-[10px] font-medium"
+                  style={{
+                    borderColor: label.color,
+                    color: label.color,
+                    backgroundColor: `${label.color}1f`,
+                  }}
+                >
+                  {label.name}
+                </span>
+              ))}
+              {(issue.labels ?? []).length > 4 && (
+                <span className="text-[10px] text-muted-foreground">+{(issue.labels ?? []).length - 4}</span>
+              )}
+            </div>
+          )}
+
+          <div className="ml-auto flex items-center gap-0.5 md:hidden shrink-0">
+            <Button
+              variant="ghost"
+              size="icon-xs"
+              onClick={copyIssueToClipboard}
+              title="Copy issue as markdown"
+            >
+              {copied ? <Check className="h-4 w-4 text-green-500" /> : <Copy className="h-4 w-4" />}
+            </Button>
+            <Button
+              variant="ghost"
+              size="icon-xs"
+              onClick={() => setMobilePropsOpen(true)}
+              title="Properties"
+            >
+              <SlidersHorizontal className="h-4 w-4" />
             </Button>
           </div>
+
+          <div className="hidden md:flex items-center md:ml-auto shrink-0">
+            <Button
+              variant="ghost"
+              size="icon-xs"
+              onClick={copyIssueToClipboard}
+              title="Copy issue as markdown"
+            >
+              {copied ? <Check className="h-4 w-4 text-green-500" /> : <Copy className="h-4 w-4" />}
+            </Button>
+            <Button
+              variant="ghost"
+              size="icon-xs"
+              className={cn(
+                "shrink-0 transition-opacity duration-200",
+                panelVisible ? "opacity-0 pointer-events-none w-0 overflow-hidden" : "opacity-100",
+              )}
+              onClick={() => setPanelVisible(true)}
+              title="Show properties"
+            >
+              <SlidersHorizontal className="h-4 w-4" />
+            </Button>
+
+            <Popover open={moreOpen} onOpenChange={setMoreOpen}>
+              <PopoverTrigger asChild>
+                <Button variant="ghost" size="icon-xs" className="shrink-0">
+                  <MoreHorizontal className="h-4 w-4" />
+                </Button>
+              </PopoverTrigger>
+            <PopoverContent className="w-44 p-1" align="end">
+              <button
+                className="flex items-center gap-2 w-full px-2 py-1.5 text-xs rounded hover:bg-accent/50 text-destructive"
+                onClick={() => {
+                  updateIssue.mutate(
+                    { hiddenAt: new Date().toISOString() },
+                    { onSuccess: () => navigate("/issues/all") },
+                  );
+                  setMoreOpen(false);
+                }}
+              >
+                <EyeOff className="h-3 w-3" />
+                Hide this Issue
+              </button>
+            </PopoverContent>
+            </Popover>
+          </div>
+        </div>
+
+        <InlineEditor
+          value={issue.title}
+          onSave={(title) => updateIssue.mutateAsync({ title })}
+          as="h2"
+          className="text-xl font-bold"
+        />
+
+        <InlineEditor
+          value={issue.description ?? ""}
+          onSave={(description) => updateIssue.mutateAsync({ description })}
+          as="p"
+          className="text-[15px] leading-7 text-foreground"
+          placeholder="Add a description..."
+          multiline
+          mentions={mentionOptions}
+          imageUploadHandler={async (file) => {
+            const attachment = await uploadAttachment.mutateAsync(file);
+            return attachment.contentPath;
+          }}
+        />
+      </div>
+
+      <PluginSlotOutlet
+        slotTypes={["toolbarButton", "contextMenuItem"]}
+        entityType="issue"
+        context={{
+          companyId: issue.companyId,
+          projectId: issue.projectId ?? null,
+          entityId: issue.id,
+          entityType: "issue",
+        }}
+        className="flex flex-wrap gap-2"
+        itemClassName="inline-flex"
+        missingBehavior="placeholder"
+      />
+
+      <PluginLauncherOutlet
+        placementZones={["toolbarButton"]}
+        entityType="issue"
+        context={{
+          companyId: issue.companyId,
+          projectId: issue.projectId ?? null,
+          entityId: issue.id,
+          entityType: "issue",
+        }}
+        className="flex flex-wrap gap-2"
+        itemClassName="inline-flex"
+      />
+
+      <PluginSlotOutlet
+        slotTypes={["taskDetailView"]}
+        entityType="issue"
+        context={{
+          companyId: issue.companyId,
+          projectId: issue.projectId ?? null,
+          entityId: issue.id,
+          entityType: "issue",
+        }}
+        className="space-y-3"
+        itemClassName="rounded-lg border border-border p-3"
+        missingBehavior="placeholder"
+      />
+
+      <IssueDocumentsSection
+        issue={issue}
+        canDeleteDocuments={Boolean(session?.user?.id)}
+        mentions={mentionOptions}
+        imageUploadHandler={async (file) => {
+          const attachment = await uploadAttachment.mutateAsync(file);
+          return attachment.contentPath;
+        }}
+        extraActions={!hasAttachments ? attachmentUploadButton : undefined}
+      />
+
+      {hasAttachments ? (
+        <div
+        className={cn(
+          "space-y-3 rounded-lg transition-colors",
+        )}
+        onDragEnter={(evt) => {
+          evt.preventDefault();
+          setAttachmentDragActive(true);
+        }}
+        onDragOver={(evt) => {
+          evt.preventDefault();
+          setAttachmentDragActive(true);
+        }}
+        onDragLeave={(evt) => {
+          if (evt.currentTarget.contains(evt.relatedTarget as Node | null)) return;
+          setAttachmentDragActive(false);
+        }}
+        onDrop={(evt) => void handleAttachmentDrop(evt)}
+      >
+        <div className="flex items-center justify-between gap-2">
+          <h3 className="text-sm font-medium text-muted-foreground">Attachments</h3>
+          {attachmentUploadButton}
         </div>
 
         {attachmentError && (
           <p className="text-xs text-destructive">{attachmentError}</p>
         )}
 
-        {(!attachments || attachments.length === 0) ? (
-          <p className="text-xs text-muted-foreground">No attachments yet.</p>
-        ) : (
-          <div className="space-y-2">
-            {attachments.map((attachment) => (
-              <div key={attachment.id} className="border border-border rounded-md p-2">
-                <div className="flex items-center justify-between gap-2">
-                  <a
-                    href={attachment.contentPath}
-                    target="_blank"
-                    rel="noreferrer"
-                    className="text-xs hover:underline truncate"
-                    title={attachment.originalFilename ?? attachment.id}
-                  >
-                    {attachment.originalFilename ?? attachment.id}
-                  </a>
-                  <button
-                    type="button"
-                    className="text-muted-foreground hover:text-destructive"
-                    onClick={() => deleteAttachment.mutate(attachment.id)}
-                    disabled={deleteAttachment.isPending}
-                    title="Delete attachment"
-                  >
-                    <Trash2 className="h-3.5 w-3.5" />
-                  </button>
-                </div>
-                <p className="text-[11px] text-muted-foreground">
-                  {attachment.contentType} · {(attachment.byteSize / 1024).toFixed(1)} KB
-                </p>
-                {isImageAttachment(attachment) && (
-                  <a href={attachment.contentPath} target="_blank" rel="noreferrer">
-                    <img
-                      src={attachment.contentPath}
-                      alt={attachment.originalFilename ?? "attachment"}
-                      className="mt-2 max-h-56 rounded border border-border object-contain bg-accent/10"
-                      loading="lazy"
-                    />
-                  </a>
-                )}
+        <div className="space-y-2">
+          {attachmentList.map((attachment) => (
+            <div key={attachment.id} className="border border-border rounded-md p-2">
+              <div className="flex items-center justify-between gap-2">
+                <a
+                  href={attachment.contentPath}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="text-xs hover:underline truncate"
+                  title={attachment.originalFilename ?? attachment.id}
+                >
+                  {attachment.originalFilename ?? attachment.id}
+                </a>
+                <button
+                  type="button"
+                  className="text-muted-foreground hover:text-destructive"
+                  onClick={() => deleteAttachment.mutate(attachment.id)}
+                  disabled={deleteAttachment.isPending}
+                  title="Delete attachment"
+                >
+                  <Trash2 className="h-3.5 w-3.5" />
+                </button>
               </div>
-            ))}
-          </div>
-        )}
-          </div>
+              <p className="text-[11px] text-muted-foreground">
+                {attachment.contentType} · {(attachment.byteSize / 1024).toFixed(1)} KB
+              </p>
+              {isImageAttachment(attachment) && (
+                <a href={attachment.contentPath} target="_blank" rel="noreferrer">
+                  <img
+                    src={attachment.contentPath}
+                    alt={attachment.originalFilename ?? "attachment"}
+                    className="mt-2 max-h-56 rounded border border-border object-contain bg-accent/10"
+                    loading="lazy"
+                  />
+                </a>
+              )}
+            </div>
+          ))}
+        </div>
+        </div>
+      ) : null}
 
-          <Separator />
+      <Separator />
 
-          <Tabs value={detailTab} onValueChange={setDetailTab} className="space-y-3">
+      <Tabs value={detailTab} onValueChange={setDetailTab} className="space-y-3">
         <TabsList variant="line" className="w-full justify-start gap-1">
           <TabsTrigger value="comments" className="gap-1.5">
             <MessageSquare className="h-3.5 w-3.5" />
@@ -897,28 +1041,29 @@ export function IssueDetail() {
             <ActivityIcon className="h-3.5 w-3.5" />
             Activity
           </TabsTrigger>
+          {issuePluginTabItems.map((item) => (
+            <TabsTrigger key={item.value} value={item.value}>
+              {item.label}
+            </TabsTrigger>
+          ))}
         </TabsList>
 
         <TabsContent value="comments">
           <CommentThread
             comments={commentsWithRunMeta}
             linkedRuns={timelineRuns}
+            companyId={issue.companyId}
+            projectId={issue.projectId}
             issueStatus={issue.status}
             agentMap={agentMap}
             draftKey={`paperclip:issue-comment-draft:${issue.id}`}
             enableReassign
             reassignOptions={commentReassignOptions}
             currentAssigneeValue={currentAssigneeValue}
-            currentAssigneeAgentId={issue.assigneeAgentId}
-            executionMode={issue.executionMode}
-            executionTargetId={issue.executionTargetId}
-            executionTargets={remoteExecutionTargets ?? []}
-            remoteTargetScopeKey={selectedCompanyId ?? issue.companyId}
-            remoteExecutionContextReady={remoteExecutionContextReady}
             mentions={mentionOptions}
-            onAdd={async (body, reopen, issueUpdate) => {
-              if (issueUpdate) {
-                await addCommentAndUpdateIssue.mutateAsync({ body, reopen, issueUpdate });
+            onAdd={async (body, reopen, reassignment) => {
+              if (reassignment) {
+                await addCommentAndReassign.mutateAsync({ body, reopen, reassignment });
                 return;
               }
               await addComment.mutateAsync({ body, reopen });
@@ -930,25 +1075,9 @@ export function IssueDetail() {
             onAttachImage={async (file) => {
               await uploadAttachment.mutateAsync(file);
             }}
-            onRetryRun={(run) => retryRun.mutate({ runId: run.runId, agentId: run.agentId })}
-            retryingRunId={retryRun.isPending ? (retryRun.variables?.runId ?? null) : null}
-            onRunClick={(runId, agentId) => {
-              const agent = agentMap.get(agentId);
-              const run = (linkedRuns ?? []).find((r) => r.runId === runId);
-              setPinnedRun({
-                id: runId,
-                status: run?.status ?? "completed",
-                invocationSource: run?.invocationSource ?? "heartbeat",
-                triggerDetail: null,
-                startedAt: run?.startedAt ?? null,
-                finishedAt: run?.finishedAt ?? null,
-                createdAt: run?.createdAt ?? new Date().toISOString(),
-                agentId,
-                agentName: agent?.name ?? agentId.slice(0, 8),
-                adapterType: agent?.adapterType ?? "claude_local",
-                issueId: issueId!,
-              });
-            }}
+            liveRunSlot={<LiveRunWidget issueId={issueId!} companyId={issue.companyId} />}
+            onRetryRun={(run) => retryRun(run)}
+            retryingRunId={retryingRunId}
           />
         </TabsContent>
 
@@ -961,6 +1090,7 @@ export function IssueDetail() {
                 <Link
                   key={child.id}
                   to={`/issues/${child.identifier ?? child.id}`}
+                  state={location.state}
                   className="flex items-center justify-between px-3 py-2 text-sm hover:bg-accent/20 transition-colors"
                 >
                   <div className="flex items-center gap-2 min-w-0">
@@ -998,103 +1128,97 @@ export function IssueDetail() {
             </div>
           )}
         </TabsContent>
-          </Tabs>
 
-          {linkedApprovals && linkedApprovals.length > 0 && (
-            <Collapsible
-              open={secondaryOpen.approvals}
-              onOpenChange={(open) => setSecondaryOpen((prev) => ({ ...prev, approvals: open }))}
-              className="rounded-lg border border-border"
-            >
-              <CollapsibleTrigger className="flex w-full items-center justify-between px-3 py-2 text-left">
-                <span className="text-sm font-medium text-muted-foreground">
-                  Linked Approvals ({linkedApprovals.length})
-                </span>
-                <ChevronDown
-                  className={cn("h-4 w-4 text-muted-foreground transition-transform", secondaryOpen.approvals && "rotate-180")}
-                />
-              </CollapsibleTrigger>
-              <CollapsibleContent>
-                <div className="border-t border-border divide-y divide-border">
-                  {linkedApprovals.map((approval) => (
-                    <Link
-                      key={approval.id}
-                      to={`/approvals/${approval.id}`}
-                      className="flex items-center justify-between px-3 py-2 text-xs hover:bg-accent/20 transition-colors"
-                    >
-                      <div className="flex items-center gap-2">
-                        <StatusBadge status={approval.status} />
-                        <span className="font-medium">
-                          {approval.type.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase())}
-                        </span>
-                        <span className="font-mono text-muted-foreground">{approval.id.slice(0, 8)}</span>
-                      </div>
-                      <span className="text-muted-foreground">{relativeTime(approval.createdAt)}</span>
-                    </Link>
-                  ))}
-                </div>
-              </CollapsibleContent>
-            </Collapsible>
-          )}
+        {activePluginTab && (
+          <TabsContent value={activePluginTab.value}>
+            <PluginSlotMount
+              slot={activePluginTab.slot}
+              context={{
+                companyId: issue.companyId,
+                projectId: issue.projectId ?? null,
+                entityId: issue.id,
+                entityType: "issue",
+              }}
+              missingBehavior="placeholder"
+            />
+          </TabsContent>
+        )}
+      </Tabs>
 
-          {linkedRuns && linkedRuns.length > 0 && (
-            <Collapsible
-              open={secondaryOpen.cost}
-              onOpenChange={(open) => setSecondaryOpen((prev) => ({ ...prev, cost: open }))}
-              className="rounded-lg border border-border"
-            >
-              <CollapsibleTrigger className="flex w-full items-center justify-between px-3 py-2 text-left">
-                <span className="text-sm font-medium text-muted-foreground">Cost Summary</span>
-                <ChevronDown
-                  className={cn("h-4 w-4 text-muted-foreground transition-transform", secondaryOpen.cost && "rotate-180")}
-                />
-              </CollapsibleTrigger>
-              <CollapsibleContent>
-                <div className="border-t border-border px-3 py-2">
-                  {!issueCostSummary.hasCost && !issueCostSummary.hasTokens ? (
-                    <div className="text-xs text-muted-foreground">No cost data yet.</div>
-                  ) : (
-                    <div className="flex flex-wrap gap-3 text-xs text-muted-foreground">
-                      {issueCostSummary.hasCost && (
-                        <span className="font-medium text-foreground">
-                          ${issueCostSummary.cost.toFixed(4)}
-                        </span>
-                      )}
-                      {issueCostSummary.hasTokens && (
-                        <span>
-                          Tokens {formatTokens(issueCostSummary.totalTokens)}
-                          {issueCostSummary.cached > 0
-                            ? ` (in ${formatTokens(issueCostSummary.input)}, out ${formatTokens(issueCostSummary.output)}, cached ${formatTokens(issueCostSummary.cached)})`
-                            : ` (in ${formatTokens(issueCostSummary.input)}, out ${formatTokens(issueCostSummary.output)})`}
-                        </span>
-                      )}
-                    </div>
+      {linkedApprovals && linkedApprovals.length > 0 && (
+        <Collapsible
+          open={secondaryOpen.approvals}
+          onOpenChange={(open) => setSecondaryOpen((prev) => ({ ...prev, approvals: open }))}
+          className="rounded-lg border border-border"
+        >
+          <CollapsibleTrigger className="flex w-full items-center justify-between px-3 py-2 text-left">
+            <span className="text-sm font-medium text-muted-foreground">
+              Linked Approvals ({linkedApprovals.length})
+            </span>
+            <ChevronDown
+              className={cn("h-4 w-4 text-muted-foreground transition-transform", secondaryOpen.approvals && "rotate-180")}
+            />
+          </CollapsibleTrigger>
+          <CollapsibleContent>
+            <div className="border-t border-border divide-y divide-border">
+              {linkedApprovals.map((approval) => (
+                <Link
+                  key={approval.id}
+                  to={`/approvals/${approval.id}`}
+                  className="flex items-center justify-between px-3 py-2 text-xs hover:bg-accent/20 transition-colors"
+                >
+                  <div className="flex items-center gap-2">
+                    <StatusBadge status={approval.status} />
+                    <span className="font-medium">
+                      {approval.type.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase())}
+                    </span>
+                    <span className="font-mono text-muted-foreground">{approval.id.slice(0, 8)}</span>
+                  </div>
+                  <span className="text-muted-foreground">{relativeTime(approval.createdAt)}</span>
+                </Link>
+              ))}
+            </div>
+          </CollapsibleContent>
+        </Collapsible>
+      )}
+
+      {linkedRuns && linkedRuns.length > 0 && (
+        <Collapsible
+          open={secondaryOpen.cost}
+          onOpenChange={(open) => setSecondaryOpen((prev) => ({ ...prev, cost: open }))}
+          className="rounded-lg border border-border"
+        >
+          <CollapsibleTrigger className="flex w-full items-center justify-between px-3 py-2 text-left">
+            <span className="text-sm font-medium text-muted-foreground">Cost Summary</span>
+            <ChevronDown
+              className={cn("h-4 w-4 text-muted-foreground transition-transform", secondaryOpen.cost && "rotate-180")}
+            />
+          </CollapsibleTrigger>
+          <CollapsibleContent>
+            <div className="border-t border-border px-3 py-2">
+              {!issueCostSummary.hasCost && !issueCostSummary.hasTokens ? (
+                <div className="text-xs text-muted-foreground">No cost data yet.</div>
+              ) : (
+                <div className="flex flex-wrap gap-3 text-xs text-muted-foreground tabular-nums">
+                  {issueCostSummary.hasCost && (
+                    <span className="font-medium text-foreground">
+                      ${issueCostSummary.cost.toFixed(4)}
+                    </span>
+                  )}
+                  {issueCostSummary.hasTokens && (
+                    <span>
+                      Tokens {formatTokens(issueCostSummary.totalTokens)}
+                      {issueCostSummary.cached > 0
+                        ? ` (in ${formatTokens(issueCostSummary.input)}, out ${formatTokens(issueCostSummary.output)}, cached ${formatTokens(issueCostSummary.cached)})`
+                        : ` (in ${formatTokens(issueCostSummary.input)}, out ${formatTokens(issueCostSummary.output)})`}
+                    </span>
                   )}
                 </div>
-              </CollapsibleContent>
-            </Collapsible>
-          )}
-        </div>
-
-        {showDesktopRightRail ? (
-          <div className="min-w-0 xl:sticky xl:top-6 space-y-4">
-            {hasPlan && (
-              <IssuePlanRail
-                issueId={issueId!}
-                onApprove={(body) => {
-                  addComment.mutate({ body: `**Plan approved.**\n\n${body.length > 200 ? body.slice(0, 200) + "..." : ""}` });
-                }}
-                onRequestChanges={(feedback) => {
-                  addComment.mutate({ body: `**Changes requested on plan:**\n\n${feedback}` });
-                }}
-              />
-            )}
-            {showDesktopRunRail && (
-              <IssueRunRail issueId={issueId!} companyId={issue.companyId} pinnedRun={pinnedRun} />
-            )}
-          </div>
-        ) : null}
-      </div>
+              )}
+            </div>
+          </CollapsibleContent>
+        </Collapsible>
+      )}
 
       {/* Mobile properties drawer */}
       <Sheet open={mobilePropsOpen} onOpenChange={setMobilePropsOpen}>
@@ -1109,6 +1233,25 @@ export function IssueDetail() {
           </ScrollArea>
         </SheetContent>
       </Sheet>
+      <ScrollToBottom />
+    </div>
+
+    {/* Right rail (run status + plan) */}
+    {showRail && (
+      <div className="hidden xl:flex xl:flex-col gap-4 sticky top-4 self-start">
+        {hasPlan && (
+          <IssuePlanRail
+            issueId={issueId!}
+            onApprove={(body) => {
+              addComment.mutate({ body: `**Plan approved.**\n\n${body.length > 200 ? body.slice(0, 200) + "\u2026" : body}` });
+            }}
+            onRequestChanges={(feedback) => {
+              addComment.mutate({ body: `**Changes requested on plan:**\n\n${feedback}` });
+            }}
+          />
+        )}
+      </div>
+    )}
     </div>
   );
 }

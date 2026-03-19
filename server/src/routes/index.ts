@@ -15,3 +15,4 @@ export { llmRoutes } from "./llms.js";
 export { accessRoutes } from "./access.js";
 export { telegramRoutes } from "./telegram.js";
 export { remoteExecutionRoutes } from "./remote-execution.js";
+export { instanceSettingsRoutes } from "./instance-settings.js";
