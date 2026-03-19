@@ -8,7 +8,6 @@ import { ExternalLink, Square } from "lucide-react";
 import { Identity } from "./Identity";
 import { StatusBadge } from "./StatusBadge";
 import { IssueRunPane } from "./IssueRunRail";
-import { RAIL_FONT } from "./RunTranscript";
 
 interface LiveRunWidgetProps {
   issueId: string;
@@ -85,7 +84,7 @@ export function LiveRunWidget({ issueId, companyId }: LiveRunWidgetProps) {
   if (runs.length === 0) return null;
 
   return (
-    <div className="overflow-hidden rounded-xl border border-cyan-500/25 bg-background/80 shadow-[0_18px_50px_rgba(6,182,212,0.08)]" style={{ fontFamily: RAIL_FONT }}>
+    <div className="overflow-hidden rounded-xl border border-cyan-500/25 bg-background/80 shadow-[0_18px_50px_rgba(6,182,212,0.08)]">
       <div className="divide-y divide-border/60">
         {runs.map((run) => {
           const isActive = isRunActive(run.status);

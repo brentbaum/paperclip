@@ -9,47 +9,12 @@ import { activityApi } from "../api/activity";
 import { useCompany } from "../context/CompanyContext";
 import { useBreadcrumbs } from "../context/BreadcrumbContext";
 import { queryKeys } from "../lib/queryKeys";
+import { parseLogRows, type RunLogChunk } from "../lib/parseLogRows";
 import { StatusBadge } from "../components/StatusBadge";
 import { Identity } from "../components/Identity";
 import { PageSkeleton } from "../components/PageSkeleton";
-import {
-  RAIL_FONT, RAIL_BG, RAIL_PANEL, RAIL_BORDER, RAIL_TEXT, RAIL_MUTED, TONE,
-  shouldRenderEntry, groupTranscript, extractFooterModel,
-  TranscriptBody,
-} from "../components/RunTranscript";
-
-type RunLogChunk = { ts: string; stream: "stdout" | "stderr" | "system"; chunk: string };
-
-function parseLogRows(
-  content: string,
-  pendingRef: React.MutableRefObject<string>,
-  finalize = false,
-): RunLogChunk[] {
-  if (!content && !finalize) return [];
-  const combined = `${pendingRef.current}${content}`;
-  const split = combined.split("\n");
-  pendingRef.current = split.pop() ?? "";
-  if (finalize && pendingRef.current) {
-    split.push(pendingRef.current);
-    pendingRef.current = "";
-  }
-  const parsed: RunLogChunk[] = [];
-  for (const line of split) {
-    const trimmed = line.trim();
-    if (!trimmed) continue;
-    try {
-      const raw = JSON.parse(trimmed) as { ts?: unknown; stream?: unknown; chunk?: unknown };
-      const stream = raw.stream === "stderr" || raw.stream === "system" ? raw.stream : "stdout";
-      const chunk = typeof raw.chunk === "string" ? raw.chunk : "";
-      const ts = typeof raw.ts === "string" ? raw.ts : new Date().toISOString();
-      if (!chunk) continue;
-      parsed.push({ ts, stream, chunk });
-    } catch {
-      // ignore malformed
-    }
-  }
-  return parsed;
-}
+import { extractFooterModel } from "../components/RunTranscript";
+import { RunTranscriptView } from "../components/transcript/RunTranscriptView";
 
 export default function RunPage() {
   const { companyPrefix, runId } = useParams<{ companyPrefix: string; runId: string }>();
@@ -196,19 +161,13 @@ export default function RunPage() {
 
   const adapter = useMemo(() => getUIAdapter(runMeta.adapterType), [runMeta.adapterType]);
   const transcript = useMemo(() => buildTranscript(logLines, adapter.parseStdoutLine), [logLines, adapter]);
-  const visibleTranscript = useMemo(
-    () => transcript.filter((entry) => shouldRenderEntry(entry)),
-    [transcript],
-  );
-  const displayItems = useMemo(() => groupTranscript(visibleTranscript), [visibleTranscript]);
-
   const modelName = useMemo(
     () => extractFooterModel(transcript, adapterInvokePayload, runMeta.adapterType),
     [adapterInvokePayload, runMeta.adapterType, transcript],
   );
   const workingDir = adapterInvokePayload && typeof adapterInvokePayload.cwd === "string"
     ? adapterInvokePayload.cwd
-    : isLive && visibleTranscript.length === 0 ? "starting..." : "";
+    : isLive && transcript.length === 0 ? "starting..." : "";
 
   // Auto-scroll
   const userScrolledUpRef = useRef(false);
@@ -228,7 +187,7 @@ export default function RunPage() {
     const body = transcriptBodyRef.current;
     if (!body) return;
     body.scrollTop = body.scrollHeight;
-  }, [displayItems.length]);
+  }, [transcript.length]);
 
   // Breadcrumbs
   const { setBreadcrumbs } = useBreadcrumbs();
@@ -242,22 +201,22 @@ export default function RunPage() {
   if (!runId) return <PageSkeleton />;
 
   return (
-    <div className="flex flex-col h-[calc(100vh-3rem)]" style={{ fontFamily: RAIL_FONT }}>
+    <div className="flex flex-col h-[calc(100vh-3rem)]">
       {/* Header */}
-      <div className="flex items-center gap-3 px-4 py-3 border-b" style={{ borderColor: RAIL_BORDER, backgroundColor: RAIL_BG }}>
+      <div className="flex items-center gap-3 px-4 py-3 border-b border-border bg-background">
         <Link
           to={`/${companyPrefix}/agents/${runMeta.agentUrlKey}`}
           className="hover:underline no-underline text-inherit"
         >
           <Identity name={runMeta.agentName} size="sm" />
         </Link>
-        <span className="text-xs font-mono" style={{ color: RAIL_MUTED }}>{runId.slice(0, 8)}</span>
+        <span className="text-xs font-mono text-muted-foreground">{runId.slice(0, 8)}</span>
         <StatusBadge status={runStatus} />
         {isLive && (
-          <span className="flex items-center gap-1 text-xs" style={{ color: TONE.result }}>
+          <span className="flex items-center gap-1 text-xs text-cyan-600 dark:text-cyan-400">
             <span className="relative flex h-2 w-2">
-              <span className="animate-ping absolute inline-flex h-full w-full rounded-full opacity-75" style={{ backgroundColor: TONE.result }} />
-              <span className="relative inline-flex rounded-full h-2 w-2" style={{ backgroundColor: TONE.result }} />
+              <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-cyan-400 opacity-75" />
+              <span className="relative inline-flex rounded-full h-2 w-2 bg-cyan-400" />
             </span>
             Live
           </span>
@@ -268,8 +227,7 @@ export default function RunPage() {
               <Link
                 key={issue.issueId}
                 to={`/${companyPrefix}/issues/${issue.identifier ?? issue.issueId}`}
-                className="inline-flex items-center gap-1.5 rounded-md border px-2 py-1 text-[11px] font-mono hover:bg-accent/20 transition-colors no-underline text-inherit"
-                style={{ borderColor: RAIL_BORDER }}
+                className="inline-flex items-center gap-1.5 rounded-md border border-border px-2 py-1 text-[11px] font-mono hover:bg-accent/20 transition-colors no-underline text-inherit"
               >
                 <StatusBadge status={issue.status} />
                 {issue.identifier ?? issue.issueId.slice(0, 8)}
@@ -282,24 +240,19 @@ export default function RunPage() {
       {/* Transcript body */}
       <div
         ref={transcriptBodyRef}
-        className="flex-1 min-h-0 overflow-y-auto px-4 py-2"
-        style={{
-          background: `linear-gradient(180deg, rgba(255,255,255,0.02), transparent 34%), ${RAIL_PANEL}`,
-          color: RAIL_TEXT,
-          scrollbarColor: `${TONE.warn} transparent`,
-        }}
+        className="flex-1 min-h-0 overflow-y-auto px-4 py-3"
       >
-        {visibleTranscript.length === 0 && !logError ? (
-          <div className="flex items-center gap-2 py-8 text-[13px] justify-center" style={{ color: RAIL_MUTED }}>
+        {transcript.length === 0 && !logError ? (
+          <div className="flex items-center gap-2 py-8 text-sm justify-center text-muted-foreground">
             <span className="inline-block h-3.5 w-3.5 animate-spin rounded-full border-2 border-current border-t-transparent" />
             {isLive ? "Starting run..." : logLoading ? "Loading transcript..." : "No transcript available."}
           </div>
-        ) : null}
+        ) : (
+          <RunTranscriptView entries={transcript} streaming={isLive} />
+        )}
 
-        <TranscriptBody displayItems={displayItems} />
-
-        {logError && visibleTranscript.length === 0 ? (
-          <div className="flex items-center gap-2 py-8 text-[13px] justify-center" style={{ color: RAIL_MUTED }}>
+        {logError && transcript.length === 0 ? (
+          <div className="flex items-center gap-2 py-8 text-sm justify-center text-muted-foreground">
             {isLive ? (
               <>
                 <span className="inline-block h-3.5 w-3.5 animate-spin rounded-full border-2 border-current border-t-transparent" />
@@ -313,10 +266,7 @@ export default function RunPage() {
       </div>
 
       {/* Footer */}
-      <div
-        className="flex items-center justify-between gap-4 border-t px-4 py-2 text-[11px]"
-        style={{ borderColor: RAIL_BORDER, backgroundColor: RAIL_BG, color: RAIL_MUTED }}
-      >
+      <div className="flex items-center justify-between gap-4 border-t border-border px-4 py-2 text-[11px] text-muted-foreground bg-background">
         <span className="shrink-0 truncate">model {modelName}</span>
         <span className="truncate text-right">{workingDir}</span>
       </div>

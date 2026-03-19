@@ -7,12 +7,10 @@ import { agentsApi } from "../api/agents";
 import { heartbeatsApi, type ActiveRunForIssue, type LiveRunForIssue } from "../api/heartbeats";
 import { queryKeys } from "../lib/queryKeys";
 import { cn } from "../lib/utils";
+import { parseLogRows, type RunLogChunk } from "../lib/parseLogRows";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import {
-  RAIL_FONT, RAIL_BG, RAIL_PANEL, RAIL_BORDER, RAIL_TEXT, RAIL_MUTED, TONE,
-  shouldRenderEntry, groupTranscript, extractFooterModel,
-  TranscriptBody,
-} from "./RunTranscript";
+import { extractFooterModel } from "./RunTranscript";
+import { RunTranscriptView } from "./transcript/RunTranscriptView";
 
 interface IssueRunRailProps {
   issueId: string;
@@ -23,7 +21,6 @@ interface IssueRunRailProps {
 }
 
 export type RailRun = LiveRunForIssue;
-type RunLogChunk = { ts: string; stream: "stdout" | "stderr" | "system"; chunk: string };
 
 function toIsoString(value: string | Date | null | undefined): string | null {
   if (!value) return null;
@@ -44,39 +41,6 @@ function toRailRun(issueId: string, run: ActiveRunForIssue): RailRun {
     adapterType: run.adapterType,
     issueId,
   };
-}
-
-function parseLogRows(
-  content: string,
-  pendingLogLineRef: React.MutableRefObject<string>,
-  finalize = false,
-): RunLogChunk[] {
-  if (!content && !finalize) return [];
-  const combined = `${pendingLogLineRef.current}${content}`;
-  const split = combined.split("\n");
-  pendingLogLineRef.current = split.pop() ?? "";
-  if (finalize && pendingLogLineRef.current) {
-    split.push(pendingLogLineRef.current);
-    pendingLogLineRef.current = "";
-  }
-
-  const parsed: RunLogChunk[] = [];
-  for (const line of split) {
-    const trimmed = line.trim();
-    if (!trimmed) continue;
-    try {
-      const raw = JSON.parse(trimmed) as { ts?: unknown; stream?: unknown; chunk?: unknown };
-      const stream = raw.stream === "stderr" || raw.stream === "system" ? raw.stream : "stdout";
-      const chunk = typeof raw.chunk === "string" ? raw.chunk : "";
-      const ts = typeof raw.ts === "string" ? raw.ts : new Date().toISOString();
-      if (!chunk) continue;
-      parsed.push({ ts, stream, chunk });
-    } catch {
-      // Ignore malformed rows while logs are still streaming.
-    }
-  }
-
-  return parsed;
 }
 
 function isLiveStatus(status: string) {
@@ -192,13 +156,6 @@ export function IssueRunPane({ run }: { run: RailRun }) {
   const adapter = useMemo(() => getUIAdapter(run.adapterType), [run.adapterType]);
   const transcript = useMemo(() => buildTranscript(logLines, adapter.parseStdoutLine), [adapter, logLines]);
 
-  const visibleTranscript = useMemo(
-    () => transcript.filter((entry) => shouldRenderEntry(entry)).slice(-220),
-    [transcript],
-  );
-
-  const displayItems = useMemo(() => groupTranscript(visibleTranscript), [visibleTranscript]);
-
   const adapterInvokePayload = useMemo(() => {
     const invokeEvent = [...events].reverse().find((event) => event.eventType === "adapter.invoke");
     const payload =
@@ -217,7 +174,7 @@ export function IssueRunPane({ run }: { run: RailRun }) {
   );
   const workingDir = adapterInvokePayload && typeof adapterInvokePayload.cwd === "string"
     ? adapterInvokePayload.cwd
-    : isLive && visibleTranscript.length === 0 ? "starting…" : "";
+    : isLive && transcript.length === 0 ? "starting…" : "";
 
   const queryClient = useQueryClient();
   const retryRun = useMutation({
@@ -262,46 +219,35 @@ export function IssueRunPane({ run }: { run: RailRun }) {
     const body = transcriptBodyRef.current;
     if (!body) return;
     body.scrollTop = body.scrollHeight;
-  }, [displayItems.length]);
+  }, [transcript.length]);
 
   return (
-    <div className="flex min-h-0 flex-1 flex-col overflow-hidden rounded-xl border" style={{ borderColor: RAIL_BORDER }}>
+    <div className="flex min-h-0 flex-1 flex-col overflow-hidden rounded-xl border border-border/70">
       <div
         ref={transcriptBodyRef}
-        className="min-h-0 flex-1 overflow-y-auto px-3 py-1"
-        style={{
-          background: `linear-gradient(180deg, rgba(255,255,255,0.02), transparent 34%), ${RAIL_PANEL}`,
-          color: RAIL_TEXT,
-          scrollbarColor: `${TONE.warn} transparent`,
-        }}
+        className="min-h-0 flex-1 overflow-y-auto px-3 py-2"
       >
-        {visibleTranscript.length === 0 && !logError ? (
-          <div className="flex items-center gap-2 py-4 text-[12px]" style={{ color: RAIL_MUTED }}>
+        {transcript.length === 0 && !logError ? (
+          <div className="flex items-center gap-2 py-4 text-xs text-muted-foreground">
             <span className="inline-block h-3 w-3 animate-spin rounded-full border-2 border-current border-t-transparent" />
             {isLive ? "Starting run…" : logLoading ? "Loading transcript…" : "Waiting for agent output…"}
           </div>
-        ) : null}
-
-        <TranscriptBody displayItems={displayItems} />
+        ) : (
+          <RunTranscriptView entries={transcript} streaming={isLive} limit={220} />
+        )}
 
         {logError ? (
-          <div className="py-2 text-[12px]" style={{ color: TONE.error }}>
-            {logError}
-          </div>
+          <div className="py-2 text-xs text-red-700 dark:text-red-300">{logError}</div>
         ) : null}
       </div>
 
-      <div
-        className="flex items-center justify-between gap-4 border-t px-3 py-2 text-[11px]"
-        style={{ borderColor: RAIL_BORDER, backgroundColor: RAIL_BG, color: RAIL_MUTED }}
-      >
+      <div className="flex items-center justify-between gap-4 border-t border-border/60 px-3 py-2 text-[11px] text-muted-foreground">
         <span className="shrink-0 truncate">model {modelName}</span>
         {isFailedStatus(run.status) ? (
           <button
             onClick={() => retryRun.mutate()}
             disabled={retryRun.isPending}
-            className="flex shrink-0 items-center gap-1 rounded px-2 py-0.5 text-[11px] font-medium transition-colors hover:bg-white/10 disabled:opacity-50"
-            style={{ color: TONE.error }}
+            className="flex shrink-0 items-center gap-1 rounded px-2 py-0.5 text-[11px] font-medium text-red-700 dark:text-red-300 transition-colors hover:bg-red-500/10 disabled:opacity-50"
           >
             <RotateCcw className="h-3 w-3" />
             {retryRun.isPending ? "Retrying…" : "Retry"}
@@ -311,7 +257,7 @@ export function IssueRunPane({ run }: { run: RailRun }) {
         )}
       </div>
       {retryRun.isError && (
-        <div className="border-t px-3 py-1.5 text-[11px]" style={{ borderColor: RAIL_BORDER, color: TONE.error }}>
+        <div className="border-t border-border/60 px-3 py-1.5 text-[11px] text-red-700 dark:text-red-300">
           {retryRun.error instanceof Error ? retryRun.error.message : "Failed to retry run"}
         </div>
       )}
@@ -375,18 +321,12 @@ export function IssueRunRail({ issueId, className, pinnedRun }: IssueRunRailProp
 
   return (
     <aside
-      className={cn("min-w-0 overflow-hidden rounded-2xl border shadow-[0_22px_60px_rgba(0,0,0,0.35)] flex flex-col", className)}
-      style={{
-        fontFamily: RAIL_FONT,
-        color: RAIL_TEXT,
-        borderColor: RAIL_BORDER,
-        background: RAIL_BG,
-        maxHeight: "calc(100vh - 3rem)",
-      }}
+      className={cn("min-w-0 overflow-hidden rounded-2xl border border-border bg-background shadow-lg flex flex-col", className)}
+      style={{ maxHeight: "calc(100vh - 3rem)" }}
     >
       <Tabs value={activeTab} onValueChange={setSelectedRunId} className="flex min-h-0 flex-1 flex-col gap-0 overflow-hidden">
         {runs.length > 1 ? (
-          <div className="border-b px-2 py-2" style={{ borderColor: RAIL_BORDER }}>
+          <div className="border-b border-border/60 px-2 py-2">
             <TabsList
               variant="line"
               className="h-auto w-full justify-start gap-1 overflow-x-auto bg-transparent p-0"
@@ -399,18 +339,18 @@ export function IssueRunRail({ issueId, className, pinnedRun }: IssueRunRailProp
                 >
                   <div className="flex min-w-0 items-center gap-2">
                     <span
-                      className={cn("h-2 w-2 rounded-full", isLiveStatus(run.status) ? "animate-pulse" : "")}
-                      style={{
-                        backgroundColor:
-                          run.status === "failed" || run.status === "timed_out"
-                            ? TONE.error
-                            : isLiveStatus(run.status)
-                              ? TONE.tool
-                              : TONE.result,
-                      }}
+                      className={cn(
+                        "h-2 w-2 rounded-full",
+                        isLiveStatus(run.status) ? "animate-pulse" : "",
+                        run.status === "failed" || run.status === "timed_out"
+                          ? "bg-red-400"
+                          : isLiveStatus(run.status)
+                            ? "bg-emerald-300"
+                            : "bg-cyan-400",
+                      )}
                     />
                     <span className="truncate">{run.agentName}</span>
-                    <span style={{ color: RAIL_MUTED }}>{run.id.slice(0, 6)}</span>
+                    <span className="text-muted-foreground">{run.id.slice(0, 6)}</span>
                   </div>
                 </TabsTrigger>
               ))}
