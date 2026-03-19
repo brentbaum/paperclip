@@ -975,18 +975,21 @@ export function heartbeatService(db: Db) {
       const fallbackCwd = resolveDefaultAgentWorkspaceDir(agent.id);
       await fs.mkdir(fallbackCwd, { recursive: true });
       const warnings: string[] = [];
-      if (missingProjectCwds.length > 0) {
-        const firstMissing = missingProjectCwds[0];
-        const extraMissingCount = Math.max(0, missingProjectCwds.length - 1);
-        warnings.push(
-          extraMissingCount > 0
-            ? `Project workspace path "${firstMissing}" and ${extraMissingCount} other configured path(s) are not available yet. Using fallback workspace "${fallbackCwd}" for this run.`
-            : `Project workspace path "${firstMissing}" is not available yet. Using fallback workspace "${fallbackCwd}" for this run.`,
-        );
-      } else if (!hasConfiguredProjectCwd) {
-        warnings.push(
-          `Project workspace has no local cwd configured. Using fallback workspace "${fallbackCwd}" for this run.`,
-        );
+      const hasAdapterCwd = !!readNonEmptyString(agent.adapterConfig?.cwd);
+      if (!hasAdapterCwd) {
+        if (missingProjectCwds.length > 0) {
+          const firstMissing = missingProjectCwds[0];
+          const extraMissingCount = Math.max(0, missingProjectCwds.length - 1);
+          warnings.push(
+            extraMissingCount > 0
+              ? `Project workspace path "${firstMissing}" and ${extraMissingCount} other configured path(s) are not available yet. Using fallback workspace "${fallbackCwd}" for this run.`
+              : `Project workspace path "${firstMissing}" is not available yet. Using fallback workspace "${fallbackCwd}" for this run.`,
+          );
+        } else if (!hasConfiguredProjectCwd) {
+          warnings.push(
+            `Project workspace has no local cwd configured. Using fallback workspace "${fallbackCwd}" for this run.`,
+          );
+        }
       }
       return {
         cwd: fallbackCwd,
@@ -1023,18 +1026,21 @@ export function heartbeatService(db: Db) {
     const cwd = resolveDefaultAgentWorkspaceDir(agent.id);
     await fs.mkdir(cwd, { recursive: true });
     const warnings: string[] = [];
-    if (sessionCwd) {
-      warnings.push(
-        `Saved session workspace "${sessionCwd}" is not available. Using fallback workspace "${cwd}" for this run.`,
-      );
-    } else if (resolvedProjectId) {
-      warnings.push(
-        `No project workspace directory is currently available for this issue. Using fallback workspace "${cwd}" for this run.`,
-      );
-    } else {
-      warnings.push(
-        `No project or prior session workspace was available. Using fallback workspace "${cwd}" for this run.`,
-      );
+    const hasAdapterCwd = !!readNonEmptyString(agent.adapterConfig?.cwd);
+    if (!hasAdapterCwd) {
+      if (sessionCwd) {
+        warnings.push(
+          `Saved session workspace "${sessionCwd}" is not available. Using fallback workspace "${cwd}" for this run.`,
+        );
+      } else if (resolvedProjectId) {
+        warnings.push(
+          `No project workspace directory is currently available for this issue. Using fallback workspace "${cwd}" for this run.`,
+        );
+      } else {
+        warnings.push(
+          `No project or prior session workspace was available. Using fallback workspace "${cwd}" for this run.`,
+        );
+      }
     }
     return {
       cwd,
