@@ -54,8 +54,10 @@ function buildTelegramWakePrompt(context: Record<string, unknown>, agentId: stri
     `- From: ${senderLabel}${location ? ` in ${location}` : ""}`,
     `- Message: ${JSON.stringify(messageText)}`,
     "",
-    "Before you end this run, you must send a reply back to Telegram.",
-    `Use POST ${sendEndpoint} with JSON body: ${JSON.stringify(replyPayload)}`,
+    "IMPORTANT: You MUST reply via the Paperclip API endpoint below. Do NOT use any other telegram skill, script, or tool (e.g. telegram-notify, telegram_notify.py, or any Python script). Those are disabled and will send to the wrong chat. The ONLY correct way to reply is:",
+    "",
+    `curl -sS -X POST -H "Authorization: Bearer $PAPERCLIP_API_KEY" -H "Content-Type: application/json" "$PAPERCLIP_API_URL${sendEndpoint}" -d '${JSON.stringify(replyPayload)}'`,
+    "",
     "If no issue work is required, send a concise acknowledgement and stop. Do not only write an internal status update.",
     "",
   ].join("\n");
