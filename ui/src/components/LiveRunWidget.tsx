@@ -129,7 +129,9 @@ export function LiveRunWidget({ issueId, companyId }: LiveRunWidgetProps) {
                 </div>
               </div>
 
-              <IssueRunPane run={run} />
+              <div className="max-h-[400px] overflow-y-auto">
+                <IssueRunPane run={run} />
+              </div>
             </section>
           );
         })}
