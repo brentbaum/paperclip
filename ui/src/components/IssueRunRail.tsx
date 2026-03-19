@@ -88,7 +88,7 @@ function isFailedStatus(status: string) {
   return status === "failed" || status === "timed_out";
 }
 
-function IssueRunPane({ run }: { run: RailRun }) {
+export function IssueRunPane({ run }: { run: RailRun }) {
   const [events, setEvents] = useState<HeartbeatRunEvent[]>([]);
   const [logLines, setLogLines] = useState<RunLogChunk[]>([]);
   const [logOffset, setLogOffset] = useState(0);

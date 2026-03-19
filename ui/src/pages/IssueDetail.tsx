@@ -19,7 +19,6 @@ import { InlineEditor } from "../components/InlineEditor";
 import { CommentThread } from "../components/CommentThread";
 import { IssueDocumentsSection } from "../components/IssueDocumentsSection";
 import { IssueProperties } from "../components/IssueProperties";
-import { IssueRunRail, type RailRun } from "../components/IssueRunRail";
 import { IssuePlanRail } from "../components/IssuePlanRail";
 import { LiveRunWidget } from "../components/LiveRunWidget";
 import { isTypingTarget } from "../lib/keyboard";
@@ -211,7 +210,6 @@ export function IssueDetail() {
   const [attachmentDragActive, setAttachmentDragActive] = useState(false);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const lastMarkedReadIssueIdRef = useRef<string | null>(null);
-  const [pinnedRun, setPinnedRun] = useState<RailRun | null>(null);
   const [retryingRunId, setRetryingRunId] = useState<string | null>(null);
   const [statusPickerOpen, setStatusPickerOpen] = useState(false);
   const [priorityPickerOpen, setPriorityPickerOpen] = useState(false);
@@ -498,25 +496,6 @@ export function IssueDetail() {
     }
   };
 
-  const handleRunClick = (runId: string, agentId: string) => {
-    const run = (linkedRuns ?? []).find((r) => r.runId === runId);
-    if (run) {
-      setPinnedRun({
-        id: run.runId,
-        status: run.status,
-        invocationSource: "on_demand",
-        triggerDetail: null,
-        startedAt: run.startedAt ? new Date(run.startedAt).toISOString() : null,
-        finishedAt: null,
-        createdAt: new Date(run.createdAt).toISOString(),
-        agentId: run.agentId,
-        agentName: agentMap.get(run.agentId)?.name ?? run.agentId.slice(0, 8),
-        adapterType: agentMap.get(run.agentId)?.adapterType ?? "claude_local",
-        issueId: issueId,
-      });
-    }
-  };
-
   const addComment = useMutation({
     mutationFn: ({ body, reopen }: { body: string; reopen?: boolean }) =>
       issuesApi.addComment(issueId!, body, reopen),
@@ -717,7 +696,7 @@ export function IssueDetail() {
     </>
   );
 
-  const showRail = hasLiveRuns || !!pinnedRun || hasPlan;
+  const showRail = hasPlan;
 
   return (
     <div className={cn(
@@ -1060,7 +1039,6 @@ export function IssueDetail() {
               await uploadAttachment.mutateAsync(file);
             }}
             liveRunSlot={<LiveRunWidget issueId={issueId!} companyId={issue.companyId} />}
-            onRunClick={handleRunClick}
             onRetryRun={(run) => retryRun(run)}
             retryingRunId={retryingRunId}
           />
@@ -1224,13 +1202,6 @@ export function IssueDetail() {
     {/* Right rail (run status + plan) */}
     {showRail && (
       <div className="hidden xl:flex xl:flex-col gap-4 sticky top-4 self-start">
-        {(hasLiveRuns || pinnedRun) && (
-          <IssueRunRail
-            issueId={issue.id}
-            companyId={issue.companyId}
-            pinnedRun={pinnedRun}
-          />
-        )}
         {hasPlan && (
           <IssuePlanRail
             issueId={issueId!}

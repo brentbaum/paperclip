@@ -7,8 +7,8 @@ import { formatDateTime } from "../lib/utils";
 import { ExternalLink, Square } from "lucide-react";
 import { Identity } from "./Identity";
 import { StatusBadge } from "./StatusBadge";
-import { RunTranscriptView } from "./transcript/RunTranscriptView";
-import { useLiveRunTranscripts } from "./transcript/useLiveRunTranscripts";
+import { IssueRunPane } from "./IssueRunRail";
+import { RAIL_FONT } from "./RunTranscript";
 
 interface LiveRunWidgetProps {
   issueId: string;
@@ -67,8 +67,6 @@ export function LiveRunWidget({ issueId, companyId }: LiveRunWidgetProps) {
     );
   }, [activeRun, issueId, liveRuns]);
 
-  const { transcriptByRun, hasOutputForRun } = useLiveRunTranscripts({ runs, companyId });
-
   const handleCancelRun = async (runId: string) => {
     setCancellingRunIds((prev) => new Set(prev).add(runId));
     try {
@@ -87,20 +85,10 @@ export function LiveRunWidget({ issueId, companyId }: LiveRunWidgetProps) {
   if (runs.length === 0) return null;
 
   return (
-    <div className="overflow-hidden rounded-xl border border-cyan-500/25 bg-background/80 shadow-[0_18px_50px_rgba(6,182,212,0.08)]">
-      <div className="border-b border-border/60 bg-cyan-500/[0.04] px-4 py-3">
-        <div className="text-xs font-semibold uppercase tracking-[0.18em] text-cyan-700 dark:text-cyan-300">
-          Live Runs
-        </div>
-        <div className="mt-1 text-xs text-muted-foreground">
-          Streamed with the same transcript UI used on the full run detail page.
-        </div>
-      </div>
-
+    <div className="overflow-hidden rounded-xl border border-cyan-500/25 bg-background/80 shadow-[0_18px_50px_rgba(6,182,212,0.08)]" style={{ fontFamily: RAIL_FONT }}>
       <div className="divide-y divide-border/60">
         {runs.map((run) => {
           const isActive = isRunActive(run.status);
-          const transcript = transcriptByRun.get(run.id) ?? [];
           return (
             <section key={run.id} className="px-4 py-4">
               <div className="mb-3 flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
@@ -141,16 +129,7 @@ export function LiveRunWidget({ issueId, companyId }: LiveRunWidgetProps) {
                 </div>
               </div>
 
-              <div className="max-h-[320px] overflow-y-auto pr-1">
-                <RunTranscriptView
-                  entries={transcript}
-                  density="compact"
-                  limit={8}
-                  streaming={isActive}
-                  collapseStdout
-                  emptyMessage={hasOutputForRun(run.id) ? "Waiting for transcript parsing..." : "Waiting for run output..."}
-                />
-              </div>
+              <IssueRunPane run={run} />
             </section>
           );
         })}
