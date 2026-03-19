@@ -1,17 +1,11 @@
-import { execFileSync } from "node:child_process";
-import fs from "node:fs/promises";
-import os from "node:os";
-import path from "node:path";
 import { describe, expect, it } from "vitest";
+import type { agents } from "@paperclipai/db";
 import { resolveDefaultAgentWorkspaceDir } from "../home-paths.js";
 import {
-  collectRemoteAgentContextFiles,
-  HEARTBEAT_ORPHAN_REAP_STALE_THRESHOLD_MS,
-  inferRepoFromWorkingDirectory,
-  resolveGitIdentityForRemoteCommit,
-  resolveRemoteRepoForExecution,
+  formatRuntimeWorkspaceWarningLog,
+  prioritizeProjectWorkspaceCandidatesForRun,
+  parseSessionCompactionPolicy,
   resolveRuntimeSessionParamsForWorkspace,
-  shouldReapRunAsOrphan,
   shouldResetTaskSessionForWake,
   type ResolvedWorkspaceForRun,
 } from "../services/heartbeat.ts";
@@ -28,6 +22,32 @@ function buildResolvedWorkspace(overrides: Partial<ResolvedWorkspaceForRun> = {}
     warnings: [],
     ...overrides,
   };
+}
+
+function buildAgent(adapterType: string, runtimeConfig: Record<string, unknown> = {}) {
+  return {
+    id: "agent-1",
+    companyId: "company-1",
+    projectId: null,
+    goalId: null,
+    name: "Agent",
+    role: "engineer",
+    title: null,
+    icon: null,
+    status: "running",
+    reportsTo: null,
+    capabilities: null,
+    adapterType,
+    adapterConfig: {},
+    runtimeConfig,
+    budgetMonthlyCents: 0,
+    spentMonthlyCents: 0,
+    permissions: {},
+    lastHeartbeatAt: null,
+    metadata: null,
+    createdAt: new Date(),
+    updatedAt: new Date(),
+  } as unknown as typeof agents.$inferSelect;
 }
 
 describe("resolveRuntimeSessionParamsForWorkspace", () => {
@@ -98,258 +118,6 @@ describe("resolveRuntimeSessionParamsForWorkspace", () => {
   });
 });
 
-describe("inferRepoFromWorkingDirectory", () => {
-  it("infers repo metadata from a configured agent cwd inside a git checkout", async () => {
-    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-heartbeat-git-"));
-    const repoDir = path.join(root, "repo");
-    await fs.mkdir(repoDir, { recursive: true });
-    execFileSync("git", ["init", "-b", "main"], { cwd: repoDir, stdio: "ignore" });
-    execFileSync("git", ["config", "user.email", "paperclip@example.com"], {
-      cwd: repoDir,
-      stdio: "ignore",
-    });
-    execFileSync("git", ["config", "user.name", "Paperclip"], {
-      cwd: repoDir,
-      stdio: "ignore",
-    });
-    execFileSync("git", ["remote", "add", "origin", "git@github.com:test/ifs-companion.git"], {
-      cwd: repoDir,
-      stdio: "ignore",
-    });
-    await fs.writeFile(path.join(repoDir, "README.md"), "hello\n", "utf8");
-    execFileSync("git", ["add", "README.md"], { cwd: repoDir, stdio: "ignore" });
-    execFileSync("git", ["commit", "-m", "init"], { cwd: repoDir, stdio: "ignore" });
-
-    const nestedCwd = path.join(repoDir, "packages", "app");
-    await fs.mkdir(nestedCwd, { recursive: true });
-
-    const inferred = await inferRepoFromWorkingDirectory(nestedCwd);
-    const expectedRepoRoot = await fs.realpath(repoDir);
-
-    expect(inferred).toMatchObject({
-      repoRoot: expectedRepoRoot,
-      repoUrl: "git@github.com:test/ifs-companion.git",
-      repoRef: "main",
-    });
-  });
-});
-
-describe("resolveRemoteRepoForExecution", () => {
-  it("falls back to the configured agent cwd when resolved workspace repo metadata is missing", async () => {
-    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-remote-repo-"));
-    const repoDir = path.join(root, "repo");
-    await fs.mkdir(repoDir, { recursive: true });
-    execFileSync("git", ["init", "-b", "develop"], { cwd: repoDir, stdio: "ignore" });
-    execFileSync("git", ["config", "user.email", "paperclip@example.com"], {
-      cwd: repoDir,
-      stdio: "ignore",
-    });
-    execFileSync("git", ["config", "user.name", "Paperclip"], {
-      cwd: repoDir,
-      stdio: "ignore",
-    });
-    execFileSync("git", ["remote", "add", "origin", "git@github.com:test/remote-repo.git"], {
-      cwd: repoDir,
-      stdio: "ignore",
-    });
-    await fs.writeFile(path.join(repoDir, "README.md"), "remote\n", "utf8");
-    execFileSync("git", ["add", "README.md"], { cwd: repoDir, stdio: "ignore" });
-    execFileSync("git", ["commit", "-m", "init"], { cwd: repoDir, stdio: "ignore" });
-    const expectedRepoRoot = await fs.realpath(repoDir);
-
-    const result = await resolveRemoteRepoForExecution({
-      resolvedWorkspace: buildResolvedWorkspace({
-        cwd: resolveDefaultAgentWorkspaceDir("agent-123"),
-        repoUrl: null,
-        repoRef: null,
-      }),
-      previousSessionParams: null,
-      runtimeSessionParams: { cwd: resolveDefaultAgentWorkspaceDir("agent-123") },
-      agentAdapterConfig: { cwd: repoDir },
-    });
-
-    expect(result).toMatchObject({
-      repoUrl: "git@github.com:test/remote-repo.git",
-      repoRef: "develop",
-      repoRoot: expectedRepoRoot,
-      sourceCwd: repoDir,
-    });
-  });
-
-  it("keeps the resolved repo URL while still finding a local repo root for remote seeding", async () => {
-    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-remote-repo-root-"));
-    const repoDir = path.join(root, "repo");
-    await fs.mkdir(repoDir, { recursive: true });
-    execFileSync("git", ["init", "-b", "main"], { cwd: repoDir, stdio: "ignore" });
-    execFileSync("git", ["config", "user.email", "paperclip@example.com"], {
-      cwd: repoDir,
-      stdio: "ignore",
-    });
-    execFileSync("git", ["config", "user.name", "Paperclip"], {
-      cwd: repoDir,
-      stdio: "ignore",
-    });
-    execFileSync("git", ["remote", "add", "origin", "git@github.com:test/remote-repo.git"], {
-      cwd: repoDir,
-      stdio: "ignore",
-    });
-    await fs.writeFile(path.join(repoDir, "README.md"), "remote\n", "utf8");
-    execFileSync("git", ["add", "README.md"], { cwd: repoDir, stdio: "ignore" });
-    execFileSync("git", ["commit", "-m", "init"], { cwd: repoDir, stdio: "ignore" });
-    const expectedRepoRoot = await fs.realpath(repoDir);
-
-    const result = await resolveRemoteRepoForExecution({
-      resolvedWorkspace: buildResolvedWorkspace({
-        cwd: resolveDefaultAgentWorkspaceDir("agent-123"),
-        repoUrl: "git@github.com:test/remote-repo.git",
-        repoRef: "main",
-      }),
-      previousSessionParams: null,
-      runtimeSessionParams: null,
-      agentAdapterConfig: { cwd: repoDir },
-    });
-
-    expect(result).toMatchObject({
-      repoUrl: "git@github.com:test/remote-repo.git",
-      repoRef: "main",
-      repoRoot: expectedRepoRoot,
-      sourceCwd: repoDir,
-    });
-  });
-});
-
-describe("resolveGitIdentityForRemoteCommit", () => {
-  it("prefers repo git identity from the inferred repo root", async () => {
-    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-git-identity-"));
-    const repoDir = path.join(root, "repo");
-    await fs.mkdir(repoDir, { recursive: true });
-    execFileSync("git", ["init", "-b", "main"], { cwd: repoDir, stdio: "ignore" });
-    execFileSync("git", ["config", "user.email", "founder@example.com"], {
-      cwd: repoDir,
-      stdio: "ignore",
-    });
-    execFileSync("git", ["config", "user.name", "Brent Baum"], {
-      cwd: repoDir,
-      stdio: "ignore",
-    });
-
-    const identity = await resolveGitIdentityForRemoteCommit({
-      repoRoot: repoDir,
-      sourceCwd: repoDir,
-      resolvedWorkspace: buildResolvedWorkspace({ cwd: resolveDefaultAgentWorkspaceDir("agent-123") }),
-      previousSessionParams: null,
-      runtimeSessionParams: null,
-      agentAdapterConfig: { cwd: repoDir },
-    });
-
-    expect(identity).toEqual({
-      name: "Brent Baum",
-      email: "founder@example.com",
-      source: "repo",
-      sourceCwd: repoDir,
-    });
-  });
-
-  it("returns null when no git identity can be resolved", async () => {
-    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-git-identity-missing-"));
-    const readGlobalGitConfig = (key: string) => {
-      try {
-        return execFileSync("git", ["config", "--global", "--get", key], {
-          encoding: "utf8",
-          stdio: ["ignore", "pipe", "ignore"],
-        }).trim();
-      } catch {
-        return "";
-      }
-    };
-    const globalName = readGlobalGitConfig("user.name");
-    const globalEmail = readGlobalGitConfig("user.email");
-
-    const identity = await resolveGitIdentityForRemoteCommit({
-      repoRoot: null,
-      sourceCwd: null,
-      resolvedWorkspace: buildResolvedWorkspace({ cwd: root, workspaceHints: [] }),
-      previousSessionParams: null,
-      runtimeSessionParams: null,
-      agentAdapterConfig: { cwd: root },
-    });
-
-    if (globalName && globalEmail) {
-      expect(identity).toEqual({
-        name: globalName,
-        email: globalEmail,
-        source: "global",
-        sourceCwd: null,
-      });
-    } else {
-      expect(identity).toBeNull();
-    }
-  });
-});
-
-describe("collectRemoteAgentContextFiles", () => {
-  it("stages only files under agents/ while preserving remote-relative paths", async () => {
-    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-agent-files-"));
-    const repoDir = path.join(root, "repo");
-    await fs.mkdir(path.join(repoDir, "agents", "founding-engineer"), { recursive: true });
-    await fs.mkdir(path.join(repoDir, "memory"), { recursive: true });
-    await fs.mkdir(path.join(repoDir, "node_modules", "pkg"), { recursive: true });
-    await fs.writeFile(path.join(repoDir, "agents", "founding-engineer", "CLAUDE.md"), "# Agent\n", "utf8");
-    await fs.writeFile(path.join(repoDir, "agents", "founding-engineer", "context.json"), "{\n  \"ok\": true\n}\n", "utf8");
-    await fs.writeFile(path.join(repoDir, "AGENTS.md"), "# Top Level\n", "utf8");
-    await fs.writeFile(path.join(repoDir, "memory", "MEMORY.md"), "# Memory\n", "utf8");
-    await fs.writeFile(path.join(repoDir, "node_modules", "pkg", "README.md"), "# Ignore\n", "utf8");
-
-    const staged = await collectRemoteAgentContextFiles({
-      repoRoot: repoDir,
-      agentAdapterConfig: { cwd: repoDir },
-    });
-
-    expect(staged?.fileCount).toBe(2);
-    const agentPromptBody = await fs.readFile(
-      path.join(staged!.stagingDir, "agents", "founding-engineer", "CLAUDE.md"),
-      "utf8",
-    );
-    const agentContextBody = await fs.readFile(
-      path.join(staged!.stagingDir, "agents", "founding-engineer", "context.json"),
-      "utf8",
-    );
-    expect(agentPromptBody).toContain("# Agent");
-    expect(agentContextBody).toContain("\"ok\": true");
-    const topLevelExists = await fs
-      .stat(path.join(staged!.stagingDir, "AGENTS.md"))
-      .then(() => true)
-      .catch(() => false);
-    expect(topLevelExists).toBe(false);
-    const ignoredExists = await fs
-      .stat(path.join(staged!.stagingDir, "memory", "MEMORY.md"))
-      .then(() => true)
-      .catch(() => false);
-    expect(ignoredExists).toBe(false);
-    await fs.rm(staged!.stagingDir, { recursive: true, force: true });
-  });
-});
-
-describe("shouldReapRunAsOrphan", () => {
-  it("does not reap a freshly updated run", () => {
-    const now = new Date("2026-03-10T19:20:00.000Z");
-    const run = {
-      updatedAt: new Date(now.getTime() - 30_000),
-    };
-
-    expect(shouldReapRunAsOrphan(run, now, HEARTBEAT_ORPHAN_REAP_STALE_THRESHOLD_MS)).toBe(false);
-  });
-
-  it("reaps a run once it exceeds the stale threshold", () => {
-    const now = new Date("2026-03-10T19:20:00.000Z");
-    const run = {
-      updatedAt: new Date(now.getTime() - HEARTBEAT_ORPHAN_REAP_STALE_THRESHOLD_MS - 1),
-    };
-
-    expect(shouldReapRunAsOrphan(run, now, HEARTBEAT_ORPHAN_REAP_STALE_THRESHOLD_MS)).toBe(true);
-  });
-});
-
 describe("shouldResetTaskSessionForWake", () => {
   it("resets session context on assignment wake", () => {
     expect(shouldResetTaskSessionForWake({ wakeReason: "issue_assigned" })).toBe(true);
@@ -411,5 +179,102 @@ describe("shouldResetTaskSessionForWake", () => {
         wakeTriggerDetail: "callback",
       }),
     ).toBe(false);
+  });
+});
+
+describe("formatRuntimeWorkspaceWarningLog", () => {
+  it("emits informational workspace warnings on stdout", () => {
+    expect(formatRuntimeWorkspaceWarningLog("Using fallback workspace")).toEqual({
+      stream: "stdout",
+      chunk: "[paperclip] Using fallback workspace\n",
+    });
+  });
+});
+
+describe("prioritizeProjectWorkspaceCandidatesForRun", () => {
+  it("moves the explicitly selected workspace to the front", () => {
+    const rows = [
+      { id: "workspace-1", cwd: "/tmp/one" },
+      { id: "workspace-2", cwd: "/tmp/two" },
+      { id: "workspace-3", cwd: "/tmp/three" },
+    ];
+
+    expect(
+      prioritizeProjectWorkspaceCandidatesForRun(rows, "workspace-2").map((row) => row.id),
+    ).toEqual(["workspace-2", "workspace-1", "workspace-3"]);
+  });
+
+  it("keeps the original order when no preferred workspace is selected", () => {
+    const rows = [
+      { id: "workspace-1" },
+      { id: "workspace-2" },
+    ];
+
+    expect(
+      prioritizeProjectWorkspaceCandidatesForRun(rows, null).map((row) => row.id),
+    ).toEqual(["workspace-1", "workspace-2"]);
+  });
+
+  it("keeps the original order when the selected workspace is missing", () => {
+    const rows = [
+      { id: "workspace-1" },
+      { id: "workspace-2" },
+    ];
+
+    expect(
+      prioritizeProjectWorkspaceCandidatesForRun(rows, "workspace-9").map((row) => row.id),
+    ).toEqual(["workspace-1", "workspace-2"]);
+  });
+});
+
+describe("parseSessionCompactionPolicy", () => {
+  it("disables Paperclip-managed rotation by default for codex and claude local", () => {
+    expect(parseSessionCompactionPolicy(buildAgent("codex_local"))).toEqual({
+      enabled: true,
+      maxSessionRuns: 0,
+      maxRawInputTokens: 0,
+      maxSessionAgeHours: 0,
+    });
+    expect(parseSessionCompactionPolicy(buildAgent("claude_local"))).toEqual({
+      enabled: true,
+      maxSessionRuns: 0,
+      maxRawInputTokens: 0,
+      maxSessionAgeHours: 0,
+    });
+  });
+
+  it("keeps conservative defaults for adapters without confirmed native compaction", () => {
+    expect(parseSessionCompactionPolicy(buildAgent("cursor"))).toEqual({
+      enabled: true,
+      maxSessionRuns: 200,
+      maxRawInputTokens: 2_000_000,
+      maxSessionAgeHours: 72,
+    });
+    expect(parseSessionCompactionPolicy(buildAgent("opencode_local"))).toEqual({
+      enabled: true,
+      maxSessionRuns: 200,
+      maxRawInputTokens: 2_000_000,
+      maxSessionAgeHours: 72,
+    });
+  });
+
+  it("lets explicit agent overrides win over adapter defaults", () => {
+    expect(
+      parseSessionCompactionPolicy(
+        buildAgent("codex_local", {
+          heartbeat: {
+            sessionCompaction: {
+              maxSessionRuns: 25,
+              maxRawInputTokens: 500_000,
+            },
+          },
+        }),
+      ),
+    ).toEqual({
+      enabled: true,
+      maxSessionRuns: 25,
+      maxRawInputTokens: 500_000,
+      maxSessionAgeHours: 0,
+    });
   });
 });

@@ -1,4 +1,5 @@
 export type { Company } from "./company.js";
+export type { InstanceExperimentalSettings, InstanceSettings } from "./instance.js";
 export type {
   Document,
   DocumentRevision,
@@ -17,15 +18,31 @@ export type {
 } from "./agent.js";
 export type { AgentFileEntry, AgentFileContent } from "./agent-file.js";
 export type { AssetImage } from "./asset.js";
-export type { Project, ProjectGoalRef, ProjectWorkspace } from "./project.js";
+export type { Project, ProjectCodebase, ProjectCodebaseOrigin, ProjectGoalRef, ProjectWorkspace } from "./project.js";
 export type {
+  ExecutionWorkspace,
   WorkspaceRuntimeService,
   ExecutionWorkspaceStrategyType,
   ExecutionWorkspaceMode,
+  ExecutionWorkspaceProviderType,
+  ExecutionWorkspaceStatus,
   ExecutionWorkspaceStrategy,
   ProjectExecutionWorkspacePolicy,
+  ProjectExecutionWorkspaceDefaultMode,
   IssueExecutionWorkspaceSettings,
 } from "./workspace-runtime.js";
+export type {
+  WorkspaceOperation,
+  WorkspaceOperationPhase,
+  WorkspaceOperationStatus,
+} from "./workspace-operation.js";
+export type {
+  IssueWorkProduct,
+  IssueWorkProductType,
+  IssueWorkProductProvider,
+  IssueWorkProductStatus,
+  IssueWorkProductReviewState,
+} from "./work-product.js";
 export type {
   Issue,
   IssueAssigneeAdapterOverrides,
