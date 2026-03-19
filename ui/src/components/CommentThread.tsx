@@ -2,7 +2,7 @@ import { memo, useEffect, useMemo, useRef, useState, type ChangeEvent } from "re
 import { Link, useLocation } from "react-router-dom";
 import type { IssueComment, Agent } from "@paperclipai/shared";
 import { Button } from "@/components/ui/button";
-import { Check, Copy, Paperclip } from "lucide-react";
+import { Check, Copy, Paperclip, RotateCcw } from "lucide-react";
 import { Identity } from "./Identity";
 import { InlineEntitySelector, type InlineEntityOption } from "./InlineEntitySelector";
 import { MarkdownBody } from "./MarkdownBody";
@@ -47,6 +47,11 @@ interface CommentThreadProps {
   reassignOptions?: InlineEntityOption[];
   currentAssigneeValue?: string;
   mentions?: MentionOption[];
+  /** When set, run links call this instead of navigating to the agent run page. */
+  onRunClick?: (runId: string, agentId: string) => void;
+  /** Callback to retry a failed run. When provided, shows a retry button on failed runs. */
+  onRetryRun?: (run: LinkedRunItem) => void;
+  retryingRunId?: string | null;
 }
 
 const CLOSED_STATUSES = new Set(["done", "cancelled"]);
@@ -124,12 +129,18 @@ const TimelineList = memo(function TimelineList({
   companyId,
   projectId,
   highlightCommentId,
+  onRunClick,
+  onRetryRun,
+  retryingRunId,
 }: {
   timeline: TimelineItem[];
   agentMap?: Map<string, Agent>;
   companyId?: string | null;
   projectId?: string | null;
   highlightCommentId?: string | null;
+  onRunClick?: (runId: string, agentId: string) => void;
+  onRetryRun?: (run: LinkedRunItem) => void;
+  retryingRunId?: string | null;
 }) {
   if (timeline.length === 0) {
     return <p className="text-sm text-muted-foreground">No comments or runs yet.</p>;
@@ -155,13 +166,32 @@ const TimelineList = memo(function TimelineList({
               </div>
               <div className="flex items-center gap-2 text-xs">
                 <span className="text-muted-foreground">Run</span>
-                <Link
-                  to={`/agents/${run.agentId}/runs/${run.runId}`}
-                  className="inline-flex items-center rounded-md border border-border bg-accent/40 px-2 py-1 font-mono text-muted-foreground hover:text-foreground hover:bg-accent/60 transition-colors"
-                >
-                  {run.runId.slice(0, 8)}
-                </Link>
+                {onRunClick ? (
+                  <button
+                    onClick={() => onRunClick(run.runId, run.agentId)}
+                    className="inline-flex items-center rounded-md border border-border bg-accent/40 px-2 py-1 font-mono text-muted-foreground hover:text-foreground hover:bg-accent/60 transition-colors cursor-pointer"
+                  >
+                    {run.runId.slice(0, 8)}
+                  </button>
+                ) : (
+                  <Link
+                    to={`/agents/${run.agentId}/runs/${run.runId}`}
+                    className="inline-flex items-center rounded-md border border-border bg-accent/40 px-2 py-1 font-mono text-muted-foreground hover:text-foreground hover:bg-accent/60 transition-colors"
+                  >
+                    {run.runId.slice(0, 8)}
+                  </Link>
+                )}
                 <StatusBadge status={run.status} />
+                {onRetryRun && (run.status === "failed" || run.status === "timed_out") && (
+                  <button
+                    onClick={() => onRetryRun(run)}
+                    disabled={retryingRunId === run.runId}
+                    className="inline-flex items-center gap-1 rounded-md border border-border px-2 py-1 text-xs text-muted-foreground hover:text-foreground hover:bg-accent/60 transition-colors disabled:opacity-50"
+                  >
+                    <RotateCcw className="h-3 w-3" />
+                    {retryingRunId === run.runId ? "Retrying…" : "Retry"}
+                  </button>
+                )}
               </div>
             </div>
           );
@@ -233,7 +263,14 @@ const TimelineList = memo(function TimelineList({
             ) : null}
             {comment.runId && (
               <div className="mt-2 pt-2 border-t border-border/60">
-                {comment.runAgentId ? (
+                {comment.runAgentId && onRunClick ? (
+                  <button
+                    onClick={() => onRunClick(comment.runId!, comment.runAgentId!)}
+                    className="inline-flex items-center rounded-md border border-border bg-accent/30 px-2 py-1 text-[10px] font-mono text-muted-foreground hover:text-foreground hover:bg-accent/50 transition-colors cursor-pointer"
+                  >
+                    run {comment.runId.slice(0, 8)}
+                  </button>
+                ) : comment.runAgentId ? (
                   <Link
                     to={`/agents/${comment.runAgentId}/runs/${comment.runId}`}
                     className="inline-flex items-center rounded-md border border-border bg-accent/30 px-2 py-1 text-[10px] font-mono text-muted-foreground hover:text-foreground hover:bg-accent/50 transition-colors"
@@ -270,6 +307,9 @@ export function CommentThread({
   reassignOptions = [],
   currentAssigneeValue = "",
   mentions: providedMentions,
+  onRunClick,
+  onRetryRun,
+  retryingRunId,
 }: CommentThreadProps) {
   const [body, setBody] = useState("");
   const [reopen, setReopen] = useState(true);
@@ -400,6 +440,9 @@ export function CommentThread({
         companyId={companyId}
         projectId={projectId}
         highlightCommentId={highlightCommentId}
+        onRunClick={onRunClick}
+        onRetryRun={onRetryRun}
+        retryingRunId={retryingRunId}
       />
 
       {liveRunSlot}

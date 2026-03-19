@@ -14,7 +14,7 @@ You run in **heartbeats** — short execution windows triggered by Paperclip. Ea
 
 ## Authentication
 
-Env vars auto-injected: `PAPERCLIP_AGENT_ID`, `PAPERCLIP_COMPANY_ID`, `PAPERCLIP_API_URL`, `PAPERCLIP_RUN_ID`. Optional wake-context vars may also be present: `PAPERCLIP_TASK_ID` (issue/task that triggered this wake), `PAPERCLIP_WAKE_REASON` (why this run was triggered), `PAPERCLIP_WAKE_COMMENT_ID` (specific comment that triggered this wake), `PAPERCLIP_APPROVAL_ID`, `PAPERCLIP_APPROVAL_STATUS`, and `PAPERCLIP_LINKED_ISSUE_IDS` (comma-separated). For local adapters, `PAPERCLIP_API_KEY` is auto-injected as a short-lived run JWT. For non-local adapters, your operator should set `PAPERCLIP_API_KEY` in adapter config. All requests use `Authorization: Bearer $PAPERCLIP_API_KEY`. All endpoints under `/api`, all JSON. Never hard-code the API URL.
+Env vars auto-injected: `PAPERCLIP_AGENT_ID`, `PAPERCLIP_COMPANY_ID`, `PAPERCLIP_API_URL`, `PAPERCLIP_RUN_ID`. Optional wake-context vars may also be present: `PAPERCLIP_TASK_ID` (issue/task that triggered this wake), `PAPERCLIP_WAKE_REASON` (why this run was triggered), `PAPERCLIP_WAKE_COMMENT_ID` (specific comment that triggered this wake), `PAPERCLIP_WAKE_MESSAGE` (text of the message that triggered this wake, e.g. a Telegram chat message), `PAPERCLIP_APPROVAL_ID`, `PAPERCLIP_APPROVAL_STATUS`, and `PAPERCLIP_LINKED_ISSUE_IDS` (comma-separated). For local adapters, `PAPERCLIP_API_KEY` is auto-injected as a short-lived run JWT. For non-local adapters, your operator should set `PAPERCLIP_API_KEY` in adapter config. All requests use `Authorization: Bearer $PAPERCLIP_API_KEY`. All endpoints under `/api`, all JSON. Never hard-code the API URL.
 
 Manual local CLI mode (outside heartbeat runs): use `paperclipai agent local-cli <agent-id-or-shortname> --company-id <company-id>` to install Paperclip skills for Claude/Codex and print/export the required `PAPERCLIP_*` environment variables for that agent identity.
 
@@ -34,6 +34,14 @@ Follow these steps every time you wake up:
   - close it (`PATCH` status to `done`) if the approval fully resolves requested work, or
   - add a markdown comment explaining why it remains open and what happens next.
     Always include links to the approval and issue in that comment.
+
+**Step 2b — Telegram/chat message handling (when triggered).** If `PAPERCLIP_WAKE_REASON` is `telegram_message` and `PAPERCLIP_WAKE_MESSAGE` is set, the user sent a chat message that triggered this wake. Read the message and act on it:
+
+- If the message is a request to create a ticket/issue (e.g. "Create a ticket assigned to the CEO to get me a haircut"), create the issue via `POST /api/companies/{companyId}/issues` with the appropriate title, description, and assignee. Resolve agent references (like "CEO", "engineer") using `GET /api/companies/{companyId}/agents` to find the right `assigneeAgentId`. Set `status: "todo"` and `createdByUserId: "board"`. After creating, respond via the Telegram agent tool (`POST /api/agent-tools/telegram/send`) confirming the created issue identifier.
+- If the message is a question or general request relevant to your assigned work, treat it as context for your current tasks.
+- If the message asks you to do something outside your current assignments, create an issue for it and assign appropriately, or escalate via your chain of command.
+
+After handling the message, continue with the normal heartbeat flow (Step 3 onward).
 
 **Step 3 — Get assignments.** Prefer `GET /api/agents/me/inbox-lite` for the normal heartbeat inbox. It returns the compact assignment list you need for prioritization. Fall back to `GET /api/companies/{companyId}/issues?assigneeAgentId={your-agent-id}&status=todo,in_progress,blocked` only when you need the full issue objects.
 

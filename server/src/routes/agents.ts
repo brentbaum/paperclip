@@ -17,6 +17,8 @@ import {
   updateAgentInstructionsPathSchema,
   wakeAgentSchema,
   updateAgentSchema,
+  agentFilePathQuerySchema,
+  updateAgentFileSchema,
 } from "@paperclipai/shared";
 import { validate } from "../middleware/validate.js";
 import {
@@ -24,12 +26,15 @@ import {
   accessService,
   approvalService,
   budgetService,
+  goalService,
   heartbeatService,
   issueApprovalService,
   issueService,
   logActivity,
+  projectService,
   secretService,
 } from "../services/index.js";
+import { agentFileService } from "../services/agent-files.js";
 import { conflict, forbidden, notFound, unprocessable } from "../errors.js";
 import { assertBoard, assertCompanyAccess, getActorInfo } from "./authz.js";
 import { findServerAdapter, listAdapterModels } from "../adapters/index.js";
@@ -605,6 +610,67 @@ export function agentRoutes(db: Db) {
     );
   });
 
+  // Boot endpoint: collapsed startup for agents (identity + assignments + wake context)
+  router.get("/agents/me/boot", async (req, res) => {
+    if (req.actor.type !== "agent" || !req.actor.agentId) {
+      res.status(401).json({ error: "Agent authentication required" });
+      return;
+    }
+    const agent = await svc.getById(req.actor.agentId);
+    if (!agent) {
+      res.status(404).json({ error: "Agent not found" });
+      return;
+    }
+    const chainOfCommand = await svc.getChainOfCommand(agent.id);
+
+    const issueSvc = issueService(db);
+    const projectsSvc = projectService(db);
+    const goalsSvc = goalService(db);
+
+    const assignments = await issueSvc.list(agent.companyId, {
+      assigneeAgentId: agent.id,
+      status: "backlog,todo,in_progress,blocked",
+    });
+
+    const taskIdRaw = (req.query.taskId as string | undefined)?.trim() || null;
+    const commentIdRaw = (req.query.commentId as string | undefined)?.trim() || null;
+    const taskId = taskIdRaw && isUuidLike(taskIdRaw) ? taskIdRaw : null;
+
+    let wakeIssue: Record<string, unknown> | null = null;
+    let wakeComment: Record<string, unknown> | null = null;
+
+    if (taskId) {
+      const issue = await issueSvc.getById(taskId);
+      if (issue) {
+        const [ancestors, project, goal, comments] = await Promise.all([
+          issueSvc.getAncestors(issue.id),
+          issue.projectId ? projectsSvc.getById(issue.projectId) : null,
+          issue.goalId ? goalsSvc.getById(issue.goalId) : null,
+          issueSvc.listComments(issue.id),
+        ]);
+        wakeIssue = {
+          ...issue,
+          ancestors,
+          project: project ?? null,
+          goal: goal ?? null,
+          comments,
+        };
+
+        if (commentIdRaw) {
+          const comment = (comments as Array<{ id: string }>).find((c) => c.id === commentIdRaw);
+          if (comment) wakeComment = comment as Record<string, unknown>;
+        }
+      }
+    }
+
+    res.json({
+      agent: { ...agent, chainOfCommand },
+      assignments,
+      wakeIssue,
+      wakeComment,
+    });
+  });
+
   router.get("/agents/:id", async (req, res) => {
     const id = req.params.id as string;
     const agent = await svc.getById(id);
@@ -623,6 +689,58 @@ export function agentRoutes(db: Db) {
     }
     const chainOfCommand = await svc.getChainOfCommand(agent.id);
     res.json({ ...agent, chainOfCommand });
+  });
+
+  // Agent file routes
+  const agentFiles = agentFileService();
+
+  router.get("/agents/:id/files", async (req, res) => {
+    assertBoard(req);
+    const id = req.params.id as string;
+    const agent = await svc.getById(id);
+    if (!agent) { res.status(404).json({ error: "Agent not found" }); return; }
+    assertCompanyAccess(req, agent.companyId);
+    const files = await agentFiles.listFiles(agent);
+    res.json(files);
+  });
+
+  router.get("/agents/:id/files/content", async (req, res) => {
+    assertBoard(req);
+    const id = req.params.id as string;
+    const agent = await svc.getById(id);
+    if (!agent) { res.status(404).json({ error: "Agent not found" }); return; }
+    assertCompanyAccess(req, agent.companyId);
+    const query = agentFilePathQuerySchema.parse(req.query);
+    const file = await agentFiles.readFile(agent, query.path);
+    res.json(file);
+  });
+
+  router.patch("/agents/:id/files/content", validate(updateAgentFileSchema), async (req, res) => {
+    assertBoard(req);
+    const id = req.params.id as string;
+    const agent = await svc.getById(id);
+    if (!agent) { res.status(404).json({ error: "Agent not found" }); return; }
+    assertCompanyAccess(req, agent.companyId);
+    const actor = getActorInfo(req);
+    const file = await agentFiles.writeFile(agent, req.body.path, req.body.body);
+    await logActivity(db, {
+      companyId: agent.companyId,
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      agentId: actor.agentId,
+      runId: actor.runId,
+      action: "agent.updated",
+      entityType: "agent",
+      entityId: agent.id,
+      details: {
+        changedTopLevelKeys: ["files"],
+        fileName: file.name,
+        relativePath: file.relativePath,
+        rootLabel: file.rootLabel,
+        isInstructionsFile: file.isInstructionsFile,
+      },
+    });
+    res.json(file);
   });
 
   router.get("/agents/:id/configuration", async (req, res) => {
@@ -712,6 +830,10 @@ export function agentRoutes(db: Db) {
 
     const state = await heartbeat.getRuntimeState(id);
     res.json(state);
+  });
+
+  router.get("/agents/:id/tasks", (req, res) => {
+    res.redirect(307, `/api/agents/${req.params.id}/task-sessions`);
   });
 
   router.get("/agents/:id/task-sessions", async (req, res) => {
@@ -1518,6 +1640,22 @@ export function agentRoutes(db: Db) {
     }
 
     res.json(run);
+  });
+
+  router.post("/heartbeat-runs/:runId/dismiss", async (req, res) => {
+    assertBoard(req);
+    const runId = req.params.runId as string;
+    const run = await heartbeat.getRun(runId);
+    if (!run) {
+      res.status(404).json({ error: "Heartbeat run not found" });
+      return;
+    }
+    const [updated] = await db
+      .update(heartbeatRuns)
+      .set({ dismissedAt: new Date(), updatedAt: new Date() })
+      .where(eq(heartbeatRuns.id, runId))
+      .returning();
+    res.json(updated);
   });
 
   router.get("/heartbeat-runs/:runId/events", async (req, res) => {

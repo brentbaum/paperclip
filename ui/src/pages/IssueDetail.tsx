@@ -7,6 +7,7 @@ import { heartbeatsApi } from "../api/heartbeats";
 import { agentsApi } from "../api/agents";
 import { authApi } from "../api/auth";
 import { projectsApi } from "../api/projects";
+import { documentsApi } from "../api/documents";
 import { useCompany } from "../context/CompanyContext";
 import { usePanel } from "../context/PanelContext";
 import { useBreadcrumbs } from "../context/BreadcrumbContext";
@@ -18,7 +19,10 @@ import { InlineEditor } from "../components/InlineEditor";
 import { CommentThread } from "../components/CommentThread";
 import { IssueDocumentsSection } from "../components/IssueDocumentsSection";
 import { IssueProperties } from "../components/IssueProperties";
+import { IssueRunRail, type RailRun } from "../components/IssueRunRail";
+import { IssuePlanRail } from "../components/IssuePlanRail";
 import { LiveRunWidget } from "../components/LiveRunWidget";
+import { isTypingTarget } from "../lib/keyboard";
 import type { MentionOption } from "../components/MarkdownEditor";
 import { ScrollToBottom } from "../components/ScrollToBottom";
 import { StatusIcon } from "../components/StatusIcon";
@@ -207,6 +211,10 @@ export function IssueDetail() {
   const [attachmentDragActive, setAttachmentDragActive] = useState(false);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const lastMarkedReadIssueIdRef = useRef<string | null>(null);
+  const [pinnedRun, setPinnedRun] = useState<RailRun | null>(null);
+  const [retryingRunId, setRetryingRunId] = useState<string | null>(null);
+  const [statusPickerOpen, setStatusPickerOpen] = useState(false);
+  const [priorityPickerOpen, setPriorityPickerOpen] = useState(false);
 
   const { data: issue, isLoading, error } = useQuery({
     queryKey: queryKeys.issues.detail(issueId!),
@@ -260,6 +268,13 @@ export function IssueDetail() {
     refetchInterval: 3000,
   });
 
+  const { data: planDoc } = useQuery({
+    queryKey: queryKeys.documents.issuePlan(issueId!),
+    queryFn: () => documentsApi.getIssuePlanDocument(issueId!),
+    enabled: !!issueId,
+  });
+
+  const hasPlan = !!(planDoc?.latestRevision?.body?.trim());
   const hasLiveRuns = (liveRuns ?? []).length > 0 || !!activeRun;
   const sourceBreadcrumb = useMemo(
     () => readIssueDetailBreadcrumb(location.state) ?? { label: "Issues", href: "/issues" },
@@ -472,6 +487,36 @@ export function IssueDetail() {
     },
   });
 
+  const retryRun = async (run: { runId: string; agentId: string }) => {
+    setRetryingRunId(run.runId);
+    try {
+      await agentsApi.wakeup(run.agentId, { source: "on_demand", triggerDetail: "manual", payload: { issueId: issue!.id } });
+      invalidateIssue();
+      queryClient.invalidateQueries({ queryKey: queryKeys.issues.runs(issueId!) });
+    } finally {
+      setRetryingRunId(null);
+    }
+  };
+
+  const handleRunClick = (runId: string, agentId: string) => {
+    const run = (linkedRuns ?? []).find((r) => r.runId === runId);
+    if (run) {
+      setPinnedRun({
+        id: run.runId,
+        status: run.status,
+        invocationSource: "on_demand",
+        triggerDetail: null,
+        startedAt: run.startedAt ? new Date(run.startedAt).toISOString() : null,
+        finishedAt: null,
+        createdAt: new Date(run.createdAt).toISOString(),
+        agentId: run.agentId,
+        agentName: agentMap.get(run.agentId)?.name ?? run.agentId.slice(0, 8),
+        adapterType: agentMap.get(run.agentId)?.adapterType ?? "claude_local",
+        issueId: issueId,
+      });
+    }
+  };
+
   const addComment = useMutation({
     mutationFn: ({ body, reopen }: { body: string; reopen?: boolean }) =>
       issuesApi.addComment(issueId!, body, reopen),
@@ -576,6 +621,28 @@ export function IssueDetail() {
     markIssueRead.mutate(issue.id);
   }, [issue?.id]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  // Keyboard shortcuts: s = status, p = priority
+  useEffect(() => {
+    function handleKeyDown(event: KeyboardEvent) {
+      if (event.metaKey || event.ctrlKey || event.altKey) return;
+      if (isTypingTarget(event.target)) return;
+
+      const key = event.key.toLowerCase();
+      if (key === "s") {
+        event.preventDefault();
+        setPriorityPickerOpen(false);
+        setStatusPickerOpen(true);
+      } else if (key === "p") {
+        event.preventDefault();
+        setStatusPickerOpen(false);
+        setPriorityPickerOpen(true);
+      }
+    }
+
+    document.addEventListener("keydown", handleKeyDown);
+    return () => document.removeEventListener("keydown", handleKeyDown);
+  }, []);
+
   useEffect(() => {
     if (issue) {
       openPanel(
@@ -650,8 +717,15 @@ export function IssueDetail() {
     </>
   );
 
+  const showRail = hasLiveRuns || !!pinnedRun || hasPlan;
+
   return (
-    <div className="max-w-2xl space-y-6">
+    <div className={cn(
+      showRail
+        ? "grid gap-6 xl:grid-cols-[minmax(0,1fr)_26rem]"
+        : "max-w-2xl",
+    )}>
+    <div className="space-y-6">
       {/* Parent chain breadcrumb */}
       {ancestors.length > 0 && (
         <nav className="flex items-center gap-1 text-xs text-muted-foreground flex-wrap">
@@ -684,10 +758,14 @@ export function IssueDetail() {
         <div className="flex items-center gap-2 min-w-0 flex-wrap">
           <StatusIcon
             status={issue.status}
+            open={statusPickerOpen}
+            onOpenChange={setStatusPickerOpen}
             onChange={(status) => updateIssue.mutate({ status })}
           />
           <PriorityIcon
             priority={issue.priority}
+            open={priorityPickerOpen}
+            onOpenChange={setPriorityPickerOpen}
             onChange={(priority) => updateIssue.mutate({ priority })}
           />
           <span className="text-sm font-mono text-muted-foreground shrink-0">{issue.identifier ?? issue.id.slice(0, 8)}</span>
@@ -982,6 +1060,9 @@ export function IssueDetail() {
               await uploadAttachment.mutateAsync(file);
             }}
             liveRunSlot={<LiveRunWidget issueId={issueId!} companyId={issue.companyId} />}
+            onRunClick={handleRunClick}
+            onRetryRun={(run) => retryRun(run)}
+            retryingRunId={retryingRunId}
           />
         </TabsContent>
 
@@ -1138,6 +1219,31 @@ export function IssueDetail() {
         </SheetContent>
       </Sheet>
       <ScrollToBottom />
+    </div>
+
+    {/* Right rail (run status + plan) */}
+    {showRail && (
+      <div className="hidden xl:flex xl:flex-col gap-4 sticky top-4 self-start">
+        {(hasLiveRuns || pinnedRun) && (
+          <IssueRunRail
+            issueId={issue.id}
+            companyId={issue.companyId}
+            pinnedRun={pinnedRun}
+          />
+        )}
+        {hasPlan && (
+          <IssuePlanRail
+            issueId={issueId!}
+            onApprove={(body) => {
+              addComment.mutate({ body: `**Plan approved.**\n\n${body.length > 200 ? body.slice(0, 200) + "\u2026" : body}` });
+            }}
+            onRequestChanges={(feedback) => {
+              addComment.mutate({ body: `**Changes requested on plan:**\n\n${feedback}` });
+            }}
+          />
+        )}
+      </div>
+    )}
     </div>
   );
 }

@@ -38,6 +38,7 @@ import {
   ArrowUpRight,
   ChevronDown,
   ChevronUp,
+  Clock,
   MessageSquare,
   XCircle,
   X,
@@ -61,14 +62,29 @@ type InboxCategoryFilter =
   | "join_requests"
   | "approvals"
   | "failed_runs"
-  | "alerts";
+  | "alerts"
+  | "stale_work";
 type InboxApprovalFilter = "all" | "actionable" | "resolved";
 type SectionKey =
   | "issues_i_touched"
   | "join_requests"
   | "approvals"
   | "failed_runs"
-  | "alerts";
+  | "alerts"
+  | "stale_work";
+
+const STALE_THRESHOLD_MS = 24 * 60 * 60 * 1000; // 24 hours
+
+function getStaleIssues(issues: Issue[]): Issue[] {
+  const now = Date.now();
+  return issues
+    .filter(
+      (i) =>
+        ["in_progress", "todo"].includes(i.status) &&
+        now - new Date(i.updatedAt).getTime() > STALE_THRESHOLD_MS,
+    )
+    .sort((a, b) => new Date(a.updatedAt).getTime() - new Date(b.updatedAt).getTime());
+}
 
 const RUN_SOURCE_LABELS: Record<string, string> = {
   timer: "Scheduled",
@@ -381,6 +397,9 @@ export function Inbox() {
     return map;
   }, [issues]);
 
+  const staleIssues = useMemo(() => getStaleIssues(issues ?? []), [issues]);
+  const hasStaleWork = staleIssues.length > 0;
+
   const failedRuns = useMemo(
     () => getLatestFailedRunsByAgent(heartbeatRuns ?? []).filter((r) => !dismissed.has(`run:${r.id}`)),
     [heartbeatRuns, dismissed],
@@ -596,6 +615,8 @@ export function Inbox() {
   const showFailedRunsSection =
     tab === "all" ? showFailedRunsCategory && hasRunFailures : tab === "unread" && hasRunFailures;
   const showAlertsSection = tab === "all" ? showAlertsCategory && hasAlerts : tab === "unread" && hasAlerts;
+  const showStaleCategory = allCategoryFilter === "everything" || allCategoryFilter === "stale_work";
+  const showStaleSection = tab === "all" ? showStaleCategory && hasStaleWork : false;
 
   const visibleSections = [
     showFailedRunsSection ? "failed_runs" : null,
@@ -603,6 +624,7 @@ export function Inbox() {
     showApprovalsSection ? "approvals" : null,
     showJoinRequestsSection ? "join_requests" : null,
     showTouchedSection ? "issues_i_touched" : null,
+    showStaleSection ? "stale_work" : null,
   ].filter((key): key is SectionKey => key !== null);
 
   const allLoaded =
@@ -666,6 +688,7 @@ export function Inbox() {
                 <SelectItem value="approvals">Approvals</SelectItem>
                 <SelectItem value="failed_runs">Failed runs</SelectItem>
                 <SelectItem value="alerts">Alerts</SelectItem>
+                <SelectItem value="stale_work">Stale work</SelectItem>
               </SelectContent>
             </Select>
 
@@ -1010,6 +1033,48 @@ export function Inbox() {
                   </button>
                 </div>
               )}
+            </div>
+          </div>
+        </>
+      )}
+
+      {showStaleSection && (
+        <>
+          {showSeparatorBefore("stale_work") && <Separator />}
+          <div>
+            <h3 className="mb-3 text-sm font-semibold uppercase tracking-wide text-muted-foreground">
+              Stale Work
+            </h3>
+            <div className="divide-y divide-border border border-border">
+              {staleIssues.map((issue) => (
+                <Link
+                  key={issue.id}
+                  to={`/issues/${issue.identifier ?? issue.id}`}
+                  state={createIssueDetailLocationState("Inbox", "/inbox")}
+                  className="flex cursor-pointer items-center gap-3 px-4 py-3 transition-colors hover:bg-accent/50 no-underline text-inherit"
+                >
+                  <Clock className="h-4 w-4 shrink-0 text-muted-foreground" />
+                  <PriorityIcon priority={issue.priority} />
+                  <StatusIcon status={issue.status} />
+                  <span className="text-xs font-mono text-muted-foreground">
+                    {issue.identifier ?? issue.id.slice(0, 8)}
+                  </span>
+                  <span className="flex-1 truncate text-sm">{issue.title}</span>
+                  {issue.assigneeAgentId && (() => {
+                    const name = agentName(issue.assigneeAgentId);
+                    return name ? (
+                      <Identity name={name} size="sm" />
+                    ) : (
+                      <span className="font-mono text-xs text-muted-foreground">
+                        {issue.assigneeAgentId.slice(0, 8)}
+                      </span>
+                    );
+                  })()}
+                  <span className="shrink-0 text-xs text-muted-foreground">
+                    updated {timeAgo(issue.updatedAt)}
+                  </span>
+                </Link>
+              ))}
             </div>
           </div>
         </>

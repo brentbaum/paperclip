@@ -1466,5 +1466,17 @@ export function issueRoutes(db: Db, storage: StorageService) {
     res.json({ ok: true });
   });
 
+  router.post("/issues/:id/view", async (req, res) => {
+    const id = req.params.id as string;
+    const issue = await svc.getById(id);
+    if (!issue) {
+      res.status(404).json({ error: "Issue not found" });
+      return;
+    }
+    assertCompanyAccess(req, issue.companyId);
+    await svc.update(id, { viewedAt: new Date() });
+    res.json({ ok: true });
+  });
+
   return router;
 }

@@ -157,7 +157,7 @@ describe("telegram approval callbacks", () => {
     const approve = vi.fn(async () => {
       throw new Error("already resolved");
     });
-    const getById = vi.fn(async () => ({ approval: { id: "approval-1", status: "approved" }, applied: true }));
+    const getById = vi.fn(async () => ({ id: "approval-1", status: "approved" }));
     const svc = telegramService(
       {} as any,
       createDeps(fakeBot, {

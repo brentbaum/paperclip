@@ -15,6 +15,7 @@ import { useDialog } from "../context/DialogContext";
 import { useBreadcrumbs } from "../context/BreadcrumbContext";
 import { queryKeys } from "../lib/queryKeys";
 import { AgentConfigForm } from "../components/AgentConfigForm";
+import { AgentFilesWorkspace } from "../components/AgentFilesWorkspace";
 import { PageTabBar } from "../components/PageTabBar";
 import { adapterLabels, roleLabels } from "../components/agent-config-primitives";
 import { getUIAdapter, buildTranscript } from "../adapters";
@@ -185,10 +186,11 @@ function scrollToContainerBottom(container: ScrollContainer, behavior: ScrollBeh
   container.scrollTo({ top: container.scrollHeight, behavior });
 }
 
-type AgentDetailView = "dashboard" | "configuration" | "runs" | "budget";
+type AgentDetailView = "dashboard" | "files" | "configuration" | "runs" | "budget";
 
 function parseAgentDetailView(value: string | null): AgentDetailView {
   if (value === "configure" || value === "configuration") return "configuration";
+  if (value === "files") return "files";
   if (value === "budget") return "budget";
   if (value === "runs") return value;
   return "dashboard";
@@ -353,6 +355,30 @@ export function AgentDetail() {
     [heartbeats],
   );
 
+  const [selectedFilePath, setSelectedFilePath] = useState<string | null>(null);
+  const { data: agentFiles } = useQuery({
+    queryKey: agent?.id ? queryKeys.agents.files(agent.id) : ["agents", "files", "none"],
+    queryFn: () => agentsApi.listFiles(agent!.id, resolvedCompanyId ?? undefined),
+    enabled: Boolean(agent?.id) && activeView === "files",
+  });
+  const { data: selectedAgentFile } = useQuery({
+    queryKey: agent?.id && selectedFilePath
+      ? queryKeys.agents.fileContent(agent.id, selectedFilePath)
+      : ["agents", "files", "content", "none"],
+    queryFn: () => agentsApi.getFileContent(agent!.id, selectedFilePath!, resolvedCompanyId ?? undefined),
+    enabled: Boolean(agent?.id && selectedFilePath) && activeView === "files",
+  });
+  const saveAgentFile = useMutation({
+    mutationFn: (data: { path: string; body: string }) =>
+      agentsApi.updateFileContent(agentLookupRef, data, resolvedCompanyId ?? undefined),
+    onSuccess: (updated) => {
+      setActionError(null);
+      if (!agent?.id) return;
+      queryClient.invalidateQueries({ queryKey: queryKeys.agents.files(agent.id) });
+      queryClient.invalidateQueries({ queryKey: queryKeys.agents.fileContent(agent.id, updated.path) });
+    },
+  });
+
   useEffect(() => {
     if (!agent) return;
     if (urlRunId) {
@@ -364,11 +390,13 @@ export function AgentDetail() {
     const canonicalTab =
       activeView === "configuration"
         ? "configuration"
-        : activeView === "runs"
-          ? "runs"
-          : activeView === "budget"
-            ? "budget"
-            : "dashboard";
+        : activeView === "files"
+          ? "files"
+          : activeView === "runs"
+            ? "runs"
+            : activeView === "budget"
+              ? "budget"
+              : "dashboard";
     if (routeAgentRef !== canonicalAgentRef || urlTab !== canonicalTab) {
       navigate(`/agents/${canonicalAgentRef}/${canonicalTab}`, { replace: true });
       return;
@@ -481,6 +509,8 @@ export function AgentDetail() {
       if (urlRunId) {
         crumbs.push({ label: "Runs", href: `/agents/${canonicalAgentRef}/runs` });
         crumbs.push({ label: `Run ${urlRunId.slice(0, 8)}` });
+      } else if (activeView === "files") {
+        crumbs.push({ label: "Files" });
       } else if (activeView === "configuration") {
         crumbs.push({ label: "Configuration" });
       } else if (activeView === "runs") {
@@ -621,7 +651,9 @@ export function AgentDetail() {
               <button
                 className="flex items-center gap-2 w-full px-2 py-1.5 text-xs rounded hover:bg-accent/50 text-destructive"
                 onClick={() => {
-                  agentAction.mutate("terminate");
+                  if (window.confirm(`Terminate agent "${agent.name}"? This action cannot be undone.`)) {
+                    agentAction.mutate("terminate");
+                  }
                   setMoreOpen(false);
                 }}
               >
@@ -641,6 +673,7 @@ export function AgentDetail() {
           <PageTabBar
             items={[
               { value: "dashboard", label: "Dashboard" },
+              { value: "files", label: "Files" },
               { value: "configuration", label: "Configuration" },
               { value: "runs", label: "Runs" },
               { value: "budget", label: "Budget" },
@@ -723,6 +756,19 @@ export function AgentDetail() {
           runtimeState={runtimeState}
           agentId={agent.id}
           agentRouteId={canonicalAgentRef}
+        />
+      )}
+
+      {activeView === "files" && (
+        <AgentFilesWorkspace
+          files={agentFiles ?? []}
+          selectedPath={selectedFilePath}
+          onSelectPath={setSelectedFilePath}
+          selectedFile={selectedAgentFile}
+          onSave={async (data) => {
+            await saveAgentFile.mutateAsync(data);
+          }}
+          isSaving={saveAgentFile.isPending}
         />
       )}
 
