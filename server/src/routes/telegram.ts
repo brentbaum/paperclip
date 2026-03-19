@@ -45,15 +45,23 @@ export function telegramRoutes(telegram: Pick<TelegramService, "sendToAgentTopic
         "telegram send request received",
       );
 
-      const result = await telegram.sendToAgentTopic({
-        companyId: req.actor.companyId,
-        agentId: req.body.agentId,
-        text: req.body.text,
-        mirrorStatus: req.body.status ?? null,
-        issueId: req.body.issueId ?? null,
-        overrideChatId: req.body.chatId ?? null,
-        overrideTopicId: req.body.topicId ?? null,
-      });
+      let result;
+      try {
+        result = await telegram.sendToAgentTopic({
+          companyId: req.actor.companyId,
+          agentId: req.body.agentId,
+          text: req.body.text,
+          mirrorStatus: req.body.status ?? null,
+          issueId: req.body.issueId ?? null,
+          overrideChatId: req.body.chatId ?? null,
+          overrideTopicId: req.body.topicId ?? null,
+        });
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        logger.error({ err, agentId: req.body.agentId }, "telegram sendToAgentTopic threw");
+        res.status(500).json({ error: "telegram send failed", detail: message });
+        return;
+      }
 
       if (!result.ok) {
         if (result.error === "agent-company mismatch") {
