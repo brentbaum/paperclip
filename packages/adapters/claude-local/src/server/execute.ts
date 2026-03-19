@@ -380,7 +380,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
   const promptTemplate = asString(
     config.promptTemplate,
-    "You are agent {{agent.id}} ({{agent.name}}). Continue your Paperclip work.",
+    "You are agent {{agent.id}} ({{agent.name}}). Use the /paperclip skill immediately to check your assignments and continue your work. Do not search memory or explore the codebase first — the skill provides everything you need.",
   );
   const model = asString(config.model, "");
   const effort = asString(config.effort, "");
