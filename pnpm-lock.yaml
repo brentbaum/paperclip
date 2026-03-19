@@ -643,6 +643,9 @@ importers:
       cmdk:
         specifier: ^1.1.1
         version: 1.1.1(@types/react-dom@19.2.3(@types/react@19.2.14))(@types/react@19.2.14)(react-dom@19.2.4(react@19.2.4))(react@19.2.4)
+      hermes-paperclip-adapter:
+        specifier: 0.1.1
+        version: 0.1.1
       lucide-react:
         specifier: ^0.574.0
         version: 0.574.0(react@19.2.4)
@@ -6536,6 +6539,11 @@ packages:
   sherpa-onnx-win-ia32@1.12.29:
     resolution: {integrity: sha512-L+S3jM+7yTrA3alG+r3CXkRzsZUcBnuL+gcwpUMz5tPq0WI2rl22UvqLIUjoplt8tMqEOYonzsLPY+Gll8ym8w==}
     cpu: [ia32]
+    os: [win32]
+
+  sherpa-onnx-win-x64@1.12.30:
+    resolution: {integrity: sha512-IoMDDMMTsbVMLbA/BE/WyJ0d5QaQqvEBmjYhyEsmoPphkHYORUH1ivIFQoGDJCzKjIId2hkfP8MA3IWB7/A+jA==}
+    cpu: [x64]
     os: [win32]
 
   side-channel-list@1.0.0:
@@ -14469,8 +14477,12 @@ snapshots:
       sherpa-onnx-linux-arm64: 1.12.29
       sherpa-onnx-linux-x64: 1.12.29
       sherpa-onnx-win-ia32: 1.12.29
+      sherpa-onnx-win-x64: 1.12.30
 
   sherpa-onnx-win-ia32@1.12.29:
+    optional: true
+
+  sherpa-onnx-win-x64@1.12.30:
     optional: true
 
   side-channel-list@1.0.0:

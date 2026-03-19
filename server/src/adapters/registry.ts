@@ -145,7 +145,10 @@ const hermesLocalAdapter: ServerAdapterModule = {
   execute: hermesExecute,
   testEnvironment: hermesTestEnvironment,
   sessionCodec: hermesSessionCodec,
-  models: hermesModels,
+  models: [
+    ...hermesModels,
+    { id: "openai/gpt-5.4", label: "GPT-5.4 (OpenAI)" },
+  ],
   supportsLocalAgentJwt: true,
   agentConfigurationDoc: hermesAgentConfigurationDoc,
 };

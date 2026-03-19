@@ -646,8 +646,12 @@ export function issueRoutes(db: Db, storage: StorageService) {
     }
 
     const actor = getActorInfo(req);
+    const { scheduledAt: scheduledAtRaw, ...createFields } = req.body;
+    if (scheduledAtRaw !== undefined) {
+      createFields.scheduledAt = scheduledAtRaw ? new Date(scheduledAtRaw) : null;
+    }
     const issue = await svc.create(companyId, {
-      ...req.body,
+      ...createFields,
       createdByAgentId: actor.agentId,
       createdByUserId: actor.actorType === "user" ? actor.actorId : null,
     });
@@ -709,9 +713,12 @@ export function issueRoutes(db: Db, storage: StorageService) {
     }
     if (!(await assertAgentRunCheckoutOwnership(req, res, existing))) return;
 
-    const { comment: commentBody, hiddenAt: hiddenAtRaw, ...updateFields } = req.body;
+    const { comment: commentBody, hiddenAt: hiddenAtRaw, scheduledAt: scheduledAtRaw, ...updateFields } = req.body;
     if (hiddenAtRaw !== undefined) {
       updateFields.hiddenAt = hiddenAtRaw ? new Date(hiddenAtRaw) : null;
+    }
+    if (scheduledAtRaw !== undefined) {
+      updateFields.scheduledAt = scheduledAtRaw ? new Date(scheduledAtRaw) : null;
     }
     let issue;
     try {
