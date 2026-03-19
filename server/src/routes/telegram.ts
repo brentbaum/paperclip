@@ -1,9 +1,19 @@
+import fs from "node:fs";
+import path from "node:path";
 import { Router } from "express";
 import { z } from "zod";
 import { forbidden, unauthorized } from "../errors.js";
 import { logger } from "../middleware/logger.js";
 import { validate } from "../middleware/validate.js";
 import type { TelegramService } from "../services/telegram.js";
+
+function debugTelegramLog(label: string, data: Record<string, unknown>) {
+  try {
+    const logPath = path.resolve("data", "telegram-debug.log");
+    const line = JSON.stringify({ t: new Date().toISOString(), label, ...data }) + "\n";
+    fs.appendFileSync(logPath, line);
+  } catch { /* best-effort */ }
+}
 
 const sendTelegramMessageSchema = z.object({
   agentId: z.string().min(1),
@@ -32,6 +42,14 @@ export function telegramRoutes(telegram: Pick<TelegramService, "sendToAgentTopic
       if (!req.actor.companyId) {
         throw unauthorized("Agent company context missing");
       }
+
+      debugTelegramLog("route:send", {
+        agentId: req.body.agentId,
+        chatId: req.body.chatId ?? null,
+        topicId: req.body.topicId ?? null,
+        rawBody: { chatId: req.body.chatId, topicId: req.body.topicId },
+        textLen: req.body.text?.length ?? 0,
+      });
 
       logger.info(
         {

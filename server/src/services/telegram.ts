@@ -1,8 +1,18 @@
+import fs from "node:fs";
+import path from "node:path";
 import type { Db } from "@paperclipai/db";
 import type { PaperclipConfig } from "@paperclipai/shared";
 import type { LiveEvent } from "@paperclipai/shared";
 import { HttpError } from "../errors.js";
 import { logger } from "../middleware/logger.js";
+
+function debugTelegramLog(label: string, data: Record<string, unknown>) {
+  try {
+    const logPath = path.resolve("data", "telegram-debug.log");
+    const line = JSON.stringify({ t: new Date().toISOString(), label, ...data }) + "\n";
+    fs.appendFileSync(logPath, line);
+  } catch { /* best-effort */ }
+}
 import type { agentService } from "./agents.js";
 import type { approvalService } from "./approvals.js";
 import type { issueService } from "./issues.js";
@@ -773,6 +783,14 @@ export function telegramService(db: Db, deps: TelegramServiceDeps) {
     const mappedAgentId = reverseTopicMapping().get(topicId);
     if (!mappedAgentId) return;
 
+    debugTelegramLog("inbound:message", {
+      configuredChatId,
+      topicId,
+      mappedAgentId,
+      text: text.slice(0, 80),
+      from: ctx.from?.username ?? ctx.from?.id ?? null,
+    });
+
     const messageId =
       typeof ctx.message?.message_id === "number" ? ctx.message.message_id : null;
 
@@ -1249,6 +1267,15 @@ export function telegramService(db: Db, deps: TelegramServiceDeps) {
     const chatId = input.overrideChatId || defaultChatId;
     let topicId: number | undefined = input.overrideTopicId ?? undefined;
 
+    debugTelegramLog("sendToAgentTopic:resolve", {
+      agentId: input.agentId,
+      overrideChatId: input.overrideChatId,
+      overrideTopicId: input.overrideTopicId,
+      resolvedChatId: chatId,
+      defaultChatId,
+      topicMapping: deps.config.telegramTopicMapping,
+    });
+
     logger.info(
       {
         agentId: input.agentId,
@@ -1273,11 +1300,19 @@ export function telegramService(db: Db, deps: TelegramServiceDeps) {
         topicId = deps.config.telegramTopicMapping[input.agentId];
       }
       if (!topicId) {
+        debugTelegramLog("sendToAgentTopic:noTopic", { agentId: input.agentId });
         return { ok: false as const, error: "agent topic not configured" };
       }
     }
 
     const text = input.mirrorStatus ? `[${input.mirrorStatus.toUpperCase()}] ${input.text}` : input.text;
+
+    debugTelegramLog("sendToAgentTopic:send", {
+      agentId: input.agentId,
+      finalChatId: chatId,
+      finalTopicId: topicId,
+      textLen: text.length,
+    });
 
     try {
       const sent = await retryTelegramCall(() =>
